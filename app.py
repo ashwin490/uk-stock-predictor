@@ -13,7 +13,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
-import plotly.graph_objects as go
 import yfinance as yf
 import pytz
 import duckdb
@@ -38,19 +37,18 @@ except ImportError:
         return {"headline": "Standard Market Flow", "status": "📰 Flow Verified", "delta": 0.0, "timestamp": datetime.now().strftime("%Y-%m-%d")}
 
 ROOT_DIR = Path(__file__).resolve().parent
+DB_PATH = os.path.join(ROOT_DIR, "lse_market_data.duckdb")
 
 # ==============================================================================
 # 1. INITIALIZE HYBRID DATABASE (DUCKDB LOCAL + SUPABASE CLOUD)
 # ==============================================================================
-DB_PATH = os.path.join(ROOT_DIR, "lse_market_data.duckdb")
-
 def init_duckdb_storage():
     con = duckdb.connect(DB_PATH, read_only=False)
     try:
         con.execute("""
             CREATE TABLE IF NOT EXISTS trade_journal (
                 trade_id VARCHAR PRIMARY KEY,
-                timestamp TIMESTAMP,
+                timestamp VARCHAR,
                 date_str VARCHAR,
                 ticker VARCHAR,
                 asset_type VARCHAR DEFAULT 'EQUITY',
@@ -63,15 +61,14 @@ def init_duckdb_storage():
                 latest_price DOUBLE,
                 pnl_pct DOUBLE DEFAULT 0.0,
                 exit_price DOUBLE DEFAULT 0.0,
-                exit_timestamp TIMESTAMP,
-                last_audited TIMESTAMP
+                exit_timestamp VARCHAR,
+                last_audited VARCHAR
             )
         """)
-        
         con.execute("""
             CREATE TABLE IF NOT EXISTS daily_options_journal (
                 date_key VARCHAR PRIMARY KEY,
-                timestamp TIMESTAMP,
+                timestamp VARCHAR,
                 share_name VARCHAR,
                 option_contract VARCHAR,
                 strike_price DOUBLE,
@@ -87,7 +84,7 @@ def init_duckdb_storage():
                 implied_vol DOUBLE,
                 status VARCHAR DEFAULT 'ACTIVE',
                 pnl_pct DOUBLE DEFAULT 0.0,
-                last_audited TIMESTAMP
+                last_audited VARCHAR
             )
         """)
     except Exception:
@@ -99,9 +96,9 @@ init_duckdb_storage()
 
 # Supabase Cloud Client
 try:
-    from supabase import create_client, Client
+    from supabase import create_client
 except ImportError:
-    create_client, Client = None, None
+    create_client = None
 
 @st.cache_resource
 def get_supabase_client():
@@ -115,24 +112,49 @@ def get_supabase_client():
 supabase = get_supabase_client()
 
 def hydrate_duckdb_from_supabase():
+    """Restores historical trades and active positions whenever container starts."""
     if not supabase: return
     con = duckdb.connect(DB_PATH, read_only=False)
     try:
-        res = supabase.table("predictions").select("*").execute()
-        if res.data:
-            for r in res.data:
+        # 1. Hydrate Equities
+        res_eq = supabase.table("predictions").select("*").execute()
+        if res_eq.data:
+            for r in res_eq.data:
                 tkr = r.get('ticker')
                 if not tkr: continue
-                trade_id = f"{tkr}_{r.get('predicted_date')}"
+                pred_date = str(r.get('predicted_date', datetime.now().strftime('%Y-%m-%d')))
+                trade_id = f"{tkr}_{pred_date}"
+                last_check = str(r.get('last_checked') or datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                
                 con.execute("""
-                    INSERT OR IGNORE INTO trade_journal 
+                    INSERT OR REPLACE INTO trade_journal 
                     VALUES (?, ?, ?, ?, 'EQUITY', ?, ?, ?, ?, ?, ?, ?, ?, 0.0, NULL, ?)
                 """, [
-                    trade_id, r.get('last_checked') or datetime.now(), r.get('predicted_date'),
-                    tkr, float(r.get('entry_price', 0.0)), float(r.get('target_price', 0.0)),
-                    float(r.get('stop_loss', 0.0)), int(r.get('shares_qty', 1)), float(r.get('position_gbp', 0.0)),
-                    r.get('status', 'ACTIVE').upper(), float(r.get('latest_price', 0.0)), float(r.get('pnl_pct', 0.0)),
-                    datetime.now()
+                    trade_id, last_check, pred_date, tkr, 
+                    float(r.get('entry_price', 0.0)), float(r.get('target_price', 0.0)),
+                    float(r.get('stop_loss', 0.0)), int(r.get('shares_qty', 1)), 
+                    float(r.get('position_gbp', 0.0)), str(r.get('status', 'ACTIVE')).upper(), 
+                    float(r.get('latest_price', 0.0)), float(r.get('pnl_pct', 0.0)),
+                    datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                ])
+                
+        # 2. Hydrate Options
+        res_opt = supabase.table("options_journal").select("*").execute()
+        if res_opt.data:
+            for o in res_opt.data:
+                date_k = str(o.get('date_key', datetime.now().strftime('%Y-%m-%d')))
+                con.execute("""
+                    INSERT OR REPLACE INTO daily_options_journal 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, [
+                    date_k, str(o.get('timestamp')), str(o.get('share_name')),
+                    str(o.get('option_contract')), float(o.get('strike_price', 0.0)), 
+                    int(o.get('expiry_days', 21)), float(o.get('underlying_spot', 0.0)), 
+                    int(o.get('lot_size', 5000)), float(o.get('entry_premium', 0.0)),
+                    float(o.get('current_option_price', 0.0)), float(o.get('target_premium', 0.0)),
+                    float(o.get('stop_loss_premium', 0.0)), float(o.get('total_capital', 0.0)),
+                    float(o.get('ai_confidence', 80.0)), float(o.get('implied_vol', 20.0)),
+                    str(o.get('status', 'ACTIVE')), float(o.get('pnl_pct', 0.0)), str(o.get('last_audited'))
                 ])
     except Exception:
         pass
@@ -145,15 +167,13 @@ hydrate_duckdb_from_supabase()
 # 2. TIMEZONE & CONFIGURATION
 # ==============================================================================
 st.set_page_config(page_title="ALPHA-LSE Quant Terminal", page_icon="⚡", layout="wide", initial_sidebar_state="collapsed")
-
 MODEL_PATH = os.path.join(ROOT_DIR, "models", "ensemble_ranker.joblib")
 LOT_SIZES = {"SHEL": 1000, "AZN": 500, "HSBA": 2000, "ULVR": 500, "BP": 3000, "BARC": 5000, "RIO": 250, "GLEN": 4000}
 
 def is_lse_market_open() -> bool:
     lon_zone = pytz.timezone('Europe/London')
     now_lon = datetime.now(lon_zone)
-    if now_lon.weekday() > 4: return False
-    return dtime(8, 0) <= now_lon.time() <= dtime(16, 30)
+    return dtime(8, 0) <= now_lon.time() <= dtime(16, 30) and now_lon.weekday() <= 4
 
 # ==============================================================================
 # 3. SECURE LOGIN GATEWAY
@@ -172,18 +192,11 @@ def check_password():
         else:
             st.session_state["password_correct"] = False
 
-    if "password_correct" not in st.session_state:
+    if "password_correct" not in st.session_state or not st.session_state["password_correct"]:
         st.subheader("🔐 ALPHA-LSE Quant Terminal - Secure Login")
         st.text_input("Username", key="username")
         st.text_input("Password", type="password", key="password")
         st.button("Log In", on_click=password_entered, width="stretch")
-        return False
-    elif not st.session_state["password_correct"]:
-        st.subheader("🔐 ALPHA-LSE Quant Terminal - Secure Login")
-        st.text_input("Username", key="username")
-        st.text_input("Password", type="password", key="password")
-        st.button("Log In", on_click=password_entered, width="stretch")
-        st.error("😕 Invalid username or password")
         return False
     return True
 
@@ -196,8 +209,9 @@ if not check_password():
 def audit_and_reconcile_all_trades():
     con = duckdb.connect(DB_PATH, read_only=False)
     lon_zone = pytz.timezone('Europe/London')
-    now_ts = datetime.now(lon_zone).replace(tzinfo=None)
+    now_str = datetime.now(lon_zone).strftime('%Y-%m-%d %H:%M:%S')
     try:
+        # Audit Equities
         active_trades = con.execute("SELECT * FROM trade_journal WHERE status = 'ACTIVE'").df()
         if not active_trades.empty:
             for _, tr in active_trades.iterrows():
@@ -228,10 +242,11 @@ def audit_and_reconcile_all_trades():
                             exit_timestamp = CASE WHEN ? != 'ACTIVE' THEN ? ELSE exit_timestamp END,
                             last_audited = ?
                         WHERE trade_id = ?
-                    """, [curr, pnl, new_status, exit_price, new_status, now_ts, now_ts, tr["trade_id"]])
+                    """, [curr, pnl, new_status, exit_price, new_status, now_str, now_str, tr["trade_id"]])
                 except Exception:
                     continue
 
+        # Audit Options
         active_opts = con.execute("SELECT * FROM daily_options_journal WHERE status = 'ACTIVE'").df()
         if not active_opts.empty:
             for _, opt in active_opts.iterrows():
@@ -242,7 +257,6 @@ def audit_and_reconcile_all_trades():
                     current_spot = float(h["Close"].iloc[-1])
                     entry_spot = float(opt["underlying_spot"])
                     
-                    # Approximate CFD/Option delta movement
                     pnl_pct = round(((current_spot - entry_spot) / entry_spot) * 100.0 * 2.5, 2)
                     opt_status = "ACTIVE"
                     if pnl_pct >= 60.0:
@@ -254,7 +268,7 @@ def audit_and_reconcile_all_trades():
                         UPDATE daily_options_journal
                         SET underlying_spot = ?, pnl_pct = ?, status = ?, last_audited = ?
                         WHERE date_key = ?
-                    """, [current_spot, pnl_pct, opt_status, now_ts, opt["date_key"]])
+                    """, [current_spot, pnl_pct, opt_status, now_str, opt["date_key"]])
                 except Exception:
                     continue
     except Exception:
@@ -282,6 +296,7 @@ def generate_daily_options_alpha() -> dict:
     lon_zone = pytz.timezone('Europe/London')
     now_lon = datetime.now(lon_zone)
     today_str = now_lon.strftime('%Y-%m-%d')
+    now_str = now_lon.strftime('%Y-%m-%d %H:%M:%S')
     
     con = duckdb.connect(DB_PATH, read_only=False)
     try:
@@ -310,13 +325,13 @@ def generate_daily_options_alpha() -> dict:
     total_cap = round((entry_prem * lot_size) / 100, 2)
 
     sig = {
-        "date_key": today_str, "timestamp": now_lon.replace(tzinfo=None), "share_name": selected_stock,
+        "date_key": today_str, "timestamp": now_str, "share_name": selected_stock,
         "option_contract": f"{selected_stock} {int(strike)}p CE", "strike_price": float(strike),
         "expiry_days": days_to_expiry, "underlying_spot": float(spot), "lot_size": lot_size,
         "entry_premium": float(entry_prem), "current_option_price": float(entry_prem),
         "target_premium": float(target_prem), "stop_loss_premium": float(stop_prem),
         "total_capital": float(total_cap), "ai_confidence": 82.4, "implied_vol": round(sigma*100, 1),
-        "status": "ACTIVE", "pnl_pct": 0.0, "last_audited": now_lon.replace(tzinfo=None)
+        "status": "ACTIVE", "pnl_pct": 0.0, "last_audited": now_str
     }
 
     con = duckdb.connect(DB_PATH, read_only=False)
@@ -330,12 +345,9 @@ def generate_daily_options_alpha() -> dict:
 
     if supabase:
         try:
-            cloud_payload = sig.copy()
-            cloud_payload["timestamp"] = str(cloud_payload["timestamp"])
-            cloud_payload["last_audited"] = str(cloud_payload["last_audited"])
             c_check = supabase.table("options_journal").select("date_key").eq("date_key", today_str).execute()
             if not c_check.data:
-                supabase.table("options_journal").insert(cloud_payload).execute()
+                supabase.table("options_journal").insert(sig).execute()
         except Exception: pass
 
     return sig
@@ -348,6 +360,7 @@ def log_equity_signal_safely(sig: dict):
     lon_zone = pytz.timezone('Europe/London')
     now = datetime.now(lon_zone)
     today_str = now.strftime('%Y-%m-%d')
+    now_str = now.strftime('%Y-%m-%d %H:%M:%S')
     ticker = sig['Ticker']
 
     try:
@@ -359,14 +372,12 @@ def log_equity_signal_safely(sig: dict):
                 INSERT INTO trade_journal 
                 VALUES (?, ?, ?, ?, 'EQUITY', ?, ?, ?, ?, ?, 'ACTIVE', ?, 0.0, 0.0, NULL, ?)
             """, [
-                trade_id, now.replace(tzinfo=None), today_str, ticker, float(sig['Price (p)']),
+                trade_id, now_str, today_str, ticker, float(sig['Price (p)']),
                 float(sig['Target (p)']), float(sig['Stop Loss (p)']),
-                shares_num, float(sig['Capital']), float(sig['Price (p)']), now.replace(tzinfo=None)
+                shares_num, float(sig['Capital']), float(sig['Price (p)']), now_str
             ])
-    except Exception:
-        pass
-    finally:
-        con.close()
+    except Exception: pass
+    finally: con.close()
 
     if supabase:
         try:
@@ -391,13 +402,12 @@ def log_equity_signal_safely(sig: dict):
                     "news_status": sig.get('RNS', 'Clean'),
                     "rns_headline": "Active LSE Quant Signal",
                     "features_json": {},
-                    "last_checked": now.strftime('%Y-%m-%d %H:%M:%S')
+                    "last_checked": now_str
                 }).execute()
-        except Exception:
-            pass
+        except Exception: pass
 
 # ==============================================================================
-# 7. ML PREDICTION PIPELINE (DYNAMIC ROTATING SCRAPER)
+# 7. SCRAPER & ML PIPELINE
 # ==============================================================================
 @st.cache_resource
 def load_ml_model():
@@ -407,37 +417,48 @@ def load_ml_model():
 ml_model = load_ml_model()
 
 def get_live_lse_universe() -> list:
-    """Dynamically scrapes live UK market indices directly from the web."""
+    """Scrapes live UK market indices with hardcoded institutional fallback."""
     tickers = []
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     
+    # Try live scraping FTSE 100
     try:
         url_100 = "https://en.wikipedia.org/wiki/FTSE_100_Index"
-        df_100 = pd.read_html(requests.get(url_100, headers=headers).text, attrs={'id': 'constituents'})[0]
+        df_100 = pd.read_html(requests.get(url_100, headers=headers, timeout=5).text, attrs={'id': 'constituents'})[0]
         tickers.extend([f"{t.replace('.', '-')}.L" for t in df_100['Ticker'].dropna()])
-    except Exception: pass
+    except Exception:
+        pass
     
+    # Try live scraping FTSE 250
     try:
         url_250 = "https://en.wikipedia.org/wiki/FTSE_250_Index"
-        df_250 = pd.read_html(requests.get(url_250, headers=headers).text, attrs={'id': 'constituents'})[0]
+        df_250 = pd.read_html(requests.get(url_250, headers=headers, timeout=5).text, attrs={'id': 'constituents'})[0]
         tickers.extend([f"{t.replace('.', '-')}.L" for t in df_250['Ticker'].dropna()])
-    except Exception: pass
+    except Exception:
+        pass
 
-    # Clean duplicates and return
-    return list(set(tickers))
+    # Verified, highly liquid fallback list of active AIM & FTSE constituents
+    fallback_pool = [
+        "SHEL.L", "AZN.L", "HSBA.L", "ULVR.L", "BP.L", "BARC.L", "RIO.L", "GLEN.L",
+        "GSK.L", "BATS.L", "LSEG.L", "NG.L", "BUR.L", "BRCK.L", "MIDW.L", "VIC.L",
+        "AOM.L", "SEE.L", "SRC.L", "SAV.L", "YOU.L", "PTAL.L", "JET2.L", "CER.L",
+        "RWS.L", "RKH.L", "KGH.L", "NFG.L", "KP2.L", "BIG.L", "JHD.L", "LTHM.L",
+        "CMCL.L", "CAML.L", "CHRT.L", "CNC.L", "CRW.L", "DOTD.L", "FEVR.L", "ITM.L"
+    ]
+
+    combined = list(set(tickers + fallback_pool))
+    return combined
 
 def run_predictions():
     if ml_model is None:
         return pd.DataFrame(), False
 
-    # Fetch live universe without a hardcoded JSON
     full_universe = get_live_lse_universe()
     if not full_universe:
-        st.error("Failed to connect to exchange data. Retrying next loop.")
         return pd.DataFrame(), False
 
-    # Pick 50 random stocks for this cycle to avoid Yahoo Finance IP Bans (HTTP 429)
-    scan_chunk = random.sample(full_universe, min(50, len(full_universe)))
+    # Sample 35 stocks per cycle to respect Yahoo Finance rate limits
+    scan_chunk = random.sample(full_universe, min(35, len(full_universe)))
 
     results = []
     lgb_model = ml_model['lgb']
@@ -448,7 +469,6 @@ def run_predictions():
 
     for i, ticker in enumerate(scan_chunk):
         try:
-            # auto_adjust=False prevents Yahoo crumb errors on raw downloads
             df = yf.Ticker(ticker).history(period="120d", auto_adjust=False)
             if df.empty or len(df) < 55 or engineer_features is None: 
                 prog.progress((i + 1) / len(scan_chunk))
@@ -517,12 +537,12 @@ def run_predictions():
 # ==============================================================================
 # 8. UI HEADER & SIDEBAR
 # ==============================================================================
-st.sidebar.header("⚙️ Autonomous Scanner Settings")
-selected_universe = st.sidebar.selectbox("Stock Universe", ["Live Web-Scraped UK Market (Rotating)"])
+st.sidebar.header("⚙️ Scanner Settings")
+selected_universe = st.sidebar.selectbox("Universe Mode", ["Rotating Active Market Basket (FTSE + AIM)"])
 
 st.sidebar.markdown("---")
 st.sidebar.header("🔌 Broker Execution Bridge")
-broker_mode = st.sidebar.selectbox("Execution Gateway", ["Paper Trading (Simulated)", "Interactive Brokers", "IG Group API"])
+broker_mode = st.sidebar.selectbox("Gateway", ["Paper Trading (Simulated)", "Interactive Brokers", "IG Group API"])
 
 st.sidebar.markdown("---")
 st.sidebar.header("🔄 Autonomous Loop")
@@ -543,9 +563,9 @@ st.caption(f"Status: **Autonomous AI Active** • Database: **{db_status_text}**
 
 tab_scanner, tab_options, tab_journal, tab_reasoning = st.tabs([
     "🎯 Equity High-Certainty Signals", 
-    "📊 FTSE Leveraged Alpha (1 Signal/Day, < £500 Cap)", 
+    "📊 FTSE Leveraged Alpha (Budget < £500)", 
     "📖 Automated Trade Journal & P&L",
-    "🧠 AI Reasoning & Self-Learning"
+    "🧠 AI Reasoning & Decision Matrix"
 ])
 
 # ==============================================================================
@@ -559,12 +579,13 @@ with tab_scanner:
     if re_scan or "scan_results" not in st.session_state:
         with st.spinner("Executing quant screen across London market universe..."):
             res_df, has_cleared = run_predictions()
-            st.session_state["scan_results"] = res_df
-            st.session_state["has_cleared"] = has_cleared
+            if not res_df.empty:
+                st.session_state["scan_results"] = res_df
+                st.session_state["has_cleared"] = has_cleared
 
     df_res = st.session_state.get("scan_results", pd.DataFrame())
     if st.session_state.get("has_cleared", False) and not df_res.empty:
-        st.success(f"🟢 **{len(df_res)} High-Conviction Buy Setup(s) Cleared All Strict Institutional Gates**")
+        st.success(f"🟢 **{len(df_res)} High-Conviction Buy Setup(s) Cleared All Institutional Gates**")
         
         # Spotlight Cards for Top 3
         st.markdown("### 🔥 Top Conviction Spotlights")
@@ -588,7 +609,7 @@ with tab_scanner:
         # Full Table View for All Qualified Equities
         st.markdown(f"### 📋 All {len(df_res)} Qualified Equities (Ranked by AI Score)")
         display_cols = ["Ticker", "Price (p)", "Target (p)", "Stop Loss (p)", "Expected Return", "AI Win Confidence", "Recommended Shares", "RNS"]
-        st.dataframe(df_res[display_cols], use_container_width=True, hide_index=True)
+        st.dataframe(df_res[display_cols], width="stretch", hide_index=True)
     else:
         st.warning("🛡️ **Capital Protection Active:** No equities currently pass all combined volume, trend, and ML filters.")
 
@@ -633,6 +654,7 @@ with tab_journal:
     with j_col2:
         if st.button("🔄 Sync & Reconcile Live Market", width="stretch"):
             audit_and_reconcile_all_trades()
+            hydrate_duckdb_from_supabase()
             st.success("Ledger reconciled with live LSE order flow.")
             st.rerun()
 
@@ -671,9 +693,6 @@ with tab_journal:
         cols_to_keep = ["Date", "Symbol", "Asset", "Entry (p)", "Target (p)", "Stop (p)", "Live Price (p)", "P&L (%)", "Status", "Last Checked"]
         master_df = master_df[[c for c in cols_to_keep if c in master_df.columns]]
         
-        if "Last Checked" in master_df.columns:
-            master_df["Last Checked"] = pd.to_datetime(master_df["Last Checked"]).dt.strftime('%Y-%m-%d %H:%M LON')
-        
         for p_col in ["Entry (p)", "Target (p)", "Stop (p)", "Live Price (p)"]:
             if p_col in master_df.columns:
                 master_df[p_col] = master_df[p_col].apply(lambda x: f"{float(x):.2f}p" if pd.notnull(x) else "-")
@@ -681,12 +700,12 @@ with tab_journal:
         if "P&L (%)" in master_df.columns:
             master_df["P&L (%)"] = master_df["P&L (%)"].apply(lambda x: f"{float(x):+.2f}%" if pd.notnull(x) else "0.00%")
 
-        st.dataframe(master_df, use_container_width=True, hide_index=True)
+        st.dataframe(master_df, width="stretch", hide_index=True)
     else:
         st.info("No trades currently logged. Active trades will appear here as the engine confirms signals.")
 
 # ==============================================================================
-# 12. TAB 4: AI REASONING & SELF-LEARNING DASHBOARD
+# 12. TAB 4: AI REASONING & DECISION MATRIX
 # ==============================================================================
 with tab_reasoning:
     st.subheader("🧠 Explainable AI & Autonomous Decision Matrix")
