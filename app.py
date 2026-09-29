@@ -6,7 +6,8 @@ import calendar
 from pathlib import Path
 from datetime import datetime, time as dtime
 import time
-import json
+import random
+import requests
 
 import streamlit as st
 import pandas as pd
@@ -146,7 +147,6 @@ hydrate_duckdb_from_supabase()
 st.set_page_config(page_title="ALPHA-LSE Quant Terminal", page_icon="⚡", layout="wide", initial_sidebar_state="collapsed")
 
 MODEL_PATH = os.path.join(ROOT_DIR, "models", "ensemble_ranker.joblib")
-UNIVERSE_FILE = os.path.join(ROOT_DIR, "data", "universe.json")
 LOT_SIZES = {"SHEL": 1000, "AZN": 500, "HSBA": 2000, "ULVR": 500, "BP": 3000, "BARC": 5000, "RIO": 250, "GLEN": 4000}
 
 def is_lse_market_open() -> bool:
@@ -176,13 +176,13 @@ def check_password():
         st.subheader("🔐 ALPHA-LSE Quant Terminal - Secure Login")
         st.text_input("Username", key="username")
         st.text_input("Password", type="password", key="password")
-        st.button("Log In", on_click=password_entered, use_container_width=True)
+        st.button("Log In", on_click=password_entered, width="stretch")
         return False
     elif not st.session_state["password_correct"]:
         st.subheader("🔐 ALPHA-LSE Quant Terminal - Secure Login")
         st.text_input("Username", key="username")
         st.text_input("Password", type="password", key="password")
-        st.button("Log In", on_click=password_entered, use_container_width=True)
+        st.button("Log In", on_click=password_entered, width="stretch")
         st.error("😕 Invalid username or password")
         return False
     return True
@@ -397,7 +397,7 @@ def log_equity_signal_safely(sig: dict):
             pass
 
 # ==============================================================================
-# 7. ML PREDICTION PIPELINE
+# 7. ML PREDICTION PIPELINE (DYNAMIC ROTATING SCRAPER)
 # ==============================================================================
 @st.cache_resource
 def load_ml_model():
@@ -406,37 +406,64 @@ def load_ml_model():
 
 ml_model = load_ml_model()
 
+def get_live_lse_universe() -> list:
+    """Dynamically scrapes live UK market indices directly from the web."""
+    tickers = []
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    
+    try:
+        url_100 = "https://en.wikipedia.org/wiki/FTSE_100_Index"
+        df_100 = pd.read_html(requests.get(url_100, headers=headers).text, attrs={'id': 'constituents'})[0]
+        tickers.extend([f"{t.replace('.', '-')}.L" for t in df_100['Ticker'].dropna()])
+    except Exception: pass
+    
+    try:
+        url_250 = "https://en.wikipedia.org/wiki/FTSE_250_Index"
+        df_250 = pd.read_html(requests.get(url_250, headers=headers).text, attrs={'id': 'constituents'})[0]
+        tickers.extend([f"{t.replace('.', '-')}.L" for t in df_250['Ticker'].dropna()])
+    except Exception: pass
+
+    # Clean duplicates and return
+    return list(set(tickers))
+
 def run_predictions():
-    if ml_model is None or not os.path.exists(UNIVERSE_FILE):
+    if ml_model is None:
         return pd.DataFrame(), False
 
-    with open(UNIVERSE_FILE, "r") as f:
-        target_basket = json.load(f)
+    # Fetch live universe without a hardcoded JSON
+    full_universe = get_live_lse_universe()
+    if not full_universe:
+        st.error("Failed to connect to exchange data. Retrying next loop.")
+        return pd.DataFrame(), False
+
+    # Pick 50 random stocks for this cycle to avoid Yahoo Finance IP Bans (HTTP 429)
+    scan_chunk = random.sample(full_universe, min(50, len(full_universe)))
 
     results = []
     lgb_model = ml_model['lgb']
     cb_model = ml_model['catboost']
     feature_cols = ml_model['feature_cols']
 
-    prog = st.progress(0, text=f"Scanning {len(target_basket)} UK equities...")
+    prog = st.progress(0, text=f"Scanning rotating chunk of {len(scan_chunk)} UK equities...")
 
-    for i, ticker in enumerate(target_basket):
+    for i, ticker in enumerate(scan_chunk):
         try:
+            # auto_adjust=False prevents Yahoo crumb errors on raw downloads
             df = yf.Ticker(ticker).history(period="120d", auto_adjust=False)
             if df.empty or len(df) < 55 or engineer_features is None: 
-                prog.progress((i + 1) / len(target_basket))
+                prog.progress((i + 1) / len(scan_chunk))
                 continue
             
             df.reset_index(inplace=True)
             feats = engineer_features(df)
             if feats.empty: 
-                prog.progress((i + 1) / len(target_basket))
+                prog.progress((i + 1) / len(scan_chunk))
                 continue
             latest = feats.iloc[-1:].copy()
 
             rns_data = fetch_direct_rns_for_ticker(ticker)
             if "Dilution" in rns_data['status']: 
-                prog.progress((i + 1) / len(target_basket))
+                prog.progress((i + 1) / len(scan_chunk))
                 continue
 
             p1 = float(lgb_model.predict_proba(latest[feature_cols])[:, 1][0])
@@ -473,7 +500,7 @@ def run_predictions():
             })
         except Exception:
             pass
-        prog.progress((i + 1) / len(target_basket))
+        prog.progress((i + 1) / len(scan_chunk))
 
     prog.empty()
     if not results: return pd.DataFrame(), False
@@ -481,7 +508,6 @@ def run_predictions():
     df_out = pd.DataFrame(results).sort_values(by=["Qualified", "Adjusted Score", "ReturnNum"], ascending=[False, False, False]).reset_index(drop=True)
     qualified_only = df_out[df_out["Qualified"] == True].copy()
     
-    # Save all qualified signals to DuckDB and Supabase
     if not qualified_only.empty:
         for _, sig in qualified_only.iterrows():
             log_equity_signal_safely(sig.to_dict())
@@ -492,7 +518,7 @@ def run_predictions():
 # 8. UI HEADER & SIDEBAR
 # ==============================================================================
 st.sidebar.header("⚙️ Autonomous Scanner Settings")
-selected_universe = st.sidebar.selectbox("Stock Universe", ["UK AIM Micro-Caps (High Growth)", "FTSE 100 (Blue Chip)", "FTSE 250"])
+selected_universe = st.sidebar.selectbox("Stock Universe", ["Live Web-Scraped UK Market (Rotating)"])
 
 st.sidebar.markdown("---")
 st.sidebar.header("🔌 Broker Execution Bridge")
@@ -504,7 +530,7 @@ market_is_open = is_lse_market_open()
 auto_mode = st.sidebar.toggle("Continuous Background Mode", value=market_is_open)
 refresh_interval_sec = st.sidebar.selectbox("Refresh Interval", [300, 600, 3600], format_func=lambda x: f"{x//60} Minutes")
 
-if st.sidebar.button("🚪 Log Out", use_container_width=True):
+if st.sidebar.button("🚪 Log Out", width="stretch"):
     st.query_params.clear()
     st.session_state["password_correct"] = False
     st.rerun()
@@ -528,7 +554,7 @@ tab_scanner, tab_options, tab_journal, tab_reasoning = st.tabs([
 with tab_scanner:
     col1, col2 = st.columns([4, 1])
     with col1: st.write("Equities screened via Dual-Ensemble ML, Amihud illiquidity, and direct LSE RNS checks:")
-    with col2: re_scan = st.button("🔄 Run Live Scan Now", use_container_width=True, type="primary")
+    with col2: re_scan = st.button("🔄 Run Live Scan Now", width="stretch", type="primary")
 
     if re_scan or "scan_results" not in st.session_state:
         with st.spinner("Executing quant screen across London market universe..."):
@@ -556,7 +582,7 @@ with tab_scanner:
                         f"⏱️ **Horizon:** `{row['Est. Time to Target']}`  \n"
                         f"📦 **Size:** `{row['Recommended Shares']}` (`{row['Total Cost (£)']}`)"
                     )
-                    if st.button(f"🚀 Execute Buy ({broker_mode})", key=f"exec_{row['Ticker']}_{idx}", use_container_width=True):
+                    if st.button(f"🚀 Execute Buy ({broker_mode})", key=f"exec_{row['Ticker']}_{idx}", width="stretch"):
                         st.info(f"Signal sent to {broker_mode}. Trade recorded to journal.")
 
         # Full Table View for All Qualified Equities
@@ -594,7 +620,7 @@ with tab_options:
             m3.success(f"Status: **{opt_signal['status']}** (Audited: {str(opt_signal['last_audited'])[:16]})")
 
             st.write("")
-            if st.button(f"🚀 Send Option Order to Broker ({broker_mode})", key="exec_opt_btn", use_container_width=True):
+            if st.button(f"🚀 Send Option Order to Broker ({broker_mode})", key="exec_opt_btn", width="stretch"):
                 st.success(f"Signal securely dispatched to {broker_mode} gateway.")
 
 # ==============================================================================
@@ -605,7 +631,7 @@ with tab_journal:
     
     j_col1, j_col2 = st.columns([4, 1])
     with j_col2:
-        if st.button("🔄 Sync & Reconcile Live Market", use_container_width=True):
+        if st.button("🔄 Sync & Reconcile Live Market", width="stretch"):
             audit_and_reconcile_all_trades()
             st.success("Ledger reconciled with live LSE order flow.")
             st.rerun()
