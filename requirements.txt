@@ -1,0 +1,16 @@
+streamlit
+pandas
+numpy
+joblib
+plotly
+yfinance
+pytz
+duckdb
+streamlit-autorefresh
+requests
+supabase
+feedparser
+beautifulsoup4
+lightgbm
+catboost
+scikit-learn
