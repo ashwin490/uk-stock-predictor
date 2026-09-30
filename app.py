@@ -154,7 +154,7 @@ def hydrate_duckdb_from_supabase():
                     float(o.get('current_option_price', 0.0)), float(o.get('target_premium', 0.0)),
                     float(o.get('stop_loss_premium', 0.0)), float(o.get('total_capital', 0.0)),
                     float(o.get('ai_confidence', 80.0)), float(o.get('implied_vol', 20.0)),
-                    str(o.get('status', 'ACTIVE')), float(o.get('pnl_pct', 0.0)), str(o.get('last_audited'))
+                    str(o.get('status', 'ACTIVE')).upper(), float(o.get('pnl_pct', 0.0)), str(o.get('last_audited'))
                 ])
     except Exception:
         pass
@@ -236,6 +236,7 @@ def audit_and_reconcile_all_trades():
                         new_status = "🛑 LOSS (STOPPED OUT)"
                         exit_price = curr
 
+                    # 1. Update Local Cache
                     con.execute("""
                         UPDATE trade_journal
                         SET latest_price = ?, pnl_pct = ?, status = ?, exit_price = ?,
@@ -243,6 +244,15 @@ def audit_and_reconcile_all_trades():
                             last_audited = ?
                         WHERE trade_id = ?
                     """, [curr, pnl, new_status, exit_price, new_status, now_str, now_str, tr["trade_id"]])
+
+                    # 2. Sync Status Back to Cloud (Bug Fix)
+                    if supabase:
+                        supabase.table("predictions").update({
+                            "status": new_status,
+                            "latest_price": curr,
+                            "pnl_pct": pnl,
+                            "last_checked": now_str
+                        }).eq("ticker", tkr).eq("predicted_date", tr["date_str"]).execute()
                 except Exception:
                     continue
 
@@ -264,19 +274,27 @@ def audit_and_reconcile_all_trades():
                     elif pnl_pct <= -50.0:
                         opt_status = "🛑 LOSS (STOPPED OUT)"
 
+                    # 1. Update Local Cache
                     con.execute("""
                         UPDATE daily_options_journal
                         SET underlying_spot = ?, pnl_pct = ?, status = ?, last_audited = ?
                         WHERE date_key = ?
                     """, [current_spot, pnl_pct, opt_status, now_str, opt["date_key"]])
+
+                    # 2. Sync Status Back to Cloud (Bug Fix)
+                    if supabase:
+                        supabase.table("options_journal").update({
+                            "status": opt_status,
+                            "underlying_spot": current_spot,
+                            "pnl_pct": pnl_pct,
+                            "last_audited": now_str
+                        }).eq("date_key", opt["date_key"]).execute()
                 except Exception:
                     continue
     except Exception:
         pass
     finally:
         con.close()
-
-audit_and_reconcile_all_trades()
 
 # ==============================================================================
 # 5. OPTIONS ENGINE (BLACK-SCHOLES FOR FTSE BLUE CHIPS)
@@ -421,7 +439,6 @@ def get_live_lse_universe() -> list:
     tickers = []
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     
-    # Try live scraping FTSE 100
     try:
         url_100 = "https://en.wikipedia.org/wiki/FTSE_100_Index"
         df_100 = pd.read_html(requests.get(url_100, headers=headers, timeout=5).text, attrs={'id': 'constituents'})[0]
@@ -429,7 +446,6 @@ def get_live_lse_universe() -> list:
     except Exception:
         pass
     
-    # Try live scraping FTSE 250
     try:
         url_250 = "https://en.wikipedia.org/wiki/FTSE_250_Index"
         df_250 = pd.read_html(requests.get(url_250, headers=headers, timeout=5).text, attrs={'id': 'constituents'})[0]
@@ -437,7 +453,6 @@ def get_live_lse_universe() -> list:
     except Exception:
         pass
 
-    # Verified, highly liquid fallback list of active AIM & FTSE constituents
     fallback_pool = [
         "SHEL.L", "AZN.L", "HSBA.L", "ULVR.L", "BP.L", "BARC.L", "RIO.L", "GLEN.L",
         "GSK.L", "BATS.L", "LSEG.L", "NG.L", "BUR.L", "BRCK.L", "MIDW.L", "VIC.L",
@@ -457,7 +472,6 @@ def run_predictions():
     if not full_universe:
         return pd.DataFrame(), False
 
-    # Sample 35 stocks per cycle to respect Yahoo Finance rate limits
     scan_chunk = random.sample(full_universe, min(35, len(full_universe)))
 
     results = []
@@ -587,7 +601,6 @@ with tab_scanner:
     if st.session_state.get("has_cleared", False) and not df_res.empty:
         st.success(f"🟢 **{len(df_res)} High-Conviction Buy Setup(s) Cleared All Institutional Gates**")
         
-        # Spotlight Cards for Top 3
         st.markdown("### 🔥 Top Conviction Spotlights")
         cols = st.columns(min(len(df_res), 3))
         for idx, row in df_res.head(3).iterrows():
@@ -606,7 +619,6 @@ with tab_scanner:
                     if st.button(f"🚀 Execute Buy ({broker_mode})", key=f"exec_{row['Ticker']}_{idx}", width="stretch"):
                         st.info(f"Signal sent to {broker_mode}. Trade recorded to journal.")
 
-        # Full Table View for All Qualified Equities
         st.markdown(f"### 📋 All {len(df_res)} Qualified Equities (Ranked by AI Score)")
         display_cols = ["Ticker", "Price (p)", "Target (p)", "Stop Loss (p)", "Expected Return", "AI Win Confidence", "Recommended Shares", "RNS"]
         st.dataframe(df_res[display_cols], width="stretch", hide_index=True)
@@ -771,5 +783,8 @@ with tab_reasoning:
 # ==============================================================================
 # 13. AUTO-REFRESH LOOP
 # ==============================================================================
-if auto_mode and is_lse_market_open() and st_autorefresh:
-    st_autorefresh(interval=refresh_interval_sec * 1000, key="auto_refresh")
+# Run the reconciliation engine before auto-refresh so the UI has the latest data
+if auto_mode and is_lse_market_open():
+    audit_and_reconcile_all_trades()
+    if st_autorefresh:
+        st_autorefresh(interval=refresh_interval_sec * 1000, key="auto_refresh")
