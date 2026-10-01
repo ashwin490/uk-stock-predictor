@@ -36,6 +36,7 @@ except ImportError:
 
 ROOT_DIR = Path(__file__).resolve().parent
 DB_PATH = os.path.join(ROOT_DIR, "lse_market_data.duckdb")
+MAX_DAILY_EQUITY_TRADES = 5
 
 # ==============================================================================
 # 1. INITIALIZE HYBRID DATABASE (DUCKDB LOCAL + SUPABASE CLOUD)
@@ -64,7 +65,6 @@ def init_duckdb_storage():
                 features_json VARCHAR DEFAULT '{}'
             )
         """)
-        # Ensure features_json column exists if table was created earlier
         try:
             con.execute("ALTER TABLE trade_journal ADD COLUMN features_json VARCHAR DEFAULT '{}'")
         except Exception:
@@ -111,7 +111,9 @@ def get_supabase_client():
     if not url or not key:
         return None
     try:
-        return create_client(url, key)
+        # Sanitize URL to prevent PostgREST PGRST125 path errors
+        clean_url = url.strip().split("/rest/v1")[0].rstrip("/")
+        return create_client(clean_url, key.strip())
     except Exception as e:
         st.session_state["db_error"] = f"Supabase Auth Error: {e}"
         return None
@@ -127,7 +129,6 @@ def hydrate_duckdb_from_supabase():
         return
     con = duckdb.connect(DB_PATH, read_only=False)
     try:
-        # 1. Hydrate Equities
         res_eq = supabase.table("predictions").select("*").execute()
         if res_eq.data:
             for r in res_eq.data:
@@ -139,8 +140,6 @@ def hydrate_duckdb_from_supabase():
                 last_check = str(r.get('last_checked') or datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
                 f_json = json.dumps(r.get('features_json') or {})
                 status_val = str(r.get('status', 'ACTIVE')).upper()
-                if status_val == "ACTIVE":
-                    status_val = "ACTIVE"
 
                 con.execute("""
                     INSERT OR REPLACE INTO trade_journal 
@@ -157,11 +156,12 @@ def hydrate_duckdb_from_supabase():
                     float(r.get('latest_price', 0.0)) if "LOSS" in status_val or "WIN" in status_val else 0.0,
                     last_check, f_json
                 ])
+        if "db_error" in st.session_state and "Hydrate" in st.session_state["db_error"]:
+            del st.session_state["db_error"]
     except Exception as e:
         record_db_error("Hydrate Equities", e)
 
     try:
-        # 2. Hydrate Options
         res_opt = supabase.table("options_journal").select("*").execute()
         if res_opt.data:
             for o in res_opt.data:
@@ -322,12 +322,14 @@ def audit_and_reconcile_all_trades():
         con.close()
 
 # ==============================================================================
-# 5. CLOSED-LOOP SELF-LEARNING ENGINE
+# 5. CLOSED-LOOP SELF-LEARNING ENGINE (75TH PERCENTILE ATR FLOOR)
 # ==============================================================================
 def get_self_learning_adjustment(ticker: str, current_atr_pct: float) -> dict:
     """
-    Analyzes historical closed trades in trade_journal to compute real-time
-    confidence penalties or boosts based on past wins, losses, and volatility regimes.
+    Computes empirical confidence adjustments from closed trades:
+    - -15% per prior stop-out on the same ticker
+    - +5% per prior target hit on the same ticker
+    - -10% if current ATR % exceeds the 75th percentile of historical loss ATRs (minimum 3.0% floor)
     """
     con = duckdb.connect(DB_PATH, read_only=True)
     delta = 0
@@ -351,7 +353,7 @@ def get_self_learning_adjustment(ticker: str, current_atr_pct: float) -> dict:
                 delta += bst
                 reasons.append(f"+{bst}% ({wins}x prior target hit on {ticker})")
 
-        # 2. Cross-Sectional Volatility Regime Autopsy
+        # 2. Cross-Sectional Volatility Regime Autopsy (75th Percentile with 3.0% Floor)
         all_losses = hist[hist["status"].str.contains("LOSS", na=False)]
         if not all_losses.empty:
             loss_atrs = []
@@ -363,10 +365,10 @@ def get_self_learning_adjustment(ticker: str, current_atr_pct: float) -> dict:
                 except Exception:
                     pass
             if loss_atrs:
-                avg_loss_atr = float(np.mean(loss_atrs))
-                if current_atr_pct >= avg_loss_atr and avg_loss_atr > 0:
+                p75_loss_atr = max(3.0, float(np.percentile(loss_atrs, 75)))
+                if current_atr_pct >= p75_loss_atr:
                     delta -= 10
-                    reasons.append(f"-10% (Matches high-ATR loss regime >= {avg_loss_atr:.1f}%)")
+                    reasons.append(f"-10% (High-ATR regime >= {p75_loss_atr:.1f}%)")
     except Exception:
         pass
     finally:
@@ -456,7 +458,7 @@ def generate_daily_options_alpha() -> dict:
     return sig
 
 # ==============================================================================
-# 7. SAFE LOGGING (NO DUPLICATE ACTIVE POSITIONS)
+# 7. SAFE LOGGING (STRICT MAX 5 NEW TRADES PER DAY CAP)
 # ==============================================================================
 def log_equity_signal_safely(sig: dict):
     con = duckdb.connect(DB_PATH, read_only=False)
@@ -469,7 +471,12 @@ def log_equity_signal_safely(sig: dict):
     f_json_str = json.dumps(f_dict)
 
     try:
-        # Prevent opening a duplicate trade if this ticker is ALREADY ACTIVE from a prior day
+        # 1. Enforce strict daily cap of MAX_DAILY_EQUITY_TRADES (5)
+        today_count_df = con.execute("SELECT COUNT(*) AS cnt FROM trade_journal WHERE date_str = ?", [today_str]).df()
+        if not today_count_df.empty and int(today_count_df["cnt"].iloc[0]) >= MAX_DAILY_EQUITY_TRADES:
+            return
+
+        # 2. Prevent duplicate entry if ticker is already ACTIVE or logged today
         existing = con.execute("""
             SELECT trade_id FROM trade_journal 
             WHERE ticker = ? AND (status = 'ACTIVE' OR date_str = ?)
@@ -494,7 +501,11 @@ def log_equity_signal_safely(sig: dict):
 
     if supabase:
         try:
-            # Also check if ticker is already Active or logged today in Supabase
+            # Verify daily count in Supabase before inserting
+            today_cloud = supabase.table("predictions").select("id").eq("predicted_date", today_str).execute()
+            if today_cloud.data and len(today_cloud.data) >= MAX_DAILY_EQUITY_TRADES:
+                return
+
             c_check = supabase.table("predictions").select("id, status, predicted_date").eq("ticker", ticker).execute()
             already_open_or_today = False
             if c_check.data:
@@ -529,7 +540,7 @@ def log_equity_signal_safely(sig: dict):
             record_db_error("Insert Equity", e)
 
 # ==============================================================================
-# 8. SCRAPER & ML PIPELINE WITH SELF-LEARNING FEEDBACK
+# 8. SCRAPER & ML PIPELINE WITH CALIBRATED CONFIDENCE SCALING
 # ==============================================================================
 @st.cache_resource
 def load_ml_model():
@@ -603,7 +614,7 @@ def run_predictions():
 
             p1 = float(lgb_model.predict_proba(latest[feature_cols])[:, 1][0])
             p2 = float(cb_model.predict_proba(latest[feature_cols])[:, 1][0])
-            blended = (0.5 * p1 + 0.5 * p2) + rns_data['delta']
+            blended = max(0.01, min(0.99, (0.5 * p1 + 0.5 * p2) + rns_data['delta']))
 
             close = float(latest['Close'].values[0])
             atr = float(latest['atr_14'].values[0])
@@ -613,17 +624,19 @@ def run_predictions():
             stop = close - (1.2 * atr)
             return_pct = round(((target - close) / close) * 100, 1)
 
-            base_confidence = int(min(98, max(52, round((blended / 0.35) * 85))))
+            # De-saturated Base ML calibration curve (spreads probabilities smoothly from 45% to 96%)
+            base_confidence = int(min(96, max(45, round(45.0 + (blended ** 0.85) * 52.0))))
 
-            # Apply Real Self-Learning Feedback Loop
+            # Apply Closed-Loop Self-Learning Adjustment
             learner = get_self_learning_adjustment(ticker, atr_pct)
-            final_confidence = int(min(99, max(25, base_confidence + learner["delta"])))
+            final_confidence = int(min(98, max(25, base_confidence + learner["delta"])))
 
             shares = int((500.0 * 100) / close) if close > 0 else 1
-            is_qualified = final_confidence >= 60
+            is_qualified = final_confidence >= 65
 
             feature_snapshot = {
                 "atr_pct": atr_pct,
+                "raw_prob": round(blended, 4),
                 "base_ml_conf": base_confidence,
                 "learner_delta": learner["delta"]
             }
@@ -660,8 +673,9 @@ def run_predictions():
     df_out = pd.DataFrame(results).sort_values(by=["Qualified", "Adjusted Score", "ReturnNum"], ascending=[False, False, False]).reset_index(drop=True)
     qualified_only = df_out[df_out["Qualified"] == True].copy()
 
+    # Only auto-log the Top 5 highest-conviction setups per day
     if not qualified_only.empty:
-        for _, sig in qualified_only.iterrows():
+        for _, sig in qualified_only.head(MAX_DAILY_EQUITY_TRADES).iterrows():
             log_equity_signal_safely(sig.to_dict())
 
     return qualified_only, not qualified_only.empty
@@ -671,6 +685,7 @@ def run_predictions():
 # ==============================================================================
 st.sidebar.header("⚙️ Scanner Settings")
 selected_universe = st.sidebar.selectbox("Universe Mode", ["Rotating Active Market Basket (FTSE + AIM)"])
+st.sidebar.caption(f"Daily Auto-Log Cap: **Top {MAX_DAILY_EQUITY_TRADES} Picks/Day**")
 
 st.sidebar.markdown("---")
 st.sidebar.header("🔌 Broker Execution Bridge")
@@ -709,7 +724,7 @@ tab_scanner, tab_options, tab_journal, tab_reasoning = st.tabs([
 with tab_scanner:
     col1, col2 = st.columns([4, 1])
     with col1:
-        st.write("Equities screened via Dual-Ensemble ML, Closed-Loop Self-Learning, and LSE RNS checks:")
+        st.write(f"Equities screened via Calibrated Dual-Ensemble ML, Self-Learning Memory, and RNS checks (Auto-logging Top {MAX_DAILY_EQUITY_TRADES}/day):")
     with col2:
         re_scan = st.button("🔄 Run Live Scan Now", width="stretch", type="primary")
 
@@ -722,7 +737,7 @@ with tab_scanner:
 
     df_res = st.session_state.get("scan_results", pd.DataFrame())
     if st.session_state.get("has_cleared", False) and not df_res.empty:
-        st.success(f"🟢 **{len(df_res)} High-Conviction Buy Setup(s) Cleared All Institutional Gates**")
+        st.success(f"🟢 **{len(df_res)} Setup(s) Cleared Gates (Top {min(MAX_DAILY_EQUITY_TRADES, len(df_res))} Logged to Daily Ledger)**")
 
         st.markdown("### 🔥 Top Conviction Spotlights")
         cols = st.columns(min(len(df_res), 3))
@@ -733,16 +748,16 @@ with tab_scanner:
                     st.subheader(row['Ticker'])
                     st.metric(label="Target Gain", value=row["Expected Return"], delta=f"Entry: {row['Price (p)']}p")
                     st.markdown(
+                        f"🤖 **Final AI Score:** `{row['AI Win Confidence']}` *(Base: {row['Base ML']}, Adj: {row['Learner Delta']})*  \n"
+                        f"🧠 **Memory Rule:** `{row['Learner Note']}`  \n"
                         f"📰 **RNS Flow:** `{row['RNS']}`  \n"
-                        f"🧠 **Self-Learner Adj:** `{row['Learner Delta']}` ({row['Learner Note']})  \n"
-                        f"🎯 **Target Sell:** `{row['Target (p)']}p`  \n"
-                        f"🛑 **Stop-Loss:** `{row['Stop Loss (p)']}p`  \n"
+                        f"🎯 **Target Sell:** `{row['Target (p)']}p` | 🛑 **Stop:** `{row['Stop Loss (p)']}p`  \n"
                         f"📦 **Size:** `{row['Recommended Shares']}` (`{row['Total Cost (£)']}`)"
                     )
                     if st.button(f"🚀 Execute Buy ({broker_mode})", key=f"exec_{row['Ticker']}_{idx}", width="stretch"):
                         st.info(f"Signal sent to {broker_mode}. Trade recorded to journal.")
 
-        st.markdown(f"### 📋 All {len(df_res)} Qualified Equities (Ranked by AI Score)")
+        st.markdown(f"### 📋 All {len(df_res)} Qualified Equities (Ranked by Final AI Score)")
         display_cols = ["Ticker", "Price (p)", "Target (p)", "Stop Loss (p)", "Expected Return", "Base ML", "Learner Delta", "AI Win Confidence", "Recommended Shares", "RNS"]
         st.dataframe(df_res[display_cols], width="stretch", hide_index=True)
     else:
@@ -840,7 +855,7 @@ with tab_journal:
 # ==============================================================================
 with tab_reasoning:
     st.subheader("🧠 Explainable AI & Closed-Loop Self-Learning")
-    st.caption("Live breakdown of Base ML probabilities, Historical Stop-Loss Penalties, and Volatility Regime Autopsies.")
+    st.caption("Live breakdown of Calibrated Base ML probabilities, Historical Stop-Loss Penalties, and 75th-Percentile Volatility Regime Autopsies.")
 
     df_scan = st.session_state.get("scan_results", pd.DataFrame())
 
@@ -855,7 +870,7 @@ with tab_reasoning:
                     st.progress(min(float(str(row['AI Win Confidence']).replace('%', '')) / 100.0, 1.0))
                     st.markdown(f"""
                     **Institutional Layer Breakdown:**
-                    * 🤖 **Dual ML Ensemble:** LightGBM + CatBoost (`{row['Base ML']}`)
+                    * 🤖 **Calibrated ML Ensemble:** LightGBM + CatBoost (`{row['Base ML']}`)
                     * 🧠 **Self-Learner Memory:** `{row['Learner Note']}`
                     * 📰 **RNS Gate:** `{row['RNS']}`
                     * ⚖️ **Capital Allocation:** £500 (`{row['Recommended Shares']}`)
@@ -878,7 +893,7 @@ with tab_reasoning:
                     st.write(f"**Entry:** `{c_row['entry_price']:.2f}p` | **Exit/Last:** `{c_row['latest_price']:.2f}p`")
                     st.code(f"Recorded Feature Vector: {c_row['features_json']}", language="json")
                     if "LOSS" in str(c_row['status']):
-                        st.error("Active Rule Applied: Future setups on this ticker receive a -15% confidence penalty, and its ATR volatility signature is added to the regime filter.")
+                        st.error("Active Rule Applied: Future setups on this ticker receive a -15% confidence penalty, and its ATR volatility signature feeds the 75th-percentile regime filter (min 3.0% floor).")
                     else:
                         st.success("Active Rule Applied: Future setups on this ticker receive a +5% track-record confidence boost.")
         else:
