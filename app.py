@@ -325,12 +325,6 @@ def audit_and_reconcile_all_trades():
 # 5. CLOSED-LOOP SELF-LEARNING ENGINE (75TH PERCENTILE ATR FLOOR)
 # ==============================================================================
 def get_self_learning_adjustment(ticker: str, current_atr_pct: float) -> dict:
-    """
-    Computes empirical confidence adjustments from closed trades:
-    - -15% per prior stop-out on the same ticker
-    - +5% per prior target hit on the same ticker
-    - -10% if current ATR % exceeds the 75th percentile of historical loss ATRs (minimum 3.0% floor)
-    """
     con = duckdb.connect(DB_PATH, read_only=True)
     delta = 0
     reasons = []
@@ -339,7 +333,6 @@ def get_self_learning_adjustment(ticker: str, current_atr_pct: float) -> dict:
         if hist.empty:
             return {"delta": 0, "reason": "Neutral (Building closed-trade memory)"}
 
-        # 1. Ticker-Specific Empirical Memory
         t_hist = hist[hist["ticker"] == ticker]
         if not t_hist.empty:
             losses = len(t_hist[t_hist["status"].str.contains("LOSS", na=False)])
@@ -353,7 +346,6 @@ def get_self_learning_adjustment(ticker: str, current_atr_pct: float) -> dict:
                 delta += bst
                 reasons.append(f"+{bst}% ({wins}x prior target hit on {ticker})")
 
-        # 2. Cross-Sectional Volatility Regime Autopsy (75th Percentile with 3.0% Floor)
         all_losses = hist[hist["status"].str.contains("LOSS", na=False)]
         if not all_losses.empty:
             loss_atrs = []
@@ -471,12 +463,10 @@ def log_equity_signal_safely(sig: dict):
     f_json_str = json.dumps(f_dict)
 
     try:
-        # 1. Enforce strict daily cap of MAX_DAILY_EQUITY_TRADES (5)
         today_count_df = con.execute("SELECT COUNT(*) AS cnt FROM trade_journal WHERE date_str = ?", [today_str]).df()
         if not today_count_df.empty and int(today_count_df["cnt"].iloc[0]) >= MAX_DAILY_EQUITY_TRADES:
             return
 
-        # 2. Prevent duplicate entry if ticker is already ACTIVE or logged today
         existing = con.execute("""
             SELECT trade_id FROM trade_journal 
             WHERE ticker = ? AND (status = 'ACTIVE' OR date_str = ?)
@@ -501,7 +491,6 @@ def log_equity_signal_safely(sig: dict):
 
     if supabase:
         try:
-            # Verify daily count in Supabase before inserting
             today_cloud = supabase.table("predictions").select("id").eq("predicted_date", today_str).execute()
             if today_cloud.data and len(today_cloud.data) >= MAX_DAILY_EQUITY_TRADES:
                 return
@@ -624,10 +613,7 @@ def run_predictions():
             stop = close - (1.2 * atr)
             return_pct = round(((target - close) / close) * 100, 1)
 
-            # De-saturated Base ML calibration curve (spreads probabilities smoothly from 45% to 96%)
             base_confidence = int(min(96, max(45, round(45.0 + (blended ** 0.85) * 52.0))))
-
-            # Apply Closed-Loop Self-Learning Adjustment
             learner = get_self_learning_adjustment(ticker, atr_pct)
             final_confidence = int(min(98, max(25, base_confidence + learner["delta"])))
 
@@ -673,7 +659,6 @@ def run_predictions():
     df_out = pd.DataFrame(results).sort_values(by=["Qualified", "Adjusted Score", "ReturnNum"], ascending=[False, False, False]).reset_index(drop=True)
     qualified_only = df_out[df_out["Qualified"] == True].copy()
 
-    # Only auto-log the Top 5 highest-conviction setups per day
     if not qualified_only.empty:
         for _, sig in qualified_only.head(MAX_DAILY_EQUITY_TRADES).iterrows():
             log_equity_signal_safely(sig.to_dict())
@@ -681,7 +666,7 @@ def run_predictions():
     return qualified_only, not qualified_only.empty
 
 # ==============================================================================
-# 9. UI HEADER & SIDEBAR
+# 9. SIDEBAR & UNIFIED AUTONOMOUS LOOP CONTROLLER
 # ==============================================================================
 st.sidebar.header("⚙️ Scanner Settings")
 selected_universe = st.sidebar.selectbox("Universe Mode", ["Rotating Active Market Basket (FTSE + AIM)"])
@@ -696,6 +681,19 @@ st.sidebar.header("🔄 Autonomous Loop")
 market_is_open = is_lse_market_open()
 auto_mode = st.sidebar.toggle("Continuous Background Mode", value=market_is_open)
 refresh_interval_sec = st.sidebar.selectbox("Refresh Interval", [300, 600, 3600], format_func=lambda x: f"{x//60} Minutes")
+
+# Single Unified Timer: Drives BOTH Trade Auditing and Rotating Market Scans
+loop_tick = 0
+if auto_mode and st_autorefresh:
+    loop_tick = st_autorefresh(interval=refresh_interval_sec * 1000, key="unified_autonomous_loop")
+
+# Trigger a full refresh whenever the autonomous timer ticks (or on first boot)
+is_new_loop_tick = ("last_loop_tick" not in st.session_state) or (loop_tick != st.session_state["last_loop_tick"])
+
+if is_new_loop_tick:
+    audit_and_reconcile_all_trades()
+    hydrate_duckdb_from_supabase()
+    st.session_state["last_loop_tick"] = loop_tick
 
 if "db_error" in st.session_state:
     st.sidebar.error(f"⚠️ Cloud Sync Warning: {st.session_state['db_error']}")
@@ -728,8 +726,12 @@ with tab_scanner:
     with col2:
         re_scan = st.button("🔄 Run Live Scan Now", width="stretch", type="primary")
 
-    if re_scan or "scan_results" not in st.session_state:
-        with st.spinner("Executing quant screen across London market universe..."):
+    # Runs on initial load, manual click, OR every time the Autonomous Loop timer ticks
+    if re_scan or is_new_loop_tick or "scan_results" not in st.session_state:
+        with st.spinner("Executing quant screen & reconciling live trades..."):
+            if re_scan:
+                audit_and_reconcile_all_trades()
+                hydrate_duckdb_from_supabase()
             res_df, has_cleared = run_predictions()
             if not res_df.empty:
                 st.session_state["scan_results"] = res_df
@@ -797,8 +799,10 @@ with tab_journal:
     st.subheader("📖 Autonomous Master Ledger (Equities & Derivatives)")
 
     j_col1, j_col2 = st.columns([4, 1])
+    with j_col1:
+        st.caption(f"Automatically synced every **{refresh_interval_sec // 60} Minutes** via Autonomous Loop (Cycle #{loop_tick}).")
     with j_col2:
-        if st.button("🔄 Sync & Reconcile Live Market", width="stretch"):
+        if st.button("🔄 Force Manual Sync", width="stretch"):
             audit_and_reconcile_all_trades()
             hydrate_duckdb_from_supabase()
             st.success("Ledger reconciled with live LSE order flow and Supabase.")
@@ -879,6 +883,25 @@ with tab_reasoning:
         st.info("No active equity signals to analyze. Run the Live Scan on the Equity tab first.")
 
     st.markdown("---")
+    st.markdown("### 📊 Derivative & Leveraged Alpha Reasoning")
+    opt_sig = generate_daily_options_alpha()
+    if opt_sig:
+        with st.container(border=True):
+            d1, d2 = st.columns([1, 2])
+            with d1:
+                st.metric("Contract Evaluated", opt_sig["option_contract"])
+                st.write(f"**Model Implied Volatility:** `{opt_sig['implied_vol']}%`")
+                st.write(f"**Underlying Spot Price:** `{opt_sig['underlying_spot']:.2f}p`")
+                st.write(f"**Strike Selected (OTM):** `{opt_sig['strike_price']:.0f}p`")
+            with d2:
+                st.markdown("""
+                **Black-Scholes Volatility & Greeks Breakdown:**
+                * 📐 **Pricing Model:** Closed-form continuous Black-Scholes with a 5.0% Bank of England base rate proxy ($r = 0.05$).
+                * 🎯 **Moneyness:** Strike placed +2.0% Out-of-the-Money to maximize risk-reward leverage while capping time decay.
+                * 🛡️ **Risk Guard:** Maximum budget capped under £500 with strict stop-loss set at -50% premium depreciation.
+                """)
+
+    st.markdown("---")
     st.markdown("### 🛑 Post-Trade Autopsies (Active Memory Bank)")
     try:
         con = duckdb.connect(DB_PATH, read_only=True)
@@ -900,11 +923,3 @@ with tab_reasoning:
             st.success("🏆 **Zero Closed/Stopped-Out Trades in Current Memory.**\n\nAs trades hit their target or stop-loss, their feature vectors are permanently stored in Supabase and used to penalize or boost future scans.")
     except Exception:
         pass
-
-# ==============================================================================
-# 14. AUTO-REFRESH LOOP
-# ==============================================================================
-if auto_mode and is_lse_market_open():
-    audit_and_reconcile_all_trades()
-    if st_autorefresh:
-        st_autorefresh(interval=refresh_interval_sec * 1000, key="auto_refresh")
