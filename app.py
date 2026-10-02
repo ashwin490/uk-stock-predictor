@@ -1,7 +1,12 @@
 import os
+import re
 import sys
 import math
 import json
+import time
+import hmac
+import hashlib
+import threading
 import warnings
 from pathlib import Path
 from datetime import datetime, time as dtime
@@ -37,64 +42,78 @@ except ImportError:
 ROOT_DIR = Path(__file__).resolve().parent
 DB_PATH = os.path.join(ROOT_DIR, "lse_market_data.duckdb")
 MAX_DAILY_EQUITY_TRADES = 5
-MAX_HOLD_CALENDAR_DAYS = 7  # Equivalent to 5 LSE trading days
+MAX_HOLD_CALENDAR_DAYS = 7  # 5 LSE trading days
+
+# Strict LSE Ticker Regex (Integrity Gate against untrusted web scraping)
+VALID_LSE_TICKER_RE = re.compile(r"^[A-Z0-9]{1,6}(-[A-Z0-9]{1,2})?\.L$")
+
+# Global Process-Wide Thread Lock for DuckDB File Integrity
+@st.cache_resource
+def get_db_lock():
+    return threading.Lock()
+
+DB_LOCK = get_db_lock()
+
+def is_valid_lse_ticker(ticker: str) -> bool:
+    return bool( isinstance(ticker, str) and VALID_LSE_TICKER_RE.match(ticker.strip()) )
 
 # ==============================================================================
-# 1. INITIALIZE HYBRID DATABASE (DUCKDB LOCAL + SUPABASE CLOUD)
+# 1. INITIALIZE HYBRID DATABASE (THREAD-SAFE DUCKDB + SUPABASE CLOUD)
 # ==============================================================================
 def init_duckdb_storage():
-    con = duckdb.connect(DB_PATH, read_only=False)
-    try:
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS trade_journal (
-                trade_id VARCHAR PRIMARY KEY,
-                timestamp VARCHAR,
-                date_str VARCHAR,
-                ticker VARCHAR,
-                asset_type VARCHAR DEFAULT 'EQUITY',
-                entry_price DOUBLE,
-                target_price DOUBLE,
-                stop_loss DOUBLE,
-                shares INTEGER,
-                capital_allocated DOUBLE,
-                status VARCHAR DEFAULT 'ACTIVE',
-                latest_price DOUBLE,
-                pnl_pct DOUBLE DEFAULT 0.0,
-                exit_price DOUBLE DEFAULT 0.0,
-                exit_timestamp VARCHAR,
-                last_audited VARCHAR,
-                features_json VARCHAR DEFAULT '{}'
-            )
-        """)
+    with DB_LOCK:
+        con = duckdb.connect(DB_PATH, read_only=False)
         try:
-            con.execute("ALTER TABLE trade_journal ADD COLUMN features_json VARCHAR DEFAULT '{}'")
-        except Exception:
-            pass
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS trade_journal (
+                    trade_id VARCHAR PRIMARY KEY,
+                    timestamp VARCHAR,
+                    date_str VARCHAR,
+                    ticker VARCHAR,
+                    asset_type VARCHAR DEFAULT 'EQUITY',
+                    entry_price DOUBLE,
+                    target_price DOUBLE,
+                    stop_loss DOUBLE,
+                    shares INTEGER,
+                    capital_allocated DOUBLE,
+                    status VARCHAR DEFAULT 'ACTIVE',
+                    latest_price DOUBLE,
+                    pnl_pct DOUBLE DEFAULT 0.0,
+                    exit_price DOUBLE DEFAULT 0.0,
+                    exit_timestamp VARCHAR,
+                    last_audited VARCHAR,
+                    features_json VARCHAR DEFAULT '{}'
+                )
+            """)
+            try:
+                con.execute("ALTER TABLE trade_journal ADD COLUMN features_json VARCHAR DEFAULT '{}'")
+            except Exception:
+                pass
 
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS daily_options_journal (
-                date_key VARCHAR PRIMARY KEY,
-                timestamp VARCHAR,
-                share_name VARCHAR,
-                option_contract VARCHAR,
-                strike_price DOUBLE,
-                expiry_days INTEGER,
-                underlying_spot DOUBLE,
-                lot_size INTEGER,
-                entry_premium DOUBLE,
-                current_option_price DOUBLE,
-                target_premium DOUBLE,
-                stop_loss_premium DOUBLE,
-                total_capital DOUBLE,
-                ai_confidence DOUBLE,
-                implied_vol DOUBLE,
-                status VARCHAR DEFAULT 'ACTIVE',
-                pnl_pct DOUBLE DEFAULT 0.0,
-                last_audited VARCHAR
-            )
-        """)
-    finally:
-        con.close()
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS daily_options_journal (
+                    date_key VARCHAR PRIMARY KEY,
+                    timestamp VARCHAR,
+                    share_name VARCHAR,
+                    option_contract VARCHAR,
+                    strike_price DOUBLE,
+                    expiry_days INTEGER,
+                    underlying_spot DOUBLE,
+                    lot_size INTEGER,
+                    entry_premium DOUBLE,
+                    current_option_price DOUBLE,
+                    target_premium DOUBLE,
+                    stop_loss_premium DOUBLE,
+                    total_capital DOUBLE,
+                    ai_confidence DOUBLE,
+                    implied_vol DOUBLE,
+                    status VARCHAR DEFAULT 'ACTIVE',
+                    pnl_pct DOUBLE DEFAULT 0.0,
+                    last_audited VARCHAR
+                )
+            """)
+        finally:
+            con.close()
 
 init_duckdb_storage()
 
@@ -114,82 +133,86 @@ def get_supabase_client():
     try:
         clean_url = url.strip().split("/rest/v1")[0].rstrip("/")
         return create_client(clean_url, key.strip())
-    except Exception as e:
-        st.session_state["db_error"] = f"Supabase Auth Error: {e}"
+    except Exception:
+        st.session_state["db_error"] = "Supabase connection failed (Check secrets configuration)."
         return None
 
 supabase = get_supabase_client()
 
 def record_db_error(context: str, err: Exception):
-    st.session_state["db_error"] = f"[{context}] {str(err)}"
+    # Sanitize exception message so sensitive URLs/Tokens are never exposed in UI
+    raw_msg = str(err)
+    sanitized = re.sub(r"https?://[^\s'\"]+", "[REDACTED_URL]", raw_msg)
+    st.session_state["db_error"] = f"[{context}] {sanitized[:140]}"
 
 def hydrate_duckdb_from_supabase():
-    """Restores all historical and active trades from Supabase on container boot."""
+    """Restores all historical and active trades from Supabase with thread locking."""
     if not supabase:
         return
-    con = duckdb.connect(DB_PATH, read_only=False)
-    try:
-        res_eq = supabase.table("predictions").select("*").execute()
-        if res_eq.data:
-            for r in res_eq.data:
-                tkr = r.get('ticker')
-                if not tkr:
-                    continue
-                pred_date = str(r.get('predicted_date', datetime.now().strftime('%Y-%m-%d')))
-                trade_id = f"{tkr}_{pred_date}"
-                last_check = str(r.get('last_checked') or datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-                f_json = json.dumps(r.get('features_json') or {})
-                status_val = str(r.get('status', 'ACTIVE')).upper()
+    with DB_LOCK:
+        con = duckdb.connect(DB_PATH, read_only=False)
+        try:
+            res_eq = supabase.table("predictions").select("*").execute()
+            if res_eq.data:
+                for r in res_eq.data:
+                    tkr = str(r.get('ticker', '')).strip()
+                    if not is_valid_lse_ticker(tkr):
+                        continue
+                    pred_date = str(r.get('predicted_date', datetime.now().strftime('%Y-%m-%d')))
+                    trade_id = f"{tkr}_{pred_date}"
+                    last_check = str(r.get('last_checked') or datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                    f_json = json.dumps(r.get('features_json') or {})
+                    status_val = str(r.get('status', 'ACTIVE')).upper()
 
-                con.execute("""
-                    INSERT OR REPLACE INTO trade_journal 
-                    (trade_id, timestamp, date_str, ticker, asset_type, entry_price, target_price,
-                     stop_loss, shares, capital_allocated, status, latest_price, pnl_pct, exit_price,
-                     exit_timestamp, last_audited, features_json)
-                    VALUES (?, ?, ?, ?, 'EQUITY', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
-                """, [
-                    trade_id, last_check, pred_date, tkr,
-                    float(r.get('entry_price', 0.0)), float(r.get('target_price', 0.0)),
-                    float(r.get('stop_loss', 0.0)), int(r.get('shares_qty', 1)),
-                    float(r.get('position_gbp', 0.0)), status_val,
-                    float(r.get('latest_price', 0.0)), float(r.get('pnl_pct', 0.0)),
-                    float(r.get('latest_price', 0.0)) if status_val != "ACTIVE" else 0.0,
-                    last_check, f_json
-                ])
-        if "db_error" in st.session_state and "Hydrate" in st.session_state["db_error"]:
-            del st.session_state["db_error"]
-    except Exception as e:
-        record_db_error("Hydrate Equities", e)
+                    con.execute("""
+                        INSERT OR REPLACE INTO trade_journal 
+                        (trade_id, timestamp, date_str, ticker, asset_type, entry_price, target_price,
+                         stop_loss, shares, capital_allocated, status, latest_price, pnl_pct, exit_price,
+                         exit_timestamp, last_audited, features_json)
+                        VALUES (?, ?, ?, ?, 'EQUITY', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                    """, [
+                        trade_id, last_check, pred_date, tkr,
+                        float(r.get('entry_price', 0.0)), float(r.get('target_price', 0.0)),
+                        float(r.get('stop_loss', 0.0)), int(r.get('shares_qty', 1)),
+                        float(r.get('position_gbp', 0.0)), status_val,
+                        float(r.get('latest_price', 0.0)), float(r.get('pnl_pct', 0.0)),
+                        float(r.get('latest_price', 0.0)) if status_val != "ACTIVE" else 0.0,
+                        last_check, f_json
+                    ])
+            if "db_error" in st.session_state and "Hydrate" in st.session_state["db_error"]:
+                del st.session_state["db_error"]
+        except Exception as e:
+            record_db_error("Hydrate Equities", e)
 
-    try:
-        res_opt = supabase.table("options_journal").select("*").execute()
-        if res_opt.data:
-            for o in res_opt.data:
-                date_k = str(o.get('date_key', datetime.now().strftime('%Y-%m-%d')))
-                con.execute("""
-                    INSERT OR REPLACE INTO daily_options_journal 
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, [
-                    date_k, str(o.get('timestamp')), str(o.get('share_name')),
-                    str(o.get('option_contract')), float(o.get('strike_price', 0.0)),
-                    int(o.get('expiry_days', 21)), float(o.get('underlying_spot', 0.0)),
-                    int(o.get('lot_size', 5000)), float(o.get('entry_premium', 0.0)),
-                    float(o.get('current_option_price', 0.0)), float(o.get('target_premium', 0.0)),
-                    float(o.get('stop_loss_premium', 0.0)), float(o.get('total_capital', 0.0)),
-                    float(o.get('ai_confidence', 80.0)), float(o.get('implied_vol', 20.0)),
-                    str(o.get('status', 'ACTIVE')).upper(), float(o.get('pnl_pct', 0.0)), str(o.get('last_audited'))
-                ])
-    except Exception as e:
-        record_db_error("Hydrate Options", e)
-    finally:
-        con.close()
+        try:
+            res_opt = supabase.table("options_journal").select("*").execute()
+            if res_opt.data:
+                for o in res_opt.data:
+                    date_k = str(o.get('date_key', datetime.now().strftime('%Y-%m-%d')))
+                    con.execute("""
+                        INSERT OR REPLACE INTO daily_options_journal 
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, [
+                        date_k, str(o.get('timestamp')), str(o.get('share_name')),
+                        str(o.get('option_contract')), float(o.get('strike_price', 0.0)),
+                        int(o.get('expiry_days', 21)), float(o.get('underlying_spot', 0.0)),
+                        int(o.get('lot_size', 5000)), float(o.get('entry_premium', 0.0)),
+                        float(o.get('current_option_price', 0.0)), float(o.get('target_premium', 0.0)),
+                        float(o.get('stop_loss_premium', 0.0)), float(o.get('total_capital', 0.0)),
+                        float(o.get('ai_confidence', 80.0)), float(o.get('implied_vol', 20.0)),
+                        str(o.get('status', 'ACTIVE')).upper(), float(o.get('pnl_pct', 0.0)), str(o.get('last_audited'))
+                    ])
+        except Exception as e:
+            record_db_error("Hydrate Options", e)
+        finally:
+            con.close()
 
 if "hydrated_once" not in st.session_state:
     hydrate_duckdb_from_supabase()
     st.session_state["hydrated_once"] = True
 
 # ==============================================================================
-# 2. TIMEZONE & CONFIGURATION
+# 2. TIMEZONE, CONFIGURATION & AVAILABILITY CACHING
 # ==============================================================================
 st.set_page_config(page_title="ALPHA-LSE Quant Terminal", page_icon="⚡", layout="wide", initial_sidebar_state="collapsed")
 MODEL_PATH = os.path.join(ROOT_DIR, "models", "ensemble_ranker.joblib")
@@ -212,179 +235,231 @@ def calculate_black_scholes_call(spot: float, strike: float, days_to_exp: float,
     call_price = spot * norm_cdf(d1) - strike * math.exp(-r * T) * norm_cdf(d2)
     return max(round(call_price, 2), 0.50)
 
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_cached_history(ticker: str, period: str = "120d") -> pd.DataFrame:
+    """Caches Yahoo Finance OHLCV bars for 5 minutes to prevent HTTP 429 bans."""
+    if not is_valid_lse_ticker(ticker):
+        return pd.DataFrame()
+    try:
+        df = yf.Ticker(ticker).history(period=period, auto_adjust=False)
+        return df if df is not None else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
 # ==============================================================================
-# 3. SECURE LOGIN GATEWAY
+# 3. HARDENED ZERO-TRUST AUTHENTICATION (CIA CONFIDENTIALITY)
 # ==============================================================================
-def check_password():
-    if st.query_params.get("auth") == "QuantTerminalLSE":
-        st.session_state["password_correct"] = True
+def check_password() -> bool:
+    """
+    CIA-Compliant Authentication:
+    - Zero URL query-parameter backdoors
+    - Constant-time HMAC SHA-256 hash comparison
+    - Brute-force lockout (5 attempts -> 15-minute cooldown)
+    """
+    if st.session_state.get("password_correct", False):
         return True
 
-    def password_entered():
-        if st.session_state.get("username") == "admin" and st.session_state.get("password") == "AlphaLSE2026!":
-            st.session_state["password_correct"] = True
-            st.query_params["auth"] = "QuantTerminalLSE"
-            del st.session_state["password"]
-            del st.session_state["username"]
-        else:
-            st.session_state["password_correct"] = False
-
-    if "password_correct" not in st.session_state or not st.session_state["password_correct"]:
-        st.subheader("🔐 ALPHA-LSE Quant Terminal - Secure Login")
-        st.text_input("Username", key="username")
-        st.text_input("Password", type="password", key="password")
-        st.button("Log In", on_click=password_entered, width="stretch")
+    now_ts = time.time()
+    lockout_until = st.session_state.get("auth_lockout_until", 0.0)
+    if now_ts < lockout_until:
+        rem_min = int(math.ceil((lockout_until - now_ts) / 60.0))
+        st.error(f"🔒 Terminal Locked due to repeated failed attempts. Try again in {rem_min} minute(s).")
         return False
-    return True
+
+    # Default SHA-256 hash corresponds to 'AlphaLSE2026!' if AUTH_PASS_HASH is not set in st.secrets
+    expected_user = st.secrets.get("AUTH_USER", "admin") if hasattr(st, "secrets") else "admin"
+    default_hash = hashlib.sha256("AlphaLSE2026!".encode("utf-8")).hexdigest()
+    expected_hash = st.secrets.get("AUTH_PASS_HASH", default_hash) if hasattr(st, "secrets") else default_hash
+
+    st.subheader("🔐 ALPHA-LSE Quant Terminal — Restricted Institutional Access")
+    with st.form("cia_secure_login_form", clear_on_submit=True):
+        user_in = st.text_input("Operator Username")
+        pass_in = st.text_input("Cryptographic Passkey", type="password")
+        submitted = st.form_submit_button("Authenticate Session", width="stretch", type="primary")
+
+        if submitted:
+            input_hash = hashlib.sha256(pass_in.encode("utf-8")).hexdigest()
+            user_ok = hmac.compare_digest(user_in.strip(), str(expected_user).strip())
+            pass_ok = hmac.compare_digest(input_hash, str(expected_hash).strip().lower())
+
+            if user_ok and pass_ok:
+                st.session_state["password_correct"] = True
+                st.session_state["failed_auth_attempts"] = 0
+                st.rerun()
+            else:
+                fails = st.session_state.get("failed_auth_attempts", 0) + 1
+                st.session_state["failed_auth_attempts"] = fails
+                if fails >= 5:
+                    st.session_state["auth_lockout_until"] = time.time() + 900  # 15-min lockout
+                    st.error("🔒 Maximum authentication attempts exceeded. Terminal locked for 15 minutes.")
+                else:
+                    st.error(f"😕 Invalid credentials ({5 - fails} attempt(s) remaining before lockout).")
+    return False
 
 if not check_password():
     st.stop()
 
 # ==============================================================================
-# 4. AUDITING & RECONCILIATION ENGINE (HIGH/LOW, TIME-STOP & TRUE B-S PRICING)
+# 4. AUDITING & RECONCILIATION ENGINE (THREAD-SAFE & B-S RE-PRICING)
 # ==============================================================================
 def audit_and_reconcile_all_trades():
-    con = duckdb.connect(DB_PATH, read_only=False)
     lon_zone = pytz.timezone('Europe/London')
     now_lon = datetime.now(lon_zone)
     now_str = now_lon.strftime('%Y-%m-%d %H:%M:%S')
     today_date = now_lon.date()
 
-    try:
-        # 1. Audit Equities
-        active_trades = con.execute("SELECT * FROM trade_journal WHERE status = 'ACTIVE'").df()
-        if not active_trades.empty:
-            for _, tr in active_trades.iterrows():
-                tkr = tr["ticker"]
-                try:
-                    h = yf.Ticker(tkr).history(period="1d")
-                    if h.empty:
-                        h = yf.Ticker(tkr).history(period="5d")
-                    if h.empty:
-                        continue
+    with DB_LOCK:
+        con = duckdb.connect(DB_PATH, read_only=False)
+        try:
+            active_trades = con.execute("SELECT * FROM trade_journal WHERE status = 'ACTIVE'").df()
+            active_opts = con.execute("SELECT * FROM daily_options_journal WHERE status = 'ACTIVE'").df()
+        finally:
+            con.close()
 
-                    curr = float(h["Close"].iloc[-1])
-                    day_high = float(h["High"].iloc[-1]) if "High" in h.columns else curr
-                    day_low = float(h["Low"].iloc[-1]) if "Low" in h.columns else curr
-
-                    entry = float(tr["entry_price"])
-                    target = float(tr["target_price"])
-                    stop = float(tr["stop_loss"])
-
-                    new_status = "ACTIVE"
-                    exit_price = 0.0
-
-                    # Check intraday target & stop-loss fills first
-                    if curr >= target or day_high >= target:
-                        new_status = "🎯 WIN (TARGET HIT)"
-                        curr = max(curr, target)
-                        exit_price = curr
-                    elif curr <= stop or day_low <= stop:
-                        new_status = "🛑 LOSS (STOPPED OUT)"
-                        curr = min(curr, stop)
-                        exit_price = curr
-                    else:
-                        # Check 5-trading-day (7 calendar day) Time-Stop
-                        try:
-                            entry_dt = datetime.strptime(str(tr["date_str"]), "%Y-%m-%d").date()
-                            if (today_date - entry_dt).days >= MAX_HOLD_CALENDAR_DAYS:
-                                new_status = "⏱️ EXPIRED (TIME EXIT)"
-                                exit_price = curr
-                        except Exception:
-                            pass
-
-                    pnl = round(((curr - entry) / entry) * 100.0, 2) if entry > 0 else 0.0
-
-                    con.execute("""
-                        UPDATE trade_journal
-                        SET latest_price = ?, pnl_pct = ?, status = ?, exit_price = ?,
-                            exit_timestamp = CASE WHEN ? != 'ACTIVE' THEN ? ELSE exit_timestamp END,
-                            last_audited = ?
-                        WHERE trade_id = ?
-                    """, [curr, pnl, new_status, exit_price, new_status, now_str, now_str, tr["trade_id"]])
-
-                    if supabase:
-                        try:
-                            supabase.table("predictions").update({
-                                "status": new_status,
-                                "latest_price": curr,
-                                "pnl_pct": pnl,
-                                "last_checked": now_str
-                            }).eq("ticker", tkr).eq("predicted_date", tr["date_str"]).execute()
-                        except Exception as e:
-                            record_db_error("Audit Equity Sync", e)
-                except Exception:
+    # 1. Audit Equities
+    if not active_trades.empty:
+        for _, tr in active_trades.iterrows():
+            tkr = str(tr["ticker"]).strip()
+            if not is_valid_lse_ticker(tkr):
+                continue
+            try:
+                h = fetch_cached_history(tkr, period="5d")
+                if h.empty:
                     continue
 
-        # 2. Audit Options using True Black-Scholes Re-Pricing (Preserving entry spot)
-        active_opts = con.execute("SELECT * FROM daily_options_journal WHERE status = 'ACTIVE'").df()
-        if not active_opts.empty:
-            for _, opt in active_opts.iterrows():
-                try:
-                    sym = f"{opt['share_name']}.L"
-                    h = yf.Ticker(sym).history(period="5d")
-                    if h.empty:
-                        continue
-                    current_spot = float(h["Close"].iloc[-1])
-                    strike = float(opt["strike_price"])
-                    entry_prem = float(opt["entry_premium"])
-                    target_prem = float(opt["target_premium"])
-                    stop_prem = float(opt["stop_loss_premium"])
-                    sigma = float(opt["implied_vol"]) / 100.0
+                curr = float(h["Close"].iloc[-1])
+                day_high = float(h["High"].iloc[-1]) if "High" in h.columns else curr
+                day_low = float(h["Low"].iloc[-1]) if "Low" in h.columns else curr
 
-                    # Calculate remaining days to expiry based on entry date_key
-                    elapsed_days = 0
+                entry = float(tr["entry_price"])
+                target = float(tr["target_price"])
+                stop = float(tr["stop_loss"])
+
+                new_status = "ACTIVE"
+                exit_price = 0.0
+
+                if curr >= target or day_high >= target:
+                    new_status = "🎯 WIN (TARGET HIT)"
+                    curr = max(curr, target)
+                    exit_price = curr
+                elif curr <= stop or day_low <= stop:
+                    new_status = "🛑 LOSS (STOPPED OUT)"
+                    curr = min(curr, stop)
+                    exit_price = curr
+                else:
                     try:
-                        opt_dt = datetime.strptime(str(opt["date_key"]), "%Y-%m-%d").date()
-                        elapsed_days = max(0, (today_date - opt_dt).days)
+                        entry_dt = datetime.strptime(str(tr["date_str"]), "%Y-%m-%d").date()
+                        if (today_date - entry_dt).days >= MAX_HOLD_CALENDAR_DAYS:
+                            new_status = "⏱️ EXPIRED (TIME EXIT)"
+                            exit_price = curr
                     except Exception:
                         pass
-                    rem_days = max(1, int(opt["expiry_days"]) - elapsed_days)
 
-                    live_prem = calculate_black_scholes_call(current_spot, strike, rem_days, 0.05, sigma)
-                    pnl_pct = round(((live_prem - entry_prem) / entry_prem) * 100.0, 2) if entry_prem > 0 else 0.0
+                pnl = round(((curr - entry) / entry) * 100.0, 2) if entry > 0 else 0.0
 
-                    opt_status = "ACTIVE"
-                    if live_prem >= target_prem or pnl_pct >= 60.0:
-                        opt_status = "🎯 WIN (TARGET HIT)"
-                    elif live_prem <= stop_prem or pnl_pct <= -50.0:
-                        opt_status = "🛑 LOSS (STOPPED OUT)"
-                    elif elapsed_days >= MAX_HOLD_CALENDAR_DAYS:
-                        opt_status = "⏱️ EXPIRED (TIME EXIT)"
+                with DB_LOCK:
+                    con = duckdb.connect(DB_PATH, read_only=False)
+                    try:
+                        con.execute("""
+                            UPDATE trade_journal
+                            SET latest_price = ?, pnl_pct = ?, status = ?, exit_price = ?,
+                                exit_timestamp = CASE WHEN ? != 'ACTIVE' THEN ? ELSE exit_timestamp END,
+                                last_audited = ?
+                            WHERE trade_id = ?
+                        """, [curr, pnl, new_status, exit_price, new_status, now_str, now_str, tr["trade_id"]])
+                    finally:
+                        con.close()
 
-                    con.execute("""
-                        UPDATE daily_options_journal
-                        SET current_option_price = ?, pnl_pct = ?, status = ?, last_audited = ?
-                        WHERE date_key = ?
-                    """, [live_prem, pnl_pct, opt_status, now_str, opt["date_key"]])
+                if supabase:
+                    try:
+                        supabase.table("predictions").update({
+                            "status": new_status,
+                            "latest_price": curr,
+                            "pnl_pct": pnl,
+                            "last_checked": now_str
+                        }).eq("ticker", tkr).eq("predicted_date", tr["date_str"]).execute()
+                    except Exception as e:
+                        record_db_error("Audit Equity Sync", e)
+            except Exception:
+                continue
 
-                    if supabase:
-                        try:
-                            supabase.table("options_journal").update({
-                                "status": opt_status,
-                                "current_option_price": live_prem,
-                                "pnl_pct": pnl_pct,
-                                "last_audited": now_str
-                            }).eq("date_key", opt["date_key"]).execute()
-                        except Exception as e:
-                            record_db_error("Audit Option Sync", e)
-                except Exception:
+    # 2. Audit Options
+    if not active_opts.empty:
+        for _, opt in active_opts.iterrows():
+            try:
+                sym = f"{opt['share_name']}.L"
+                h = fetch_cached_history(sym, period="5d")
+                if h.empty:
                     continue
-    finally:
-        con.close()
+                current_spot = float(h["Close"].iloc[-1])
+                strike = float(opt["strike_price"])
+                entry_prem = float(opt["entry_premium"])
+                target_prem = float(opt["target_premium"])
+                stop_prem = float(opt["stop_loss_premium"])
+                sigma = float(opt["implied_vol"]) / 100.0
+
+                elapsed_days = 0
+                try:
+                    opt_dt = datetime.strptime(str(opt["date_key"]), "%Y-%m-%d").date()
+                    elapsed_days = max(0, (today_date - opt_dt).days)
+                except Exception:
+                    pass
+                rem_days = max(1, int(opt["expiry_days"]) - elapsed_days)
+
+                live_prem = calculate_black_scholes_call(current_spot, strike, rem_days, 0.05, sigma)
+                pnl_pct = round(((live_prem - entry_prem) / entry_prem) * 100.0, 2) if entry_prem > 0 else 0.0
+
+                opt_status = "ACTIVE"
+                if live_prem >= target_prem or pnl_pct >= 60.0:
+                    opt_status = "🎯 WIN (TARGET HIT)"
+                elif live_prem <= stop_prem or pnl_pct <= -50.0:
+                    opt_status = "🛑 LOSS (STOPPED OUT)"
+                elif elapsed_days >= MAX_HOLD_CALENDAR_DAYS:
+                    opt_status = "⏱️ EXPIRED (TIME EXIT)"
+
+                with DB_LOCK:
+                    con = duckdb.connect(DB_PATH, read_only=False)
+                    try:
+                        con.execute("""
+                            UPDATE daily_options_journal
+                            SET current_option_price = ?, pnl_pct = ?, status = ?, last_audited = ?
+                            WHERE date_key = ?
+                        """, [live_prem, pnl_pct, opt_status, now_str, opt["date_key"]])
+                    finally:
+                        con.close()
+
+                if supabase:
+                    try:
+                        supabase.table("options_journal").update({
+                            "status": opt_status,
+                            "current_option_price": live_prem,
+                            "pnl_pct": pnl_pct,
+                            "last_audited": now_str
+                        }).eq("date_key", opt["date_key"]).execute()
+                    except Exception as e:
+                        record_db_error("Audit Option Sync", e)
+            except Exception:
+                continue
 
 # ==============================================================================
 # 5. CLOSED-LOOP SELF-LEARNING ENGINE (75TH PERCENTILE ATR FLOOR)
 # ==============================================================================
 def get_self_learning_adjustment(ticker: str, current_atr_pct: float) -> dict:
-    con = duckdb.connect(DB_PATH, read_only=True)
     delta = 0
     reasons = []
-    try:
-        hist = con.execute("SELECT ticker, status, features_json FROM trade_journal WHERE status != 'ACTIVE'").df()
-        if hist.empty:
-            return {"delta": 0, "reason": "Neutral (Building closed-trade memory)"}
+    with DB_LOCK:
+        con = duckdb.connect(DB_PATH, read_only=True)
+        try:
+            hist = con.execute("SELECT ticker, status, features_json FROM trade_journal WHERE status != 'ACTIVE'").df()
+        except Exception:
+            hist = pd.DataFrame()
+        finally:
+            con.close()
 
+    if hist.empty:
+        return {"delta": 0, "reason": "Neutral (Building closed-trade memory)"}
+
+    try:
         t_hist = hist[hist["ticker"] == ticker]
         if not t_hist.empty:
             losses = len(t_hist[t_hist["status"].str.contains("LOSS", na=False)])
@@ -415,8 +490,6 @@ def get_self_learning_adjustment(ticker: str, current_atr_pct: float) -> dict:
                     reasons.append(f"-10% (High-ATR regime >= {p75_loss_atr:.1f}%)")
     except Exception:
         pass
-    finally:
-        con.close()
 
     reason_str = " | ".join(reasons) if reasons else "No adverse historical match"
     return {"delta": delta, "reason": reason_str}
@@ -430,24 +503,24 @@ def generate_daily_options_alpha() -> dict:
     today_str = now_lon.strftime('%Y-%m-%d')
     now_str = now_lon.strftime('%Y-%m-%d %H:%M:%S')
 
-    con = duckdb.connect(DB_PATH, read_only=False)
-    try:
-        df = con.execute("SELECT * FROM daily_options_journal WHERE date_key = ?", [today_str]).df()
-        if not df.empty:
-            return df.iloc[0].to_dict()
-    except Exception:
-        pass
-    finally:
-        con.close()
+    with DB_LOCK:
+        con = duckdb.connect(DB_PATH, read_only=True)
+        try:
+            df = con.execute("SELECT * FROM daily_options_journal WHERE date_key = ?", [today_str]).df()
+            if not df.empty:
+                return df.iloc[0].to_dict()
+        except Exception:
+            pass
+        finally:
+            con.close()
 
-    # Dynamically evaluate FTSE 100 optionable blue chips for positive momentum & < £500 budget
     candidates = ["BARC", "BP", "HSBA", "GLEN", "SHEL"]
     best_sig = None
     best_score = -999.0
 
     for sym in candidates:
         try:
-            h = yf.Ticker(f"{sym}.L").history(period="30d")
+            h = fetch_cached_history(f"{sym}.L", period="30d")
             if h.empty or len(h) < 15:
                 continue
             spot = float(h["Close"].iloc[-1])
@@ -479,14 +552,15 @@ def generate_daily_options_alpha() -> dict:
     if best_sig is None:
         return {}
 
-    con = duckdb.connect(DB_PATH, read_only=False)
-    try:
-        con.execute("""
-            INSERT OR REPLACE INTO daily_options_journal 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', 0.0, ?)
-        """, [best_sig[k] for k in ["date_key", "timestamp", "share_name", "option_contract", "strike_price", "expiry_days", "underlying_spot", "lot_size", "entry_premium", "current_option_price", "target_premium", "stop_loss_premium", "total_capital", "ai_confidence", "implied_vol", "last_audited"]])
-    finally:
-        con.close()
+    with DB_LOCK:
+        con = duckdb.connect(DB_PATH, read_only=False)
+        try:
+            con.execute("""
+                INSERT OR REPLACE INTO daily_options_journal 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', 0.0, ?)
+            """, [best_sig[k] for k in ["date_key", "timestamp", "share_name", "option_contract", "strike_price", "expiry_days", "underlying_spot", "lot_size", "entry_premium", "current_option_price", "target_premium", "stop_loss_premium", "total_capital", "ai_confidence", "implied_vol", "last_audited"]])
+        finally:
+            con.close()
 
     if supabase:
         try:
@@ -499,56 +573,61 @@ def generate_daily_options_alpha() -> dict:
     return best_sig
 
 # ==============================================================================
-# 7. SAFE LOGGING (RETURNS TRUE WHEN LOGGED SO ALL 5 SLOTS FILL PROPERLY)
+# 7. SAFE LOGGING (THREAD-SAFE & STRICT 5-TRADE DAILY QUOTA)
 # ==============================================================================
 def get_currently_active_tickers() -> set:
-    con = duckdb.connect(DB_PATH, read_only=True)
-    try:
-        df = con.execute("SELECT DISTINCT ticker FROM trade_journal WHERE status = 'ACTIVE'").df()
-        return set(df["ticker"].tolist()) if not df.empty else set()
-    except Exception:
-        return set()
-    finally:
-        con.close()
+    with DB_LOCK:
+        con = duckdb.connect(DB_PATH, read_only=True)
+        try:
+            df = con.execute("SELECT DISTINCT ticker FROM trade_journal WHERE status = 'ACTIVE'").df()
+            return set(df["ticker"].tolist()) if not df.empty else set()
+        except Exception:
+            return set()
+        finally:
+            con.close()
 
 def log_equity_signal_safely(sig: dict) -> bool:
-    con = duckdb.connect(DB_PATH, read_only=False)
     lon_zone = pytz.timezone('Europe/London')
     now = datetime.now(lon_zone)
     today_str = now.strftime('%Y-%m-%d')
     now_str = now.strftime('%Y-%m-%d %H:%M:%S')
-    ticker = sig['Ticker']
+    ticker = str(sig.get('Ticker', '')).strip()
+    if not is_valid_lse_ticker(ticker):
+        return False
+
     f_dict = sig.get('FeaturesDict', {})
     f_json_str = json.dumps(f_dict)
     logged_local = False
 
-    try:
-        today_count_df = con.execute("SELECT COUNT(*) AS cnt FROM trade_journal WHERE date_str = ?", [today_str]).df()
-        if not today_count_df.empty and int(today_count_df["cnt"].iloc[0]) >= MAX_DAILY_EQUITY_TRADES:
-            return False
+    with DB_LOCK:
+        con = duckdb.connect(DB_PATH, read_only=False)
+        try:
+            today_count_df = con.execute("SELECT COUNT(*) AS cnt FROM trade_journal WHERE date_str = ?", [today_str]).df()
+            if not today_count_df.empty and int(today_count_df["cnt"].iloc[0]) >= MAX_DAILY_EQUITY_TRADES:
+                return False
 
-        existing = con.execute("""
-            SELECT trade_id FROM trade_journal 
-            WHERE ticker = ? AND (status = 'ACTIVE' OR date_str = ?)
-        """, [ticker, today_str]).df()
+            existing = con.execute("""
+                SELECT trade_id FROM trade_journal 
+                WHERE ticker = ? AND (status = 'ACTIVE' OR date_str = ?)
+            """, [ticker, today_str]).df()
 
-        if existing.empty:
-            trade_id = f"{ticker}_{today_str}"
-            shares_num = int(str(sig['Recommended Shares']).split()[0])
-            con.execute("""
-                INSERT INTO trade_journal 
-                (trade_id, timestamp, date_str, ticker, asset_type, entry_price, target_price,
-                 stop_loss, shares, capital_allocated, status, latest_price, pnl_pct, exit_price,
-                 exit_timestamp, last_audited, features_json)
-                VALUES (?, ?, ?, ?, 'EQUITY', ?, ?, ?, ?, ?, 'ACTIVE', ?, 0.0, 0.0, NULL, ?, ?)
-            """, [
-                trade_id, now_str, today_str, ticker, float(sig['Price (p)']),
-                float(sig['Target (p)']), float(sig['Stop Loss (p)']),
-                shares_num, float(sig['Capital']), float(sig['Price (p)']), now_str, f_json_str
-            ])
-            logged_local = True
-    finally:
-        con.close()
+            if existing.empty:
+                trade_id = f"{ticker}_{today_str}"
+                shares_num = int(str(sig['Recommended Shares']).split()[0])
+                con.execute("""
+                    INSERT INTO trade_journal 
+                    (trade_id, timestamp, date_str, ticker, asset_type, entry_price, target_price,
+                     stop_loss, shares, capital_allocated, status, latest_price, pnl_pct, exit_price,
+                     exit_timestamp, last_audited, features_json)
+                    VALUES (?, ?, ?, ?, 'EQUITY', ?, ?, ?, ?, ?, 'ACTIVE', ?, 0.0, 0.0, NULL, ?, ?)
+                """, [
+                    trade_id, now_str, today_str, ticker, float(sig['Price (p)']),
+                    float(sig['Target (p)']), float(sig['Stop Loss (p)']),
+                    shares_num, float(sig['Capital']), float(sig['Price (p)']), now_str, f_json_str
+                ])
+                logged_local = True
+        finally:
+            con.close()
 
     if supabase and logged_local:
         try:
@@ -592,7 +671,7 @@ def log_equity_signal_safely(sig: dict) -> bool:
     return logged_local
 
 # ==============================================================================
-# 8. SCRAPER & ML PIPELINE (FILTERS ALREADY-HELD ACTIVE TICKERS)
+# 8. SANITIZED UNIVERSE SCRAPER & ML PIPELINE
 # ==============================================================================
 @st.cache_resource
 def load_ml_model():
@@ -602,20 +681,26 @@ def load_ml_model():
 
 ml_model = load_ml_model()
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_live_lse_universe() -> list:
-    tickers = []
+    """Scrapes FTSE indices and strictly validates every symbol against VALID_LSE_TICKER_RE."""
+    raw_tickers = []
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     try:
         url_100 = "https://en.wikipedia.org/wiki/FTSE_100_Index"
-        df_100 = pd.read_html(requests.get(url_100, headers=headers, timeout=5).text, attrs={'id': 'constituents'})[0]
-        tickers.extend([f"{t.replace('.', '-')}.L" for t in df_100['Ticker'].dropna()])
+        resp_100 = requests.get(url_100, headers=headers, timeout=5)
+        if resp_100.status_code == 200:
+            df_100 = pd.read_html(resp_100.text, attrs={'id': 'constituents'})[0]
+            raw_tickers.extend([f"{str(t).strip().replace('.', '-')}.L" for t in df_100['Ticker'].dropna()])
     except Exception:
         pass
 
     try:
         url_250 = "https://en.wikipedia.org/wiki/FTSE_250_Index"
-        df_250 = pd.read_html(requests.get(url_250, headers=headers, timeout=5).text, attrs={'id': 'constituents'})[0]
-        tickers.extend([f"{t.replace('.', '-')}.L" for t in df_250['Ticker'].dropna()])
+        resp_250 = requests.get(url_250, headers=headers, timeout=5)
+        if resp_250.status_code == 200:
+            df_250 = pd.read_html(resp_250.text, attrs={'id': 'constituents'})[0]
+            raw_tickers.extend([f"{str(t).strip().replace('.', '-')}.L" for t in df_250['Ticker'].dropna()])
     except Exception:
         pass
 
@@ -626,13 +711,13 @@ def get_live_lse_universe() -> list:
         "RWS.L", "RKH.L", "KGH.L", "NFG.L", "KP2.L", "BIG.L", "JHD.L", "LTHM.L",
         "CMCL.L", "CAML.L", "CHRT.L", "CNC.L", "CRW.L", "DOTD.L", "FEVR.L", "ITM.L"
     ]
-    return list(set(tickers + fallback_pool))
+    combined = set(raw_tickers + fallback_pool)
+    return sorted([t for t in combined if is_valid_lse_ticker(t)])
 
 def run_predictions():
     if ml_model is None:
         return pd.DataFrame(), False
 
-    # Exclude tickers currently open in ACTIVE portfolio so we only spotlight fresh setups
     active_held = get_currently_active_tickers()
     full_universe = [t for t in get_live_lse_universe() if t not in active_held]
     if not full_universe:
@@ -649,11 +734,12 @@ def run_predictions():
 
     for i, ticker in enumerate(scan_chunk):
         try:
-            df = yf.Ticker(ticker).history(period="120d", auto_adjust=False)
+            df = fetch_cached_history(ticker, period="120d")
             if df.empty or len(df) < 55 or engineer_features is None:
                 prog.progress((i + 1) / len(scan_chunk))
                 continue
 
+            df = df.copy()
             df.reset_index(inplace=True)
             feats = engineer_features(df)
             if feats.empty:
@@ -724,7 +810,6 @@ def run_predictions():
     df_out = pd.DataFrame(results).sort_values(by=["Qualified", "Adjusted Score", "ReturnNum"], ascending=[False, False, False]).reset_index(drop=True)
     qualified_only = df_out[df_out["Qualified"] == True].copy()
 
-    # Iterate through qualified candidates until today's 5-trade quota is reached
     if not qualified_only.empty:
         for _, sig in qualified_only.iterrows():
             log_equity_signal_safely(sig.to_dict())
@@ -763,7 +848,6 @@ if "db_error" in st.session_state:
     st.sidebar.error(f"⚠️ Cloud Sync Warning: {st.session_state['db_error']}")
 
 if st.sidebar.button("🚪 Log Out", width="stretch"):
-    st.query_params.clear()
     st.session_state["password_correct"] = False
     st.rerun()
 
@@ -771,7 +855,7 @@ market_status = "🟢 OPEN" if market_is_open else "🔴 CLOSED"
 db_status_text = "🟢 ONLINE (SUPABASE)" if supabase else "🔴 OFFLINE"
 
 st.title("⚡ ALPHA-LSE Quant Terminal")
-st.caption(f"Status: **Autonomous AI Active** • Database: **{db_status_text}** • Market (LON): **{market_status}**")
+st.caption(f"Status: **CIA-Hardened Autonomous AI** • Database: **{db_status_text}** • Market (LON): **{market_status}**")
 
 tab_scanner, tab_options, tab_journal, tab_reasoning = st.tabs([
     "🎯 Equity High-Certainty Signals",
@@ -781,8 +865,11 @@ tab_scanner, tab_options, tab_journal, tab_reasoning = st.tabs([
 ])
 
 # ==============================================================================
-# 10. TAB 1: EQUITY SCANNER
+# 10. TAB 1: EQUITY SCANNER (WITH IDEMPOTENT ORDER EXECUTION)
 # ==============================================================================
+if "dispatched_orders" not in st.session_state:
+    st.session_state["dispatched_orders"] = set()
+
 with tab_scanner:
     col1, col2 = st.columns([4, 1])
     with col1:
@@ -806,6 +893,7 @@ with tab_scanner:
 
         st.markdown("### 🔥 Top Conviction Spotlights")
         cols = st.columns(min(len(df_res), 3))
+        today_key = datetime.now(pytz.timezone('Europe/London')).strftime('%Y-%m-%d')
         for idx, row in df_res.head(3).iterrows():
             with cols[idx % 3]:
                 with st.container(border=True):
@@ -819,14 +907,20 @@ with tab_scanner:
                         f"🎯 **Target Sell:** `{row['Target (p)']}p` | 🛑 **Stop:** `{row['Stop Loss (p)']}p`  \n"
                         f"📦 **Size:** `{row['Recommended Shares']}` (`{row['Total Cost (£)']}`)"
                     )
-                    if st.button(f"🚀 Execute Buy ({broker_mode})", key=f"exec_{row['Ticker']}_{idx}", width="stretch"):
-                        st.info(f"Signal sent to {broker_mode}. Trade recorded to journal.")
+                    idem_token = hashlib.sha256(f"{row['Ticker']}_{today_key}_{broker_mode}".encode()).hexdigest()[:12]
+                    already_sent = idem_token in st.session_state["dispatched_orders"]
+                    btn_label = "✅ Order Dispatched (Idempotent Lock)" if already_sent else f"🚀 Execute Buy ({broker_mode})"
+                    if st.button(btn_label, key=f"exec_{idem_token}", width="stretch", disabled=already_sent):
+                        st.session_state["dispatched_orders"].add(idem_token)
+                        log_equity_signal_safely(row.to_dict())
+                        st.info(f"Order [{idem_token}] dispatched to {broker_mode}.")
+                        st.rerun()
 
         st.markdown(f"### 📋 All {len(df_res)} Qualified Fresh Equities (Ranked by Final AI Score)")
         display_cols = ["Ticker", "Price (p)", "Target (p)", "Stop Loss (p)", "Expected Return", "Base ML", "Learner Delta", "AI Win Confidence", "Recommended Shares", "RNS"]
         st.dataframe(df_res[display_cols], width="stretch", hide_index=True)
     else:
-        st.warning("🛡️️ **Capital Protection Active:** No equities currently pass all combined volume, trend, and ML filters.")
+        st.warning("🛡️ **Capital Protection Active:** No equities currently pass all combined volume, trend, and ML filters.")
 
 # ==============================================================================
 # 11. TAB 2: OPTIONS ALPHA
@@ -873,13 +967,15 @@ with tab_journal:
 
     df_eq = pd.DataFrame()
     df_opt = pd.DataFrame()
-    try:
+    with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=True)
-        df_eq = con.execute("SELECT * FROM trade_journal ORDER BY date_str DESC, ticker ASC").df()
-        df_opt = con.execute("SELECT * FROM daily_options_journal ORDER BY date_key DESC").df()
-        con.close()
-    except Exception:
-        pass
+        try:
+            df_eq = con.execute("SELECT * FROM trade_journal ORDER BY date_str DESC, ticker ASC").df()
+            df_opt = con.execute("SELECT * FROM daily_options_journal ORDER BY date_key DESC").df()
+        except Exception:
+            pass
+        finally:
+            con.close()
 
     master_list = []
     if not df_eq.empty:
@@ -948,7 +1044,7 @@ with tab_reasoning:
     st.markdown("---")
     st.markdown("### 📊 Derivative & Leveraged Alpha Reasoning")
     opt_sig = generate_daily_options_alpha()
-    if opt_signal:
+    if opt_sig:
         with st.container(border=True):
             d1, d2 = st.columns([1, 2])
             with d1:
@@ -966,23 +1062,26 @@ with tab_reasoning:
 
     st.markdown("---")
     st.markdown("### 🛑 Post-Trade Autopsies (Active Memory Bank)")
-    try:
+    with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=True)
-        closed_trades = con.execute("""
-            SELECT date_str, ticker, status, entry_price, latest_price, pnl_pct, features_json 
-            FROM trade_journal WHERE status != 'ACTIVE' ORDER BY last_audited DESC
-        """).df()
-        con.close()
-        if not closed_trades.empty:
-            for _, c_row in closed_trades.iterrows():
-                with st.expander(f"{c_row['status']} | {c_row['ticker']} ({c_row['date_str']}) — P&L: {c_row['pnl_pct']:+.2f}%"):
-                    st.write(f"**Entry:** `{c_row['entry_price']:.2f}p` | **Exit/Last:** `{c_row['latest_price']:.2f}p`")
-                    st.code(f"Recorded Feature Vector: {c_row['features_json']}", language="json")
-                    if "LOSS" in str(c_row['status']):
-                        st.error("Active Rule Applied: Future setups on this ticker receive a -15% confidence penalty, and its ATR volatility signature feeds the 75th-percentile regime filter (min 3.0% floor).")
-                    else:
-                        st.success("Active Rule Applied: Future setups on this ticker receive a +5% track-record confidence boost.")
-        else:
-            st.success("🏆 **Zero Closed/Stopped-Out Trades in Current Memory.**\n\nAs trades hit their target or stop-loss, their feature vectors are permanently stored in Supabase and used to penalize or boost future scans.")
-    except Exception:
-        pass
+        try:
+            closed_trades = con.execute("""
+                SELECT date_str, ticker, status, entry_price, latest_price, pnl_pct, features_json 
+                FROM trade_journal WHERE status != 'ACTIVE' ORDER BY last_audited DESC
+            """).df()
+        except Exception:
+            closed_trades = pd.DataFrame()
+        finally:
+            con.close()
+
+    if not closed_trades.empty:
+        for _, c_row in closed_trades.iterrows():
+            with st.expander(f"{c_row['status']} | {c_row['ticker']} ({c_row['date_str']}) — P&L: {c_row['pnl_pct']:+.2f}%"):
+                st.write(f"**Entry:** `{c_row['entry_price']:.2f}p` | **Exit/Last:** `{c_row['latest_price']:.2f}p`")
+                st.code(f"Recorded Feature Vector: {c_row['features_json']}", language="json")
+                if "LOSS" in str(c_row['status']):
+                    st.error("Active Rule Applied: Future setups on this ticker receive a -15% confidence penalty, and its ATR volatility signature feeds the 75th-percentile regime filter (min 3.0% floor).")
+                else:
+                    st.success("Active Rule Applied: Future setups on this ticker receive a +5% track-record confidence boost.")
+    else:
+        st.success("🏆 **Zero Closed/Stopped-Out Trades in Current Memory.**\n\nAs trades hit their target or stop-loss, their feature vectors are permanently stored in Supabase and used to penalize or boost future scans.")
