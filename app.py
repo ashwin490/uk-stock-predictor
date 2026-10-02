@@ -37,6 +37,7 @@ except ImportError:
 ROOT_DIR = Path(__file__).resolve().parent
 DB_PATH = os.path.join(ROOT_DIR, "lse_market_data.duckdb")
 MAX_DAILY_EQUITY_TRADES = 5
+MAX_HOLD_CALENDAR_DAYS = 7  # Equivalent to 5 LSE trading days
 
 # ==============================================================================
 # 1. INITIALIZE HYBRID DATABASE (DUCKDB LOCAL + SUPABASE CLOUD)
@@ -111,7 +112,6 @@ def get_supabase_client():
     if not url or not key:
         return None
     try:
-        # Sanitize URL to prevent PostgREST PGRST125 path errors
         clean_url = url.strip().split("/rest/v1")[0].rstrip("/")
         return create_client(clean_url, key.strip())
     except Exception as e:
@@ -153,7 +153,7 @@ def hydrate_duckdb_from_supabase():
                     float(r.get('stop_loss', 0.0)), int(r.get('shares_qty', 1)),
                     float(r.get('position_gbp', 0.0)), status_val,
                     float(r.get('latest_price', 0.0)), float(r.get('pnl_pct', 0.0)),
-                    float(r.get('latest_price', 0.0)) if "LOSS" in status_val or "WIN" in status_val else 0.0,
+                    float(r.get('latest_price', 0.0)) if status_val != "ACTIVE" else 0.0,
                     last_check, f_json
                 ])
         if "db_error" in st.session_state and "Hydrate" in st.session_state["db_error"]:
@@ -200,6 +200,18 @@ def is_lse_market_open() -> bool:
     now_lon = datetime.now(lon_zone)
     return dtime(8, 0) <= now_lon.time() <= dtime(16, 30) and now_lon.weekday() <= 4
 
+def norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def calculate_black_scholes_call(spot: float, strike: float, days_to_exp: float, r: float, sigma: float) -> float:
+    T = max(days_to_exp, 1.0) / 365.0
+    if spot <= 0 or strike <= 0 or sigma <= 0:
+        return max(0.0, spot - strike)
+    d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    call_price = spot * norm_cdf(d1) - strike * math.exp(-r * T) * norm_cdf(d2)
+    return max(round(call_price, 2), 0.50)
+
 # ==============================================================================
 # 3. SECURE LOGIN GATEWAY
 # ==============================================================================
@@ -229,13 +241,17 @@ if not check_password():
     st.stop()
 
 # ==============================================================================
-# 4. AUDITING & RECONCILIATION ENGINE
+# 4. AUDITING & RECONCILIATION ENGINE (HIGH/LOW, TIME-STOP & TRUE B-S PRICING)
 # ==============================================================================
 def audit_and_reconcile_all_trades():
     con = duckdb.connect(DB_PATH, read_only=False)
     lon_zone = pytz.timezone('Europe/London')
-    now_str = datetime.now(lon_zone).strftime('%Y-%m-%d %H:%M:%S')
+    now_lon = datetime.now(lon_zone)
+    now_str = now_lon.strftime('%Y-%m-%d %H:%M:%S')
+    today_date = now_lon.date()
+
     try:
+        # 1. Audit Equities
         active_trades = con.execute("SELECT * FROM trade_journal WHERE status = 'ACTIVE'").df()
         if not active_trades.empty:
             for _, tr in active_trades.iterrows():
@@ -246,20 +262,38 @@ def audit_and_reconcile_all_trades():
                         h = yf.Ticker(tkr).history(period="5d")
                     if h.empty:
                         continue
+
                     curr = float(h["Close"].iloc[-1])
+                    day_high = float(h["High"].iloc[-1]) if "High" in h.columns else curr
+                    day_low = float(h["Low"].iloc[-1]) if "Low" in h.columns else curr
+
                     entry = float(tr["entry_price"])
                     target = float(tr["target_price"])
                     stop = float(tr["stop_loss"])
-                    pnl = round(((curr - entry) / entry) * 100.0, 2) if entry > 0 else 0.0
 
                     new_status = "ACTIVE"
                     exit_price = 0.0
-                    if curr >= target:
+
+                    # Check intraday target & stop-loss fills first
+                    if curr >= target or day_high >= target:
                         new_status = "🎯 WIN (TARGET HIT)"
+                        curr = max(curr, target)
                         exit_price = curr
-                    elif curr <= stop:
+                    elif curr <= stop or day_low <= stop:
                         new_status = "🛑 LOSS (STOPPED OUT)"
+                        curr = min(curr, stop)
                         exit_price = curr
+                    else:
+                        # Check 5-trading-day (7 calendar day) Time-Stop
+                        try:
+                            entry_dt = datetime.strptime(str(tr["date_str"]), "%Y-%m-%d").date()
+                            if (today_date - entry_dt).days >= MAX_HOLD_CALENDAR_DAYS:
+                                new_status = "⏱️ EXPIRED (TIME EXIT)"
+                                exit_price = curr
+                        except Exception:
+                            pass
+
+                    pnl = round(((curr - entry) / entry) * 100.0, 2) if entry > 0 else 0.0
 
                     con.execute("""
                         UPDATE trade_journal
@@ -282,6 +316,7 @@ def audit_and_reconcile_all_trades():
                 except Exception:
                     continue
 
+        # 2. Audit Options using True Black-Scholes Re-Pricing (Preserving entry spot)
         active_opts = con.execute("SELECT * FROM daily_options_journal WHERE status = 'ACTIVE'").df()
         if not active_opts.empty:
             for _, opt in active_opts.iterrows():
@@ -291,26 +326,43 @@ def audit_and_reconcile_all_trades():
                     if h.empty:
                         continue
                     current_spot = float(h["Close"].iloc[-1])
-                    entry_spot = float(opt["underlying_spot"])
+                    strike = float(opt["strike_price"])
+                    entry_prem = float(opt["entry_premium"])
+                    target_prem = float(opt["target_premium"])
+                    stop_prem = float(opt["stop_loss_premium"])
+                    sigma = float(opt["implied_vol"]) / 100.0
 
-                    pnl_pct = round(((current_spot - entry_spot) / entry_spot) * 100.0 * 2.5, 2)
+                    # Calculate remaining days to expiry based on entry date_key
+                    elapsed_days = 0
+                    try:
+                        opt_dt = datetime.strptime(str(opt["date_key"]), "%Y-%m-%d").date()
+                        elapsed_days = max(0, (today_date - opt_dt).days)
+                    except Exception:
+                        pass
+                    rem_days = max(1, int(opt["expiry_days"]) - elapsed_days)
+
+                    live_prem = calculate_black_scholes_call(current_spot, strike, rem_days, 0.05, sigma)
+                    pnl_pct = round(((live_prem - entry_prem) / entry_prem) * 100.0, 2) if entry_prem > 0 else 0.0
+
                     opt_status = "ACTIVE"
-                    if pnl_pct >= 60.0:
+                    if live_prem >= target_prem or pnl_pct >= 60.0:
                         opt_status = "🎯 WIN (TARGET HIT)"
-                    elif pnl_pct <= -50.0:
+                    elif live_prem <= stop_prem or pnl_pct <= -50.0:
                         opt_status = "🛑 LOSS (STOPPED OUT)"
+                    elif elapsed_days >= MAX_HOLD_CALENDAR_DAYS:
+                        opt_status = "⏱️ EXPIRED (TIME EXIT)"
 
                     con.execute("""
                         UPDATE daily_options_journal
-                        SET underlying_spot = ?, pnl_pct = ?, status = ?, last_audited = ?
+                        SET current_option_price = ?, pnl_pct = ?, status = ?, last_audited = ?
                         WHERE date_key = ?
-                    """, [current_spot, pnl_pct, opt_status, now_str, opt["date_key"]])
+                    """, [live_prem, pnl_pct, opt_status, now_str, opt["date_key"]])
 
                     if supabase:
                         try:
                             supabase.table("options_journal").update({
                                 "status": opt_status,
-                                "underlying_spot": current_spot,
+                                "current_option_price": live_prem,
                                 "pnl_pct": pnl_pct,
                                 "last_audited": now_str
                             }).eq("date_key", opt["date_key"]).execute()
@@ -370,20 +422,8 @@ def get_self_learning_adjustment(ticker: str, current_atr_pct: float) -> dict:
     return {"delta": delta, "reason": reason_str}
 
 # ==============================================================================
-# 6. OPTIONS ENGINE (BLACK-SCHOLES FOR FTSE BLUE CHIPS)
+# 6. OPTIONS ENGINE (DYNAMIC BLUE-CHIP SELECTION UNDER £500 CAP)
 # ==============================================================================
-def norm_cdf(x: float) -> float:
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-
-def calculate_black_scholes_call(spot: float, strike: float, days_to_exp: float, r: float, sigma: float) -> float:
-    T = max(days_to_exp, 1.0) / 365.0
-    if spot <= 0 or strike <= 0 or sigma <= 0:
-        return max(0.0, spot - strike)
-    d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
-    d2 = d1 - sigma * math.sqrt(T)
-    call_price = spot * norm_cdf(d1) - strike * math.exp(-r * T) * norm_cdf(d2)
-    return max(round(call_price, 2), 0.50)
-
 def generate_daily_options_alpha() -> dict:
     lon_zone = pytz.timezone('Europe/London')
     now_lon = datetime.now(lon_zone)
@@ -400,42 +440,51 @@ def generate_daily_options_alpha() -> dict:
     finally:
         con.close()
 
-    selected_stock = "BARC"
-    spot, sigma = 220.0, 0.234
-    try:
-        h = yf.Ticker("BARC.L").history(period="30d")
-        if not h.empty:
+    # Dynamically evaluate FTSE 100 optionable blue chips for positive momentum & < £500 budget
+    candidates = ["BARC", "BP", "HSBA", "GLEN", "SHEL"]
+    best_sig = None
+    best_score = -999.0
+
+    for sym in candidates:
+        try:
+            h = yf.Ticker(f"{sym}.L").history(period="30d")
+            if h.empty or len(h) < 15:
+                continue
             spot = float(h["Close"].iloc[-1])
+            ret_5d = float((spot - h["Close"].iloc[-5]) / h["Close"].iloc[-5])
             returns = np.log(h["Close"] / h["Close"].shift(1)).dropna()
             sigma = max(0.15, min(0.45, float(returns.std() * np.sqrt(252))))
-    except Exception:
-        pass
 
-    days_to_expiry = 21
-    lot_size = LOT_SIZES.get(selected_stock, 5000)
-    strike = round(spot * 1.02)
-    entry_prem = calculate_black_scholes_call(spot, strike, days_to_expiry, 0.05, sigma)
+            days_to_expiry = 21
+            lot_size = LOT_SIZES.get(sym, 1000)
+            strike = round(spot * 1.02)
+            entry_prem = calculate_black_scholes_call(spot, strike, days_to_expiry, 0.05, sigma)
+            total_cap = round((entry_prem * lot_size) / 100.0, 2)
 
-    target_prem = round(entry_prem * 1.60, 2)
-    stop_prem = round(entry_prem * 0.50, 2)
-    total_cap = round((entry_prem * lot_size) / 100, 2)
+            if total_cap <= 500.0 and ret_5d > best_score:
+                best_score = ret_5d
+                conf = round(min(92.0, max(68.0, 78.0 + (ret_5d * 150.0))), 1)
+                best_sig = {
+                    "date_key": today_str, "timestamp": now_str, "share_name": sym,
+                    "option_contract": f"{sym} {int(strike)}p CE", "strike_price": float(strike),
+                    "expiry_days": days_to_expiry, "underlying_spot": float(spot), "lot_size": lot_size,
+                    "entry_premium": float(entry_prem), "current_option_price": float(entry_prem),
+                    "target_premium": round(entry_prem * 1.60, 2), "stop_loss_premium": round(entry_prem * 0.50, 2),
+                    "total_capital": float(total_cap), "ai_confidence": conf, "implied_vol": round(sigma * 100, 1),
+                    "status": "ACTIVE", "pnl_pct": 0.0, "last_audited": now_str
+                }
+        except Exception:
+            continue
 
-    sig = {
-        "date_key": today_str, "timestamp": now_str, "share_name": selected_stock,
-        "option_contract": f"{selected_stock} {int(strike)}p CE", "strike_price": float(strike),
-        "expiry_days": days_to_expiry, "underlying_spot": float(spot), "lot_size": lot_size,
-        "entry_premium": float(entry_prem), "current_option_price": float(entry_prem),
-        "target_premium": float(target_prem), "stop_loss_premium": float(stop_prem),
-        "total_capital": float(total_cap), "ai_confidence": 82.4, "implied_vol": round(sigma * 100, 1),
-        "status": "ACTIVE", "pnl_pct": 0.0, "last_audited": now_str
-    }
+    if best_sig is None:
+        return {}
 
     con = duckdb.connect(DB_PATH, read_only=False)
     try:
         con.execute("""
             INSERT OR REPLACE INTO daily_options_journal 
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', 0.0, ?)
-        """, [sig[k] for k in ["date_key", "timestamp", "share_name", "option_contract", "strike_price", "expiry_days", "underlying_spot", "lot_size", "entry_premium", "current_option_price", "target_premium", "stop_loss_premium", "total_capital", "ai_confidence", "implied_vol", "last_audited"]])
+        """, [best_sig[k] for k in ["date_key", "timestamp", "share_name", "option_contract", "strike_price", "expiry_days", "underlying_spot", "lot_size", "entry_premium", "current_option_price", "target_premium", "stop_loss_premium", "total_capital", "ai_confidence", "implied_vol", "last_audited"]])
     finally:
         con.close()
 
@@ -443,16 +492,26 @@ def generate_daily_options_alpha() -> dict:
         try:
             c_check = supabase.table("options_journal").select("date_key").eq("date_key", today_str).execute()
             if not c_check.data:
-                supabase.table("options_journal").insert(sig).execute()
+                supabase.table("options_journal").insert(best_sig).execute()
         except Exception as e:
             record_db_error("Insert Option", e)
 
-    return sig
+    return best_sig
 
 # ==============================================================================
-# 7. SAFE LOGGING (STRICT MAX 5 NEW TRADES PER DAY CAP)
+# 7. SAFE LOGGING (RETURNS TRUE WHEN LOGGED SO ALL 5 SLOTS FILL PROPERLY)
 # ==============================================================================
-def log_equity_signal_safely(sig: dict):
+def get_currently_active_tickers() -> set:
+    con = duckdb.connect(DB_PATH, read_only=True)
+    try:
+        df = con.execute("SELECT DISTINCT ticker FROM trade_journal WHERE status = 'ACTIVE'").df()
+        return set(df["ticker"].tolist()) if not df.empty else set()
+    except Exception:
+        return set()
+    finally:
+        con.close()
+
+def log_equity_signal_safely(sig: dict) -> bool:
     con = duckdb.connect(DB_PATH, read_only=False)
     lon_zone = pytz.timezone('Europe/London')
     now = datetime.now(lon_zone)
@@ -461,11 +520,12 @@ def log_equity_signal_safely(sig: dict):
     ticker = sig['Ticker']
     f_dict = sig.get('FeaturesDict', {})
     f_json_str = json.dumps(f_dict)
+    logged_local = False
 
     try:
         today_count_df = con.execute("SELECT COUNT(*) AS cnt FROM trade_journal WHERE date_str = ?", [today_str]).df()
         if not today_count_df.empty and int(today_count_df["cnt"].iloc[0]) >= MAX_DAILY_EQUITY_TRADES:
-            return
+            return False
 
         existing = con.execute("""
             SELECT trade_id FROM trade_journal 
@@ -486,14 +546,15 @@ def log_equity_signal_safely(sig: dict):
                 float(sig['Target (p)']), float(sig['Stop Loss (p)']),
                 shares_num, float(sig['Capital']), float(sig['Price (p)']), now_str, f_json_str
             ])
+            logged_local = True
     finally:
         con.close()
 
-    if supabase:
+    if supabase and logged_local:
         try:
             today_cloud = supabase.table("predictions").select("id").eq("predicted_date", today_str).execute()
             if today_cloud.data and len(today_cloud.data) >= MAX_DAILY_EQUITY_TRADES:
-                return
+                return logged_local
 
             c_check = supabase.table("predictions").select("id, status, predicted_date").eq("ticker", ticker).execute()
             already_open_or_today = False
@@ -528,8 +589,10 @@ def log_equity_signal_safely(sig: dict):
         except Exception as e:
             record_db_error("Insert Equity", e)
 
+    return logged_local
+
 # ==============================================================================
-# 8. SCRAPER & ML PIPELINE WITH CALIBRATED CONFIDENCE SCALING
+# 8. SCRAPER & ML PIPELINE (FILTERS ALREADY-HELD ACTIVE TICKERS)
 # ==============================================================================
 @st.cache_resource
 def load_ml_model():
@@ -569,7 +632,9 @@ def run_predictions():
     if ml_model is None:
         return pd.DataFrame(), False
 
-    full_universe = get_live_lse_universe()
+    # Exclude tickers currently open in ACTIVE portfolio so we only spotlight fresh setups
+    active_held = get_currently_active_tickers()
+    full_universe = [t for t in get_live_lse_universe() if t not in active_held]
     if not full_universe:
         return pd.DataFrame(), False
 
@@ -580,7 +645,7 @@ def run_predictions():
     cb_model = ml_model['catboost']
     feature_cols = ml_model['feature_cols']
 
-    prog = st.progress(0, text=f"Scanning rotating chunk of {len(scan_chunk)} UK equities...")
+    prog = st.progress(0, text=f"Scanning rotating chunk of {len(scan_chunk)} unheld UK equities...")
 
     for i, ticker in enumerate(scan_chunk):
         try:
@@ -659,8 +724,9 @@ def run_predictions():
     df_out = pd.DataFrame(results).sort_values(by=["Qualified", "Adjusted Score", "ReturnNum"], ascending=[False, False, False]).reset_index(drop=True)
     qualified_only = df_out[df_out["Qualified"] == True].copy()
 
+    # Iterate through qualified candidates until today's 5-trade quota is reached
     if not qualified_only.empty:
-        for _, sig in qualified_only.head(MAX_DAILY_EQUITY_TRADES).iterrows():
+        for _, sig in qualified_only.iterrows():
             log_equity_signal_safely(sig.to_dict())
 
     return qualified_only, not qualified_only.empty
@@ -682,12 +748,10 @@ market_is_open = is_lse_market_open()
 auto_mode = st.sidebar.toggle("Continuous Background Mode", value=market_is_open)
 refresh_interval_sec = st.sidebar.selectbox("Refresh Interval", [300, 600, 3600], format_func=lambda x: f"{x//60} Minutes")
 
-# Single Unified Timer: Drives BOTH Trade Auditing and Rotating Market Scans
 loop_tick = 0
 if auto_mode and st_autorefresh:
     loop_tick = st_autorefresh(interval=refresh_interval_sec * 1000, key="unified_autonomous_loop")
 
-# Trigger a full refresh whenever the autonomous timer ticks (or on first boot)
 is_new_loop_tick = ("last_loop_tick" not in st.session_state) or (loop_tick != st.session_state["last_loop_tick"])
 
 if is_new_loop_tick:
@@ -722,11 +786,10 @@ tab_scanner, tab_options, tab_journal, tab_reasoning = st.tabs([
 with tab_scanner:
     col1, col2 = st.columns([4, 1])
     with col1:
-        st.write(f"Equities screened via Calibrated Dual-Ensemble ML, Self-Learning Memory, and RNS checks (Auto-logging Top {MAX_DAILY_EQUITY_TRADES}/day):")
+        st.write(f"Unheld equities screened via Calibrated Dual-Ensemble ML, Self-Learning Memory, and RNS checks (Auto-logging Top {MAX_DAILY_EQUITY_TRADES}/day):")
     with col2:
         re_scan = st.button("🔄 Run Live Scan Now", width="stretch", type="primary")
 
-    # Runs on initial load, manual click, OR every time the Autonomous Loop timer ticks
     if re_scan or is_new_loop_tick or "scan_results" not in st.session_state:
         with st.spinner("Executing quant screen & reconciling live trades..."):
             if re_scan:
@@ -739,7 +802,7 @@ with tab_scanner:
 
     df_res = st.session_state.get("scan_results", pd.DataFrame())
     if st.session_state.get("has_cleared", False) and not df_res.empty:
-        st.success(f"🟢 **{len(df_res)} Setup(s) Cleared Gates (Top {min(MAX_DAILY_EQUITY_TRADES, len(df_res))} Logged to Daily Ledger)**")
+        st.success(f"🟢 **{len(df_res)} Fresh Unheld Setup(s) Cleared Gates (Up to {MAX_DAILY_EQUITY_TRADES}/Day Logged to Ledger)**")
 
         st.markdown("### 🔥 Top Conviction Spotlights")
         cols = st.columns(min(len(df_res), 3))
@@ -759,11 +822,11 @@ with tab_scanner:
                     if st.button(f"🚀 Execute Buy ({broker_mode})", key=f"exec_{row['Ticker']}_{idx}", width="stretch"):
                         st.info(f"Signal sent to {broker_mode}. Trade recorded to journal.")
 
-        st.markdown(f"### 📋 All {len(df_res)} Qualified Equities (Ranked by Final AI Score)")
+        st.markdown(f"### 📋 All {len(df_res)} Qualified Fresh Equities (Ranked by Final AI Score)")
         display_cols = ["Ticker", "Price (p)", "Target (p)", "Stop Loss (p)", "Expected Return", "Base ML", "Learner Delta", "AI Win Confidence", "Recommended Shares", "RNS"]
         st.dataframe(df_res[display_cols], width="stretch", hide_index=True)
     else:
-        st.warning("🛡️ **Capital Protection Active:** No equities currently pass all combined volume, trend, and ML filters.")
+        st.warning("🛡️️ **Capital Protection Active:** No equities currently pass all combined volume, trend, and ML filters.")
 
 # ==============================================================================
 # 11. TAB 2: OPTIONS ALPHA
@@ -778,9 +841,9 @@ with tab_options:
             o1, o2, o3 = st.columns(3)
             with o1:
                 st.metric("Derivative Contract", opt_signal["option_contract"])
-                st.markdown(f"Underlying Spot: **{opt_signal['underlying_spot']:.2f}p**")
+                st.markdown(f"Entry Underlying Spot: **{opt_signal['underlying_spot']:.2f}p**")
             with o2:
-                st.metric("Live Entry Premium", f"{opt_signal['current_option_price']:.2f}p")
+                st.metric("Live Option Price", f"{opt_signal['current_option_price']:.2f}p", f"{opt_signal['pnl_pct']:+.2f}% vs Entry ({opt_signal['entry_premium']:.2f}p)")
                 st.markdown(f"Implied Volatility: **{opt_signal['implied_vol']}%**")
             with o3:
                 st.metric("AI Win Probability", f"{opt_signal['ai_confidence']}%")
@@ -885,13 +948,13 @@ with tab_reasoning:
     st.markdown("---")
     st.markdown("### 📊 Derivative & Leveraged Alpha Reasoning")
     opt_sig = generate_daily_options_alpha()
-    if opt_sig:
+    if opt_signal:
         with st.container(border=True):
             d1, d2 = st.columns([1, 2])
             with d1:
                 st.metric("Contract Evaluated", opt_sig["option_contract"])
                 st.write(f"**Model Implied Volatility:** `{opt_sig['implied_vol']}%`")
-                st.write(f"**Underlying Spot Price:** `{opt_sig['underlying_spot']:.2f}p`")
+                st.write(f"**Entry Spot Price:** `{opt_sig['underlying_spot']:.2f}p`")
                 st.write(f"**Strike Selected (OTM):** `{opt_sig['strike_price']:.0f}p`")
             with d2:
                 st.markdown("""
