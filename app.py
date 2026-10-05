@@ -43,6 +43,7 @@ ROOT_DIR = Path(__file__).resolve().parent
 DB_PATH = os.path.join(ROOT_DIR, "lse_market_data.duckdb")
 MAX_DAILY_EQUITY_TRADES = 5
 MAX_HOLD_CALENDAR_DAYS = 7  # 5 LSE trading days
+BREAKEVEN_TRIGGER_RATIO = 0.65  # Ratchet stop to entry at >= 65% of target distance
 
 # Strict LSE Ticker Regex (Integrity Gate against untrusted web scraping)
 VALID_LSE_TICKER_RE = re.compile(r"^[A-Z0-9]{1,6}(-[A-Z0-9]{1,2})?\.L$")
@@ -55,7 +56,7 @@ def get_db_lock():
 DB_LOCK = get_db_lock()
 
 def is_valid_lse_ticker(ticker: str) -> bool:
-    return bool( isinstance(ticker, str) and VALID_LSE_TICKER_RE.match(ticker.strip()) )
+    return bool(isinstance(ticker, str) and VALID_LSE_TICKER_RE.match(ticker.strip()))
 
 # ==============================================================================
 # 1. INITIALIZE HYBRID DATABASE (THREAD-SAFE DUCKDB + SUPABASE CLOUD)
@@ -140,7 +141,6 @@ def get_supabase_client():
 supabase = get_supabase_client()
 
 def record_db_error(context: str, err: Exception):
-    # Sanitize exception message so sensitive URLs/Tokens are never exposed in UI
     raw_msg = str(err)
     sanitized = re.sub(r"https?://[^\s'\"]+", "[REDACTED_URL]", raw_msg)
     st.session_state["db_error"] = f"[{context}] {sanitized[:140]}"
@@ -250,12 +250,6 @@ def fetch_cached_history(ticker: str, period: str = "120d") -> pd.DataFrame:
 # 3. HARDENED ZERO-TRUST AUTHENTICATION (CIA CONFIDENTIALITY)
 # ==============================================================================
 def check_password() -> bool:
-    """
-    CIA-Compliant Authentication:
-    - Zero URL query-parameter backdoors
-    - Constant-time HMAC SHA-256 hash comparison
-    - Brute-force lockout (5 attempts -> 15-minute cooldown)
-    """
     if st.session_state.get("password_correct", False):
         return True
 
@@ -266,7 +260,6 @@ def check_password() -> bool:
         st.error(f"🔒 Terminal Locked due to repeated failed attempts. Try again in {rem_min} minute(s).")
         return False
 
-    # Default SHA-256 hash corresponds to 'AlphaLSE2026!' if AUTH_PASS_HASH is not set in st.secrets
     expected_user = st.secrets.get("AUTH_USER", "admin") if hasattr(st, "secrets") else "admin"
     default_hash = hashlib.sha256("AlphaLSE2026!".encode("utf-8")).hexdigest()
     expected_hash = st.secrets.get("AUTH_PASS_HASH", default_hash) if hasattr(st, "secrets") else default_hash
@@ -290,7 +283,7 @@ def check_password() -> bool:
                 fails = st.session_state.get("failed_auth_attempts", 0) + 1
                 st.session_state["failed_auth_attempts"] = fails
                 if fails >= 5:
-                    st.session_state["auth_lockout_until"] = time.time() + 900  # 15-min lockout
+                    st.session_state["auth_lockout_until"] = time.time() + 900
                     st.error("🔒 Maximum authentication attempts exceeded. Terminal locked for 15 minutes.")
                 else:
                     st.error(f"😕 Invalid credentials ({5 - fails} attempt(s) remaining before lockout).")
@@ -300,7 +293,7 @@ if not check_password():
     st.stop()
 
 # ==============================================================================
-# 4. AUDITING & RECONCILIATION ENGINE (THREAD-SAFE & B-S RE-PRICING)
+# 4. AUDITING & RECONCILIATION ENGINE (WITH BREAK-EVEN STOP RATCHET)
 # ==============================================================================
 def audit_and_reconcile_all_trades():
     lon_zone = pytz.timezone('Europe/London')
@@ -316,7 +309,7 @@ def audit_and_reconcile_all_trades():
         finally:
             con.close()
 
-    # 1. Audit Equities
+    # 1. Audit Equities (with 65% Break-Even Stop-Loss Ratchet)
     if not active_trades.empty:
         for _, tr in active_trades.iterrows():
             tkr = str(tr["ticker"]).strip()
@@ -335,6 +328,15 @@ def audit_and_reconcile_all_trades():
                 target = float(tr["target_price"])
                 stop = float(tr["stop_loss"])
 
+                # Automatic Break-Even Stop Ratchet once price covers >= 65% of target distance
+                target_dist = target - entry
+                if target_dist > 0 and stop < entry:
+                    be_trigger_price = entry + (BREAKEVEN_TRIGGER_RATIO * target_dist)
+                    if curr >= be_trigger_price or day_high >= be_trigger_price:
+                        stop = round(entry, 2)
+
+                is_be_ratcheted = abs(stop - entry) < 1e-4
+
                 new_status = "ACTIVE"
                 exit_price = 0.0
 
@@ -342,10 +344,15 @@ def audit_and_reconcile_all_trades():
                     new_status = "🎯 WIN (TARGET HIT)"
                     curr = max(curr, target)
                     exit_price = curr
-                elif curr <= stop or day_low <= stop:
-                    new_status = "🛑 LOSS (STOPPED OUT)"
-                    curr = min(curr, stop)
-                    exit_price = curr
+                elif curr <= stop or (not is_be_ratcheted and day_low <= stop):
+                    if is_be_ratcheted:
+                        new_status = "🛡️ BREAK-EVEN (PROTECTED EXIT)"
+                        curr = entry
+                        exit_price = entry
+                    else:
+                        new_status = "🛑 LOSS (STOPPED OUT)"
+                        curr = min(curr, stop)
+                        exit_price = curr
                 else:
                     try:
                         entry_dt = datetime.strptime(str(tr["date_str"]), "%Y-%m-%d").date()
@@ -362,11 +369,11 @@ def audit_and_reconcile_all_trades():
                     try:
                         con.execute("""
                             UPDATE trade_journal
-                            SET latest_price = ?, pnl_pct = ?, status = ?, exit_price = ?,
+                            SET latest_price = ?, stop_loss = ?, pnl_pct = ?, status = ?, exit_price = ?,
                                 exit_timestamp = CASE WHEN ? != 'ACTIVE' THEN ? ELSE exit_timestamp END,
                                 last_audited = ?
                             WHERE trade_id = ?
-                        """, [curr, pnl, new_status, exit_price, new_status, now_str, now_str, tr["trade_id"]])
+                        """, [curr, stop, pnl, new_status, exit_price, new_status, now_str, now_str, tr["trade_id"]])
                     finally:
                         con.close()
 
@@ -374,6 +381,7 @@ def audit_and_reconcile_all_trades():
                     try:
                         supabase.table("predictions").update({
                             "status": new_status,
+                            "stop_loss": stop,
                             "latest_price": curr,
                             "pnl_pct": pnl,
                             "last_checked": now_str
@@ -573,7 +581,7 @@ def generate_daily_options_alpha() -> dict:
     return best_sig
 
 # ==============================================================================
-# 7. SAFE LOGGING (THREAD-SAFE & STRICT 5-TRADE DAILY QUOTA)
+# 7. SAFE LOGGING & DAILY QUOTA HELPERS
 # ==============================================================================
 def get_currently_active_tickers() -> set:
     with DB_LOCK:
@@ -583,6 +591,18 @@ def get_currently_active_tickers() -> set:
             return set(df["ticker"].tolist()) if not df.empty else set()
         except Exception:
             return set()
+        finally:
+            con.close()
+
+def get_todays_logged_equities() -> pd.DataFrame:
+    lon_zone = pytz.timezone('Europe/London')
+    today_str = datetime.now(lon_zone).strftime('%Y-%m-%d')
+    with DB_LOCK:
+        con = duckdb.connect(DB_PATH, read_only=True)
+        try:
+            return con.execute("SELECT * FROM trade_journal WHERE date_str = ? ORDER BY ticker ASC", [today_str]).df()
+        except Exception:
+            return pd.DataFrame()
         finally:
             con.close()
 
@@ -683,7 +703,6 @@ ml_model = load_ml_model()
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_live_lse_universe() -> list:
-    """Scrapes FTSE indices and strictly validates every symbol against VALID_LSE_TICKER_RE."""
     raw_tickers = []
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     try:
@@ -822,6 +841,7 @@ def run_predictions():
 st.sidebar.header("⚙️ Scanner Settings")
 selected_universe = st.sidebar.selectbox("Universe Mode", ["Rotating Active Market Basket (FTSE + AIM)"])
 st.sidebar.caption(f"Daily Auto-Log Cap: **Top {MAX_DAILY_EQUITY_TRADES} Picks/Day**")
+st.sidebar.caption(f"Break-Even Ratchet: **≥ {int(BREAKEVEN_TRIGGER_RATIO * 100)}% of Target**")
 
 st.sidebar.markdown("---")
 st.sidebar.header("🔌 Broker Execution Bridge")
@@ -865,62 +885,101 @@ tab_scanner, tab_options, tab_journal, tab_reasoning = st.tabs([
 ])
 
 # ==============================================================================
-# 10. TAB 1: EQUITY SCANNER (WITH IDEMPOTENT ORDER EXECUTION)
+# 10. TAB 1: EQUITY SCANNER (WITH POST-QUOTA EXECUTION LOCK)
 # ==============================================================================
 if "dispatched_orders" not in st.session_state:
     st.session_state["dispatched_orders"] = set()
 
 with tab_scanner:
+    todays_logged_df = get_todays_logged_equities()
+    quota_filled = len(todays_logged_df) >= MAX_DAILY_EQUITY_TRADES
+
     col1, col2 = st.columns([4, 1])
     with col1:
-        st.write(f"Unheld equities screened via Calibrated Dual-Ensemble ML, Self-Learning Memory, and RNS checks (Auto-logging Top {MAX_DAILY_EQUITY_TRADES}/day):")
+        if quota_filled:
+            st.write(f"Daily equity allocation complete (**{len(todays_logged_df)}/{MAX_DAILY_EQUITY_TRADES} slots filled**). Spotlighting today's active cohort:")
+        else:
+            st.write(f"Unheld equities screened via Calibrated Dual-Ensemble ML, Self-Learning Memory, and RNS checks (**{len(todays_logged_df)}/{MAX_DAILY_EQUITY_TRADES} logged today**):")
     with col2:
         re_scan = st.button("🔄 Run Live Scan Now", width="stretch", type="primary")
 
-    if re_scan or is_new_loop_tick or "scan_results" not in st.session_state:
-        with st.spinner("Executing quant screen & reconciling live trades..."):
-            if re_scan:
-                audit_and_reconcile_all_trades()
-                hydrate_duckdb_from_supabase()
-            res_df, has_cleared = run_predictions()
-            if not res_df.empty:
-                st.session_state["scan_results"] = res_df
-                st.session_state["has_cleared"] = has_cleared
-
-    df_res = st.session_state.get("scan_results", pd.DataFrame())
-    if st.session_state.get("has_cleared", False) and not df_res.empty:
-        st.success(f"🟢 **{len(df_res)} Fresh Unheld Setup(s) Cleared Gates (Up to {MAX_DAILY_EQUITY_TRADES}/Day Logged to Ledger)**")
-
-        st.markdown("### 🔥 Top Conviction Spotlights")
-        cols = st.columns(min(len(df_res), 3))
-        today_key = datetime.now(pytz.timezone('Europe/London')).strftime('%Y-%m-%d')
-        for idx, row in df_res.head(3).iterrows():
-            with cols[idx % 3]:
+    # If daily quota is already filled, lock Tab 1 onto today's 5 executed picks unless operator forces an extra scan
+    if quota_filled and not re_scan:
+        st.info(f"🔒 **Daily Quota Filled ({len(todays_logged_df)}/{MAX_DAILY_EQUITY_TRADES} Slots Active for Today)** — Scanner locked onto today's executed positions to prevent over-trading.")
+        st.markdown("### 📌 Today's Executed Cohort (Live Intraday Monitor)")
+        q_cols = st.columns(min(len(todays_logged_df), 3))
+        for idx, t_row in todays_logged_df.iterrows():
+            with q_cols[idx % 3]:
                 with st.container(border=True):
-                    st.success(f"🔥 CONVICTION PICK #{idx + 1}")
-                    st.subheader(row['Ticker'])
-                    st.metric(label="Target Gain", value=row["Expected Return"], delta=f"Entry: {row['Price (p)']}p")
-                    st.markdown(
-                        f"🤖 **Final AI Score:** `{row['AI Win Confidence']}` *(Base: {row['Base ML']}, Adj: {row['Learner Delta']})*  \n"
-                        f"🧠 **Memory Rule:** `{row['Learner Note']}`  \n"
-                        f"📰 **RNS Flow:** `{row['RNS']}`  \n"
-                        f"🎯 **Target Sell:** `{row['Target (p)']}p` | 🛑 **Stop:** `{row['Stop Loss (p)']}p`  \n"
-                        f"📦 **Size:** `{row['Recommended Shares']}` (`{row['Total Cost (£)']}`)"
-                    )
-                    idem_token = hashlib.sha256(f"{row['Ticker']}_{today_key}_{broker_mode}".encode()).hexdigest()[:12]
-                    already_sent = idem_token in st.session_state["dispatched_orders"]
-                    btn_label = "✅ Order Dispatched (Idempotent Lock)" if already_sent else f"🚀 Execute Buy ({broker_mode})"
-                    if st.button(btn_label, key=f"exec_{idem_token}", width="stretch", disabled=already_sent):
-                        st.session_state["dispatched_orders"].add(idem_token)
-                        log_equity_signal_safely(row.to_dict())
-                        st.info(f"Order [{idem_token}] dispatched to {broker_mode}.")
-                        st.rerun()
+                    f_meta = {}
+                    try:
+                        f_meta = json.loads(t_row.get("features_json") or "{}")
+                    except Exception:
+                        pass
+                    base_c = f_meta.get("base_ml_conf", 75)
+                    del_c = f_meta.get("learner_delta", 0)
+                    final_c = base_c + del_c
+                    be_active = abs(float(t_row["stop_loss"]) - float(t_row["entry_price"])) < 1e-4
+                    stop_tag = f"{t_row['stop_loss']:.2f}p (🛡️ BE Locked)" if be_active else f"{t_row['stop_loss']:.2f}p"
 
-        st.markdown(f"### 📋 All {len(df_res)} Qualified Fresh Equities (Ranked by Final AI Score)")
-        display_cols = ["Ticker", "Price (p)", "Target (p)", "Stop Loss (p)", "Expected Return", "Base ML", "Learner Delta", "AI Win Confidence", "Recommended Shares", "RNS"]
-        st.dataframe(df_res[display_cols], width="stretch", hide_index=True)
+                    st.success(f"✅ TODAY'S SLOT #{idx + 1} ({t_row['status']})")
+                    st.subheader(t_row["ticker"])
+                    st.metric(
+                        label="Live Intraday P&L",
+                        value=f"{t_row['pnl_pct']:+.2f}%",
+                        delta=f"Live: {t_row['latest_price']:.2f}p (Entry: {t_row['entry_price']:.2f}p)"
+                    )
+                    st.markdown(
+                        f"🤖 **Entry AI Score:** `{final_c}%` *(Base: {base_c}%, Adj: {del_c:+d}%)*  \n"
+                        f"🎯 **Target Sell:** `{t_row['target_price']:.2f}p` | 🛑 **Stop:** `{stop_tag}`  \n"
+                        f"📦 **Position Size:** `{int(t_row['shares'])} shares` (`£{t_row['capital_allocated']:.0f}`)  \n"
+                        f"🕒 **Last Audited:** `{str(t_row['last_audited'])[:19]}`"
+                    )
     else:
-        st.warning("🛡️ **Capital Protection Active:** No equities currently pass all combined volume, trend, and ML filters.")
+        if re_scan or is_new_loop_tick or "scan_results" not in st.session_state:
+            with st.spinner("Executing quant screen & reconciling live trades..."):
+                if re_scan:
+                    audit_and_reconcile_all_trades()
+                    hydrate_duckdb_from_supabase()
+                res_df, has_cleared = run_predictions()
+                if not res_df.empty:
+                    st.session_state["scan_results"] = res_df
+                    st.session_state["has_cleared"] = has_cleared
+
+        df_res = st.session_state.get("scan_results", pd.DataFrame())
+        if st.session_state.get("has_cleared", False) and not df_res.empty:
+            st.success(f"🟢 **{len(df_res)} Fresh Unheld Setup(s) Cleared Gates (Up to {MAX_DAILY_EQUITY_TRADES}/Day Logged to Ledger)**")
+
+            st.markdown("### 🔥 Top Conviction Spotlights")
+            cols = st.columns(min(len(df_res), 3))
+            today_key = datetime.now(pytz.timezone('Europe/London')).strftime('%Y-%m-%d')
+            for idx, row in df_res.head(3).iterrows():
+                with cols[idx % 3]:
+                    with st.container(border=True):
+                        st.success(f"🔥 CONVICTION PICK #{idx + 1}")
+                        st.subheader(row['Ticker'])
+                        st.metric(label="Target Gain", value=row["Expected Return"], delta=f"Entry: {row['Price (p)']}p")
+                        st.markdown(
+                            f"🤖 **Final AI Score:** `{row['AI Win Confidence']}` *(Base: {row['Base ML']}, Adj: {row['Learner Delta']})*  \n"
+                            f"🧠 **Memory Rule:** `{row['Learner Note']}`  \n"
+                            f"📰 **RNS Flow:** `{row['RNS']}`  \n"
+                            f"🎯 **Target Sell:** `{row['Target (p)']}p` | 🛑 **Stop:** `{row['Stop Loss (p)']}p`  \n"
+                            f"📦 **Size:** `{row['Recommended Shares']}` (`{row['Total Cost (£)']}`)"
+                        )
+                        idem_token = hashlib.sha256(f"{row['Ticker']}_{today_key}_{broker_mode}".encode()).hexdigest()[:12]
+                        already_sent = idem_token in st.session_state["dispatched_orders"]
+                        btn_label = "✅ Order Dispatched (Idempotent Lock)" if already_sent else f"🚀 Execute Buy ({broker_mode})"
+                        if st.button(btn_label, key=f"exec_{idem_token}", width="stretch", disabled=already_sent):
+                            st.session_state["dispatched_orders"].add(idem_token)
+                            log_equity_signal_safely(row.to_dict())
+                            st.info(f"Order [{idem_token}] dispatched to {broker_mode}.")
+                            st.rerun()
+
+            st.markdown(f"### 📋 All {len(df_res)} Qualified Fresh Equities (Ranked by Final AI Score)")
+            display_cols = ["Ticker", "Price (p)", "Target (p)", "Stop Loss (p)", "Expected Return", "Base ML", "Learner Delta", "AI Win Confidence", "Recommended Shares", "RNS"]
+            st.dataframe(df_res[display_cols], width="stretch", hide_index=True)
+        else:
+            st.warning("🛡️ **Capital Protection Active:** No equities currently pass all combined volume, trend, and ML filters.")
 
 # ==============================================================================
 # 11. TAB 2: OPTIONS ALPHA
@@ -950,14 +1009,14 @@ with tab_options:
             m3.success(f"Status: **{opt_signal['status']}** (Audited: {str(opt_signal['last_audited'])[:16]})")
 
 # ==============================================================================
-# 12. TAB 3: MASTER TRADE JOURNAL & RECONCILIATION
+# 12. TAB 3: MASTER TRADE JOURNAL, KPI HEADER BAR & RECONCILIATION
 # ==============================================================================
 with tab_journal:
     st.subheader("📖 Autonomous Master Ledger (Equities & Derivatives)")
 
     j_col1, j_col2 = st.columns([4, 1])
     with j_col1:
-        st.caption(f"Automatically synced every **{refresh_interval_sec // 60} Minutes** via Autonomous Loop (Cycle #{loop_tick}).")
+        st.caption(f"Automatically synced every **{refresh_interval_sec // 60} Minutes** via Autonomous Loop (Cycle #{loop_tick}). Break-Even Stop Ratchet active at ≥ {int(BREAKEVEN_TRIGGER_RATIO * 100)}% of target.")
     with j_col2:
         if st.button("🔄 Force Manual Sync", width="stretch"):
             audit_and_reconcile_all_trades()
@@ -977,9 +1036,96 @@ with tab_journal:
         finally:
             con.close()
 
+    # Calculate Real-Time Executive Portfolio KPIs across Equities and Options
+    active_cap_gbp = 0.0
+    open_unrealized_gbp = 0.0
+    closed_realized_gbp = 0.0
+    win_count = 0
+    loss_count = 0
+    be_count = 0
+    be_ratcheted_active_count = 0
+
+    if not df_eq.empty:
+        for _, r in df_eq.iterrows():
+            cap = float(r.get("capital_allocated", 500.0))
+            pnl_gbp = cap * (float(r.get("pnl_pct", 0.0)) / 100.0)
+            st_str = str(r.get("status", "ACTIVE")).upper()
+            if st_str == "ACTIVE":
+                active_cap_gbp += cap
+                open_unrealized_gbp += pnl_gbp
+                if abs(float(r.get("stop_loss", 0.0)) - float(r.get("entry_price", -1.0))) < 1e-4:
+                    be_ratcheted_active_count += 1
+            else:
+                closed_realized_gbp += pnl_gbp
+                if "WIN" in st_str:
+                    win_count += 1
+                elif "BREAK-EVEN" in st_str:
+                    be_count += 1
+                elif "LOSS" in st_str:
+                    loss_count += 1
+
+    if not df_opt.empty:
+        for _, o in df_opt.iterrows():
+            cap = float(o.get("total_capital", 350.0))
+            pnl_gbp = cap * (float(o.get("pnl_pct", 0.0)) / 100.0)
+            st_str = str(o.get("status", "ACTIVE")).upper()
+            if st_str == "ACTIVE":
+                active_cap_gbp += cap
+                open_unrealized_gbp += pnl_gbp
+            else:
+                closed_realized_gbp += pnl_gbp
+                if "WIN" in st_str:
+                    win_count += 1
+                elif "LOSS" in st_str:
+                    loss_count += 1
+
+    decided_trades = win_count + loss_count
+    win_rate_pct = (win_count / decided_trades * 100.0) if decided_trades > 0 else 0.0
+    open_ret_pct = (open_unrealized_gbp / active_cap_gbp * 100.0) if active_cap_gbp > 0 else 0.0
+
+    # Render 4-Card Institutional Portfolio KPI Header
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        with st.container(border=True):
+            st.metric(
+                label="Closed Win Rate",
+                value=f"{win_rate_pct:.1f}%",
+                delta=f"{win_count}W • {loss_count}L • {be_count}BE"
+            )
+    with k2:
+        with st.container(border=True):
+            st.metric(
+                label="Active Capital Deployed",
+                value=f"£{active_cap_gbp:,.0f}",
+                delta=f"🛡️ {be_ratcheted_active_count} Break-Even Protected"
+            )
+    with k3:
+        with st.container(border=True):
+            st.metric(
+                label="Open Unrealized P&L",
+                value=f"£{open_unrealized_gbp:+,.2f}",
+                delta=f"{open_ret_pct:+.2f}% on Active Capital"
+            )
+    with k4:
+        with st.container(border=True):
+            st.metric(
+                label="Closed Realized P&L",
+                value=f"£{closed_realized_gbp:+,.2f}",
+                delta=f"{decided_trades + be_count} Settled Trades"
+            )
+
     master_list = []
     if not df_eq.empty:
-        clean_eq = df_eq.rename(columns={
+        df_eq_disp = df_eq.copy()
+        # Highlight Break-Even Ratcheted stops directly in the Status column for instant visibility
+        def format_eq_status(row):
+            st_val = str(row["status"])
+            if st_val == "ACTIVE" and abs(float(row["stop_loss"]) - float(row["entry_price"])) < 1e-4:
+                return "🟢 ACTIVE (🛡️ BE STOP)"
+            return st_val
+
+        df_eq_disp["status"] = df_eq_disp.apply(format_eq_status, axis=1)
+        clean_eq = df_eq_disp.rename(columns={
             "date_str": "Date", "ticker": "Symbol", "asset_type": "Asset",
             "entry_price": "Entry (p)", "target_price": "Target (p)",
             "stop_loss": "Stop (p)", "latest_price": "Live Price (p)",
@@ -988,8 +1134,9 @@ with tab_journal:
         master_list.append(clean_eq)
 
     if not df_opt.empty:
-        df_opt['Asset'] = 'OPTIONS'
-        clean_opt = df_opt.rename(columns={
+        df_opt_disp = df_opt.copy()
+        df_opt_disp['Asset'] = 'OPTIONS'
+        clean_opt = df_opt_disp.rename(columns={
             "date_key": "Date", "option_contract": "Symbol",
             "entry_premium": "Entry (p)", "current_option_price": "Live Price (p)",
             "target_premium": "Target (p)", "stop_loss_premium": "Stop (p)",
@@ -1021,6 +1168,7 @@ with tab_reasoning:
     st.caption("Live breakdown of Calibrated Base ML probabilities, Historical Stop-Loss Penalties, and 75th-Percentile Volatility Regime Autopsies.")
 
     df_scan = st.session_state.get("scan_results", pd.DataFrame())
+    todays_eq = get_todays_logged_equities()
 
     st.markdown("### 🔍 Live Equity Decision Matrix")
     if not df_scan.empty:
@@ -1037,6 +1185,29 @@ with tab_reasoning:
                     * 🧠 **Self-Learner Memory:** `{row['Learner Note']}`
                     * 📰 **RNS Gate:** `{row['RNS']}`
                     * ⚖️ **Capital Allocation:** £500 (`{row['Recommended Shares']}`)
+                    """)
+    elif not todays_eq.empty:
+        r_cols = st.columns(min(len(todays_eq), 3))
+        for idx, t_row in todays_eq.head(3).iterrows():
+            with r_cols[idx % 3]:
+                with st.container(border=True):
+                    f_meta = {}
+                    try:
+                        f_meta = json.loads(t_row.get("features_json") or "{}")
+                    except Exception:
+                        pass
+                    base_c = f_meta.get("base_ml_conf", 75)
+                    del_c = f_meta.get("learner_delta", 0)
+                    final_c = base_c + del_c
+                    st.markdown(f"#### #{idx+1} {t_row['ticker']} (Logged Today)")
+                    st.write(f"**Final AI Confidence:** `{final_c}%` *(Base ML: {base_c}%, Self-Learner: {del_c:+d}%)*")
+                    st.progress(min(max(final_c / 100.0, 0.0), 1.0))
+                    st.markdown(f"""
+                    **Institutional Layer Breakdown:**
+                    * 🤖 **Calibrated ML Ensemble:** LightGBM + CatBoost (`{base_c}%`)
+                    * 🧠 **Recorded ATR Regime:** `{f_meta.get('atr_pct', 'N/A')}%`
+                    * 🛡️ **Stop-Loss Protection:** `{'Break-Even Locked' if abs(float(t_row['stop_loss']) - float(t_row['entry_price'])) < 1e-4 else 'Initial ATR Stop'}`
+                    * ⚖️ **Capital Allocation:** £{t_row['capital_allocated']:.0f} (`{int(t_row['shares'])} shares`)
                     """)
     else:
         st.info("No active equity signals to analyze. Run the Live Scan on the Equity tab first.")
@@ -1081,6 +1252,8 @@ with tab_reasoning:
                 st.code(f"Recorded Feature Vector: {c_row['features_json']}", language="json")
                 if "LOSS" in str(c_row['status']):
                     st.error("Active Rule Applied: Future setups on this ticker receive a -15% confidence penalty, and its ATR volatility signature feeds the 75th-percentile regime filter (min 3.0% floor).")
+                elif "BREAK-EVEN" in str(c_row['status']):
+                    st.info("Active Rule Applied: Capital preserved via 65% Break-Even Stop Ratchet. Neutral memory weight (0% penalty).")
                 else:
                     st.success("Active Rule Applied: Future setups on this ticker receive a +5% track-record confidence boost.")
     else:
