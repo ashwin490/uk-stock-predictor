@@ -45,6 +45,7 @@ MAX_DAILY_EQUITY_TRADES = 5
 MAX_HOLD_CALENDAR_DAYS = 7        # 5 LSE trading days
 BREAKEVEN_TRIGGER_RATIO = 0.65    # Ratchet stop to friction-adjusted break-even at >= 65% of target distance
 MAX_ACTIVE_PER_SECTOR = 2         # Barra-style concentration limit: max 2 active positions per sector
+COOLDOWN_CALENDAR_DAYS = 3        # Anti-churn rule: prevent re-entry within 3 days of exit
 
 # Strict LSE Ticker Regex (Integrity Gate against untrusted web scraping)
 VALID_LSE_TICKER_RE = re.compile(r"^[A-Z0-9]{1,6}(-[A-Z0-9]{1,2})?\.L$")
@@ -106,7 +107,6 @@ def get_ticker_sector(ticker: str) -> str:
     t = str(ticker).strip().upper()
     if t in SECTOR_MAP:
         return SECTOR_MAP[t]
-    # Deterministic sector fallback for unmapped FTSE 250 constituents so no single bucket jams
     fallback_buckets = ["Industrials", "Consumer", "Financials", "Technology", "Services", "Healthcare"]
     idx = int(hashlib.md5(t.encode("utf-8")).hexdigest()[:4], 16) % len(fallback_buckets)
     return fallback_buckets[idx]
@@ -115,15 +115,9 @@ def is_aim_exempt(ticker: str) -> bool:
     return str(ticker).strip().upper() in AIM_EXEMPT_TICKERS
 
 def get_uk_friction_pct(ticker: str) -> float:
-    """
-    Returns total round-trip execution friction in percentage points:
-    - Main Market LSE: 0.50% HMRC Stamp Duty + 0.10% round-trip spread = 0.60%
-    - AIM Market LSE:  0.00% Stamp Duty (Exempt) + 0.25% round-trip spread = 0.25%
-    """
     return 0.25 if is_aim_exempt(ticker) else 0.60
 
 def get_breakeven_exit_price(entry_price: float, ticker: str) -> float:
-    """Calculates exact exit price required to achieve 0.00% Net P&L after UK Stamp Duty & spread."""
     f_pct = get_uk_friction_pct(ticker)
     return round(float(entry_price) * (1.0 + (f_pct / 100.0)), 2)
 
@@ -343,7 +337,6 @@ def calculate_black_scholes_call(spot: float, strike: float, days_to_exp: float,
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_cached_history(ticker: str, period: str = "120d") -> pd.DataFrame:
-    """Caches Yahoo Finance OHLCV bars for 5 minutes to prevent HTTP 429 bans."""
     if not is_valid_lse_ticker(ticker):
         return pd.DataFrame()
     try:
@@ -354,13 +347,6 @@ def fetch_cached_history(ticker: str, period: str = "120d") -> pd.DataFrame:
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_cross_asset_macro_regime() -> dict:
-    """
-    Fetches 5-day rolling returns for global macro drivers of LSE equities:
-    - Brent Crude (BZ=F) -> Drives Energy (SHEL.L, BP.L)
-    - Copper (HG=F) -> Drives Basic Materials / Miners (RIO.L, GLEN.L)
-    - GBP/USD (GBPUSD=X) -> Weaker GBP boosts FTSE 100 USD Exporters
-    - FTSE 100 (^FTSE) -> Broad UK market beta
-    """
     macro = {"brent_5d": 0.0, "copper_5d": 0.0, "gbpusd_5d": 0.0, "ftse_5d": 0.0}
     symbols = {"brent_5d": "BZ=F", "copper_5d": "HG=F", "gbpusd_5d": "GBPUSD=X", "ftse_5d": "^FTSE"}
     for key, sym in symbols.items():
@@ -376,7 +362,6 @@ def get_cross_asset_macro_regime() -> dict:
     return macro
 
 def compute_macro_lead_lag_adjustment(ticker: str, sector: str, macro: dict) -> tuple:
-    """Computes bounded [-4, +4] confidence delta based on cross-asset macro alignment."""
     delta = 0
     notes = []
     brent = macro.get("brent_5d", 0.0)
@@ -463,7 +448,6 @@ if not check_password():
 # 4. AUDITING & RECONCILIATION ENGINE (TCA NET P&L + FRICTION-AWARE BE RATCHET)
 # ==============================================================================
 def is_stop_breakeven_protected(entry_price: float, stop_loss: float, ticker: str) -> bool:
-    """Returns True if stop_loss has been ratcheted to >= entry_price (or friction-adjusted BE)."""
     return float(stop_loss) >= float(entry_price) - 1e-4
 
 def audit_and_reconcile_all_trades():
@@ -480,7 +464,7 @@ def audit_and_reconcile_all_trades():
         finally:
             con.close()
 
-    # 1. Audit Equities (with Friction-Adjusted Break-Even Stop-Loss Ratchet & Net-of-Tax P&L)
+    # 1. Audit Equities
     if not active_trades.empty:
         for _, tr in active_trades.iterrows():
             tkr = str(tr["ticker"]).strip()
@@ -500,7 +484,6 @@ def audit_and_reconcile_all_trades():
                 stop = float(tr["stop_loss"])
                 be_Floor = get_breakeven_exit_price(entry, tkr)
 
-                # Ratchet stop to friction-adjusted break-even once price covers >= 65% of target distance
                 target_dist = target - entry
                 if target_dist > 0 and stop < be_Floor:
                     be_trigger_price = entry + (BREAKEVEN_TRIGGER_RATIO * target_dist)
@@ -534,7 +517,6 @@ def audit_and_reconcile_all_trades():
                     except Exception:
                         pass
 
-                # Net P&L (%) after UK HMRC Stamp Duty (0.50% Main / 0.00% AIM) and LSE Spread Friction
                 if new_status == "🛡️ BREAK-EVEN (PROTECTED EXIT)":
                     pnl = 0.0
                 else:
@@ -771,7 +753,6 @@ def get_currently_active_tickers() -> set:
             con.close()
 
 def get_active_sector_exposure() -> dict:
-    """Returns count of currently ACTIVE equity positions per industry sector."""
     counts = {}
     for tkr in get_currently_active_tickers():
         sec = get_ticker_sector(tkr)
@@ -789,6 +770,28 @@ def get_todays_logged_equities() -> pd.DataFrame:
             return pd.DataFrame()
         finally:
             con.close()
+
+def get_recent_cooldown_tickers() -> set:
+    """Anti-Churn Rule: Identifies tickers closed within COOLDOWN_CALENDAR_DAYS to prevent immediate re-entry."""
+    lon_zone = pytz.timezone('Europe/London')
+    today_dt = datetime.now(lon_zone).date()
+    cooldown = set()
+    with DB_LOCK:
+        con = duckdb.connect(DB_PATH, read_only=True)
+        try:
+            recent_closed = con.execute("SELECT ticker, date_str FROM trade_journal WHERE status != 'ACTIVE'").df()
+            for _, r in recent_closed.iterrows():
+                try:
+                    c_dt = datetime.strptime(str(r["date_str"]), "%Y-%m-%d").date()
+                    if (today_dt - c_dt).days <= COOLDOWN_CALENDAR_DAYS:
+                        cooldown.add(str(r["ticker"]).strip())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            con.close()
+    return cooldown
 
 def log_equity_signal_safely(sig: dict, enforce_sector_cap: bool = True) -> bool:
     lon_zone = pytz.timezone('Europe/London')
@@ -928,8 +931,20 @@ def run_predictions():
     if ml_model is None:
         return pd.DataFrame(), False
 
+    # 1. Identify active positions, saturated sectors, and cooling-down tickers
     active_held = get_currently_active_tickers()
-    full_universe = [t for t in get_live_lse_universe() if t not in active_held]
+    active_sectors = get_active_sector_exposure()
+    saturated_sectors = {sec for sec, cnt in active_sectors.items() if cnt >= MAX_ACTIVE_PER_SECTOR}
+    cooldown_tickers = get_recent_cooldown_tickers()
+
+    # Pre-filter universe so saturated sectors & churned stocks cannot monopolize candidate pools
+    full_universe = [
+        t for t in get_live_lse_universe() 
+        if t not in active_held 
+        and t not in cooldown_tickers
+        and get_ticker_sector(t) not in saturated_sectors
+    ]
+    
     if not full_universe:
         return pd.DataFrame(), False
 
@@ -941,7 +956,7 @@ def run_predictions():
     cb_model = ml_model['catboost']
     feature_cols = ml_model['feature_cols']
 
-    prog = st.progress(0, text=f"Scanning rotating chunk of {len(scan_chunk)} unheld UK equities...")
+    prog = st.progress(0, text=f"Scanning rotating chunk of {len(scan_chunk)} unheld UK equities in available sectors...")
 
     for i, ticker in enumerate(scan_chunk):
         try:
@@ -1038,9 +1053,12 @@ def run_predictions():
     df_out = pd.DataFrame(results).sort_values(by=["Qualified", "Adjusted Score", "ReturnNum"], ascending=[False, False, False]).reset_index(drop=True)
     qualified_only = df_out[df_out["Qualified"] == True].copy()
 
-    # Log qualified setups while respecting both the 5/day cap and Barra-style 2/sector cap
+    # Dynamic auto-fill: log down the ranked list until daily quota fills or candidates exhaust
     if not qualified_only.empty:
         for _, sig in qualified_only.iterrows():
+            todays_count = len(get_todays_logged_equities())
+            if todays_count >= MAX_DAILY_EQUITY_TRADES:
+                break
             log_equity_signal_safely(sig.to_dict(), enforce_sector_cap=True)
 
     return qualified_only, not qualified_only.empty
@@ -1053,6 +1071,7 @@ selected_universe = st.sidebar.selectbox("Universe Mode", ["Rotating Active Mark
 st.sidebar.caption(f"Daily Auto-Log Cap: **Top {MAX_DAILY_EQUITY_TRADES} Picks/Day**")
 st.sidebar.caption(f"Sector Exposure Cap: **Max {MAX_ACTIVE_PER_SECTOR} Active/Sector**")
 st.sidebar.caption(f"Break-Even Ratchet: **≥ {int(BREAKEVEN_TRIGGER_RATIO * 100)}% of Target (Net of Tax)**")
+st.sidebar.caption(f"Post-Exit Cooldown: **{COOLDOWN_CALENDAR_DAYS} Days Anti-Churn**")
 st.sidebar.caption("UK TCA Friction: **0.50% SDRT (Main) / 0% (AIM) + Spread**")
 
 st.sidebar.markdown("---")
@@ -1167,9 +1186,9 @@ with tab_scanner:
 
         df_res = st.session_state.get("scan_results", pd.DataFrame())
         if st.session_state.get("has_cleared", False) and not df_res.empty:
-            st.success(f"🟢 **{len(df_res)} Fresh Unheld Setup(s) Cleared Gates (Net of UK Stamp Duty & Sector Caps)**")
+            st.success(f"🟢 **{len(df_res)} Fresh Unheld Setup(s) Cleared Gates in Available Sectors (Net of UK Stamp Duty & Caps)**")
 
-            st.markdown("### 🔥 Top Conviction Spotlights")
+            st.markdown("### 🔥 Top Conviction Spotlights (Available Sectors)")
             cols = st.columns(min(len(df_res), 3))
             today_key = datetime.now(pytz.timezone('Europe/London')).strftime('%Y-%m-%d')
             for idx, row in df_res.head(3).iterrows():
@@ -1190,7 +1209,7 @@ with tab_scanner:
                         btn_label = "✅ Order Dispatched (Idempotent Lock)" if already_sent else f"🚀 Execute Buy ({broker_mode})"
                         if st.button(btn_label, key=f"exec_{idem_token}", width="stretch", disabled=already_sent):
                             st.session_state["dispatched_orders"].add(idem_token)
-                            log_equity_signal_safely(row.to_dict(), enforce_sector_cap=False)
+                            log_equity_signal_safely(row.to_dict(), enforce_sector_cap=True)
                             st.info(f"Order [{idem_token}] dispatched to {broker_mode}.")
                             st.rerun()
 
@@ -1198,7 +1217,7 @@ with tab_scanner:
             display_cols = ["Ticker", "Sector", "Tax Regime", "Price (p)", "Target (p)", "Stop Loss (p)", "Expected Return", "Base ML", "Learner Delta", "AI Win Confidence", "Recommended Shares", "RNS"]
             st.dataframe(df_res[[c for c in display_cols if c in df_res.columns]], width="stretch", hide_index=True)
         else:
-            st.warning("🛡️ **Capital Protection Active:** No equities currently pass all combined volume, trend, sector, and ML filters.")
+            st.warning("🛡️ **Capital Protection Active:** No equities currently pass all combined volume, trend, sector availability, and ML filters.")
 
 # ==============================================================================
 # 11. TAB 2: OPTIONS ALPHA
@@ -1439,7 +1458,7 @@ with tab_reasoning:
                     st.markdown(f"""
                     **Institutional Layer Breakdown:**
                     * 🤖 **Calibrated ML Ensemble:** LightGBM + CatBoost (`{base_c}%`)
-                    * 🏛️ **UK TCA Regime:** `{tax_tag}` (`-{get_uk_friction_pct(tkr_sym):.2f}%`)
+                    * 🏛️️ **UK TCA Regime:** `{tax_tag}` (`-{get_uk_friction_pct(tkr_sym):.2f}%`)
                     * 🧠 **Recorded ATR Regime:** `{f_meta.get('atr_pct', 'N/A')}%`
                     * 🛡️ **Stop-Loss Protection:** `{'Break-Even + Tax Locked' if be_locked else 'Initial ATR Stop'}`
                     * ⚖️ **Capital Allocation:** £{t_row['capital_allocated']:.0f} (`{int(t_row['shares'])} shares`)
