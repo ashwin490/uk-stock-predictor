@@ -41,11 +41,16 @@ except ImportError:
 
 ROOT_DIR = Path(__file__).resolve().parent
 DB_PATH = os.path.join(ROOT_DIR, "lse_market_data.duckdb")
+MODEL_PATH = os.path.join(ROOT_DIR, "models", "ensemble_ranker.joblib")
+
 MAX_DAILY_EQUITY_TRADES = 5
 MAX_HOLD_CALENDAR_DAYS = 7        # 5 LSE trading days
 BREAKEVEN_TRIGGER_RATIO = 0.65    # Ratchet stop to friction-adjusted break-even at >= 65% of target distance
 MAX_ACTIVE_PER_SECTOR = 2         # Barra-style concentration limit: max 2 active positions per sector
 COOLDOWN_CALENDAR_DAYS = 3        # Anti-churn rule: prevent re-entry within 3 days of exit
+HALF_LIFE_DAYS = 30.0             # 30-day exponential decay half-life for historical penalties
+MIN_SETTLED_TO_RETRAIN = 50       # Minimum closed trades to trigger autonomous ML retraining
+RETRAIN_STEP_INTERVAL = 25        # Retrain every N new closed trades thereafter
 
 # Strict LSE Ticker Regex (Integrity Gate against untrusted web scraping)
 VALID_LSE_TICKER_RE = re.compile(r"^[A-Z0-9]{1,6}(-[A-Z0-9]{1,2})?\.L$")
@@ -67,15 +72,15 @@ SECTOR_MAP = {
     # Basic Materials
     "RIO.L": "Basic Materials", "GLEN.L": "Basic Materials", "LTHM.L": "Basic Materials",
     "CMCL.L": "Basic Materials", "CAML.L": "Basic Materials", "SAV.L": "Basic Materials", "KP2.L": "Basic Materials",
-    # Financials
+    # Financials (Expanded FTSE 100/250)
     "HSBA.L": "Financials", "BARC.L": "Financials", "LSEG.L": "Financials", "BUR.L": "Financials",
     "LLOY.L": "Financials", "NWG.L": "Financials", "PRU.L": "Financials", "LGEN.L": "Financials", "AV.L": "Financials",
-    # Healthcare
+    # Healthcare (Expanded FTSE 100/250)
     "AZN.L": "Healthcare", "GSK.L": "Healthcare", "HLN.L": "Healthcare", "SN.L": "Healthcare", "HIK.L": "Healthcare",
     # Consumer
     "ULVR.L": "Consumer", "BATS.L": "Consumer", "FEVR.L": "Consumer", "JET2.L": "Consumer", "NFG.L": "Consumer",
     "TSCO.L": "Consumer", "SBRY.L": "Consumer", "MKS.L": "Consumer", "NXT.L": "Consumer", "DGE.L": "Consumer", "RKT.L": "Consumer",
-    # Telecom & Utilities
+    # Telecom & Utilities (Expanded FTSE 100/250)
     "NG.L": "Telecom & Utilities", "VOD.L": "Telecom & Utilities", "BT-A.L": "Telecom & Utilities", "SSE.L": "Telecom & Utilities", "CNA.L": "Telecom & Utilities",
     # Technology
     "DOTD.L": "Technology", "BIG.L": "Technology", "SEE.L": "Technology", "AOM.L": "Technology",
@@ -148,7 +153,7 @@ def evaluate_rns_nlp_sentiment(ticker: str) -> dict:
     for phrase, weight in RNS_BEARISH_LEXICON.items():
         if phrase in headline:
             lex_delta += weight
-            matched_tags.append(f"⚠️️ {phrase.title()}")
+            matched_tags.append(f"⚠️ {phrase.title()}")
     for phrase, weight in RNS_BULLISH_LEXICON.items():
         if phrase in headline:
             lex_delta += weight
@@ -254,15 +259,37 @@ def record_db_error(context: str, err: Exception):
     sanitized = re.sub(r"https?://[^\s'\"]+", "[REDACTED_URL]", raw_msg)
     st.session_state["db_error"] = f"[{context}] {sanitized[:140]}"
 
+def fetch_all_supabase_rows(table_name: str) -> list:
+    """Paginated retrieval: seamlessly retrieves beyond the PostgREST 1,000-row ceiling for 10-year scale."""
+    if not supabase:
+        return []
+    all_rows = []
+    chunk_size = 1000
+    start = 0
+    while True:
+        try:
+            res = supabase.table(table_name).select("*").range(start, start + chunk_size - 1).execute()
+            if not res.data:
+                break
+            all_rows.extend(res.data)
+            if len(res.data) < chunk_size:
+                break
+            start += chunk_size
+        except Exception as e:
+            record_db_error(f"Paginate {table_name}", e)
+            break
+    return all_rows
+
 def hydrate_duckdb_from_supabase():
+    """Restores all historical and active trades from Supabase using 10-year chunked pagination."""
     if not supabase:
         return
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=False)
         try:
-            res_eq = supabase.table("predictions").select("*").execute()
-            if res_eq.data:
-                for r in res_eq.data:
+            eq_data = fetch_all_supabase_rows("predictions")
+            if eq_data:
+                for r in eq_data:
                     tkr = str(r.get('ticker', '')).strip()
                     if not is_valid_lse_ticker(tkr):
                         continue
@@ -293,9 +320,9 @@ def hydrate_duckdb_from_supabase():
             record_db_error("Hydrate Equities", e)
 
         try:
-            res_opt = supabase.table("options_journal").select("*").execute()
-            if res_opt.data:
-                for o in res_opt.data:
+            opt_data = fetch_all_supabase_rows("options_journal")
+            if opt_data:
+                for o in opt_data:
                     date_k = str(o.get('date_key', datetime.now().strftime('%Y-%m-%d')))
                     con.execute("""
                         INSERT OR REPLACE INTO daily_options_journal 
@@ -320,10 +347,9 @@ if "hydrated_once" not in st.session_state:
     st.session_state["hydrated_once"] = True
 
 # ==============================================================================
-# 2. TIMEZONE, CONFIGURATION, MACRO FEED & AVAILABILITY CACHING
+# 2. TIMEZONE, CONFIGURATION, MACRO FEED & RESILIENT DATA CACHING
 # ==============================================================================
 st.set_page_config(page_title="ALPHA-LSE Quant Terminal", page_icon="⚡", layout="wide", initial_sidebar_state="collapsed")
-MODEL_PATH = os.path.join(ROOT_DIR, "models", "ensemble_ranker.joblib")
 LOT_SIZES = {"SHEL": 1000, "AZN": 500, "HSBA": 2000, "ULVR": 500, "BP": 3000, "BARC": 5000, "RIO": 250, "GLEN": 4000}
 
 def is_lse_market_open() -> bool:
@@ -345,13 +371,18 @@ def calculate_black_scholes_call(spot: float, strike: float, days_to_exp: float,
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_cached_history(ticker: str, period: str = "120d") -> pd.DataFrame:
+    """Fault-tolerant history fetcher with exponential retry and timeout guards."""
     if not is_valid_lse_ticker(ticker):
         return pd.DataFrame()
-    try:
-        df = yf.Ticker(ticker).history(period=period, auto_adjust=False)
-        return df if df is not None else pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
+    for attempt in range(2):
+        try:
+            df = yf.Ticker(ticker).history(period=period, auto_adjust=False, timeout=6)
+            if df is not None and not df.empty:
+                return df
+        except Exception:
+            if attempt == 0:
+                time.sleep(0.5)
+    return pd.DataFrame()
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_cross_asset_macro_regime() -> dict:
@@ -359,7 +390,7 @@ def get_cross_asset_macro_regime() -> dict:
     symbols = {"brent_5d": "BZ=F", "copper_5d": "HG=F", "gbpusd_5d": "GBPUSD=X", "ftse_5d": "^FTSE"}
     for key, sym in symbols.items():
         try:
-            h = yf.Ticker(sym).history(period="10d")
+            h = yf.Ticker(sym).history(period="10d", timeout=5)
             if h is not None and len(h) >= 5:
                 c_now = float(h["Close"].iloc[-1])
                 c_5d = float(h["Close"].iloc[-5])
@@ -525,7 +556,7 @@ def audit_and_reconcile_all_trades():
                     except Exception:
                         pass
 
-                if new_status == "🛡️ BREAK-EVEN (PROTECTED EXIT)":
+                if new_status == "🛡️️ BREAK-EVEN (PROTECTED EXIT)":
                     pnl = 0.0
                 else:
                     pnl = calc_net_equity_pnl_pct(entry, curr, tkr)
@@ -616,36 +647,53 @@ def audit_and_reconcile_all_trades():
                 continue
 
 # ==============================================================================
-# 5. CLOSED-LOOP SELF-LEARNING ENGINE (75TH PERCENTILE ATR FLOOR)
+# 5. CONTINUOUS LEARNING: 30-DAY EXPONENTIAL DECAY & AUTONOMOUS RETRAINING
 # ==============================================================================
 def get_self_learning_adjustment(ticker: str, current_atr_pct: float) -> dict:
-    delta = 0
+    """Applies exponential half-life time decay (30 days) to historical stop-outs and wins."""
+    delta = 0.0
     reasons = []
+    lon_zone = pytz.timezone('Europe/London')
+    today_dt = datetime.now(lon_zone).date()
+
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=True)
         try:
-            hist = con.execute("SELECT ticker, status, features_json FROM trade_journal WHERE status != 'ACTIVE'").df()
+            hist = con.execute("SELECT ticker, date_str, status, features_json FROM trade_journal WHERE status != 'ACTIVE'").df()
         except Exception:
             hist = pd.DataFrame()
         finally:
             con.close()
 
     if hist.empty:
-        return {"delta": 0, "reason": "Neutral (Building closed-trade memory)"}
+        return {"delta": 0, "reason": "Neutral (Building memory)"}
 
     try:
         t_hist = hist[hist["ticker"] == ticker]
         if not t_hist.empty:
-            losses = len(t_hist[t_hist["status"].str.contains("LOSS", na=False)])
-            wins = len(t_hist[t_hist["status"].str.contains("WIN", na=False)])
-            if losses > 0:
-                pen = losses * 15
-                delta -= pen
-                reasons.append(f"-{pen}% ({losses}x prior stop-out on {ticker})")
-            if wins > 0:
-                bst = wins * 5
-                delta += bst
-                reasons.append(f"+{bst}% ({wins}x prior target hit on {ticker})")
+            decayed_loss = 0.0
+            decayed_win = 0.0
+            for _, r in t_hist.iterrows():
+                try:
+                    dt = datetime.strptime(str(r["date_str"]), "%Y-%m-%d").date()
+                    days_ago = max(0, (today_dt - dt).days)
+                except Exception:
+                    days_ago = 15
+                weight = math.pow(0.5, days_ago / HALF_LIFE_DAYS)
+                st_val = str(r["status"]).upper()
+                if "LOSS" in st_val:
+                    decayed_loss += 15.0 * weight
+                elif "WIN" in st_val:
+                    decayed_win += 5.0 * weight
+
+            if decayed_loss >= 1.0:
+                pen_i = int(round(decayed_loss))
+                delta -= pen_i
+                reasons.append(f"-{pen_i}% (Decayed stop-out memory)")
+            if decayed_win >= 1.0:
+                bst_i = int(round(decayed_win))
+                delta += bst_i
+                reasons.append(f"+{bst_i}% (Decayed target hit memory)")
 
         all_losses = hist[hist["status"].str.contains("LOSS", na=False)]
         if not all_losses.empty:
@@ -665,8 +713,83 @@ def get_self_learning_adjustment(ticker: str, current_atr_pct: float) -> dict:
     except Exception:
         pass
 
+    final_delta = int(round(delta))
     reason_str = " | ".join(reasons) if reasons else "No adverse historical match"
-    return {"delta": delta, "reason": reason_str}
+    return {"delta": final_delta, "reason": reason_str}
+
+def check_and_auto_retrain_model(feature_cols: list):
+    """Autonomous ML Engine: Retrains LightGBM & CatBoost when sufficient live trade vectors accumulate."""
+    with DB_LOCK:
+        con = duckdb.connect(DB_PATH, read_only=True)
+        try:
+            closed_trades = con.execute("SELECT status, features_json FROM trade_journal WHERE status != 'ACTIVE'").df()
+        except Exception:
+            closed_trades = pd.DataFrame()
+        finally:
+            con.close()
+
+    total_closed = len(closed_trades)
+    if total_closed < MIN_SETTLED_TO_RETRAIN:
+        return
+
+    last_retrained = st.session_state.get("last_retrained_count", 0)
+    if (total_closed - last_retrained) < RETRAIN_STEP_INTERVAL:
+        return
+
+    rows = []
+    labels = []
+    weights = []
+
+    for _, r in closed_trades.iterrows():
+        try:
+            f_obj = json.loads(r["features_json"])
+            raw_feats = f_obj.get("raw_features", {})
+            if not all(col in raw_feats for col in feature_cols):
+                continue
+            st_val = str(r["status"]).upper()
+            if "WIN" in st_val:
+                labels.append(1)
+                weights.append(3.0)
+            elif "LOSS" in st_val:
+                labels.append(0)
+                weights.append(3.5)
+            elif "BREAK-EVEN" in st_val:
+                labels.append(1)
+                weights.append(1.5)
+            else:
+                continue
+            rows.append([float(raw_feats[c]) for c in feature_cols])
+        except Exception:
+            continue
+
+    if len(rows) < MIN_SETTLED_TO_RETRAIN:
+        return
+
+    try:
+        from lightgbm import LGBMClassifier
+        from catboost import CatBoostClassifier
+
+        X = pd.DataFrame(rows, columns=feature_cols)
+        y = np.array(labels)
+        w = np.array(weights)
+
+        # Ensure class diversity
+        if len(np.unique(y)) < 2:
+            return
+
+        lgb_model = LGBMClassifier(n_estimators=250, learning_rate=0.03, max_depth=5, random_state=42)
+        lgb_model.fit(X, y, sample_weight=w)
+
+        cb_model = CatBoostClassifier(iterations=300, learning_rate=0.03, depth=5, verbose=0, random_seed=42)
+        cb_model.fit(X, y, sample_weight=w)
+
+        new_bundle = {"lgb": lgb_model, "catboost": cb_model, "feature_cols": feature_cols}
+        joblib.dump(new_bundle, MODEL_PATH)
+        st.session_state["ml_model_bundle"] = new_bundle
+        st.session_state["last_retrained_count"] = total_closed
+        st.session_state["retrain_notice"] = f"🧠 AI Retrained autonomously on {len(rows)} live UK market trades ({total_closed} total closed)!"
+    except Exception as e:
+        record_db_error("Auto-Retrain ML", e)
 
 # ==============================================================================
 # 6. OPTIONS ENGINE (DYNAMIC BLUE-CHIP SELECTION UNDER £500 CAP)
@@ -892,15 +1015,19 @@ def log_equity_signal_safely(sig: dict, enforce_sector_cap: bool = True) -> bool
     return logged_local
 
 # ==============================================================================
-# 8. SANITIZED UNIVERSE SCRAPER & INSTITUTIONAL ML PIPELINE
+# 8. EXPANDED UNIVERSE & AUTONOMOUS DUAL-ENSEMBLE ML ENGINE
 # ==============================================================================
-@st.cache_resource
-def load_ml_model():
+def get_ml_model():
+    if "ml_model_bundle" in st.session_state:
+        return st.session_state["ml_model_bundle"]
     if os.path.exists(MODEL_PATH):
-        return joblib.load(MODEL_PATH)
+        try:
+            bundle = joblib.load(MODEL_PATH)
+            st.session_state["ml_model_bundle"] = bundle
+            return bundle
+        except Exception:
+            return None
     return None
-
-ml_model = load_ml_model()
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_live_lse_universe() -> list:
@@ -908,7 +1035,7 @@ def get_live_lse_universe() -> list:
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     try:
         url_100 = "https://en.wikipedia.org/wiki/FTSE_100_Index"
-        resp_100 = requests.get(url_100, headers=headers, timeout=5)
+        resp_100 = requests.get(url_100, headers=headers, timeout=4)
         if resp_100.status_code == 200:
             df_100 = pd.read_html(resp_100.text, attrs={'id': 'constituents'})[0]
             raw_tickers.extend([f"{str(t).strip().replace('.', '-')}.L" for t in df_100['Ticker'].dropna()])
@@ -917,7 +1044,7 @@ def get_live_lse_universe() -> list:
 
     try:
         url_250 = "https://en.wikipedia.org/wiki/FTSE_250_Index"
-        resp_250 = requests.get(url_250, headers=headers, timeout=5)
+        resp_250 = requests.get(url_250, headers=headers, timeout=4)
         if resp_250.status_code == 200:
             df_250 = pd.read_html(resp_250.text, attrs={'id': 'constituents'})[0]
             raw_tickers.extend([f"{str(t).strip().replace('.', '-')}.L" for t in df_250['Ticker'].dropna()])
@@ -948,16 +1075,18 @@ def get_live_lse_universe() -> list:
     return sorted([t for t in combined if is_valid_lse_ticker(t)])
 
 def run_predictions():
-    if ml_model is None:
+    ml_bundle = get_ml_model()
+    if ml_bundle is None:
         return pd.DataFrame(), False
 
-    # 1. Identify active positions, saturated sectors, and cooling-down tickers
+    feature_cols = ml_bundle['feature_cols']
+    check_and_auto_retrain_model(feature_cols)
+
     active_held = get_currently_active_tickers()
     active_sectors = get_active_sector_exposure()
     saturated_sectors = {sec for sec, cnt in active_sectors.items() if cnt >= MAX_ACTIVE_PER_SECTOR}
     cooldown_tickers = get_recent_cooldown_tickers()
 
-    # Pre-filter universe so saturated sectors & churned stocks cannot monopolize candidate pools
     full_universe = [
         t for t in get_live_lse_universe() 
         if t not in active_held 
@@ -972,9 +1101,8 @@ def run_predictions():
     macro_regime = get_cross_asset_macro_regime()
 
     results = []
-    lgb_model = ml_model['lgb']
-    cb_model = ml_model['catboost']
-    feature_cols = ml_model['feature_cols']
+    lgb_model = ml_bundle['lgb']
+    cb_model = ml_bundle['catboost']
 
     prog = st.progress(0, text=f"Scanning rotating chunk of {len(scan_chunk)} unheld UK equities in available sectors...")
 
@@ -1025,7 +1153,11 @@ def run_predictions():
             shares = int((500.0 * 100) / close) if close > 0 else 1
             is_qualified = (final_confidence >= 65) and (net_return_pct >= 2.0)
 
+            # Store the complete numeric feature vector so walk-forward model retraining is 100% automated
+            raw_feature_map = {c: float(latest[c].values[0]) for c in feature_cols if c in latest.columns}
+
             feature_snapshot = {
+                "raw_features": raw_feature_map,
                 "atr_pct": atr_pct,
                 "raw_prob": round(blended, 4),
                 "base_ml_conf": base_confidence,
@@ -1092,6 +1224,7 @@ st.sidebar.caption(f"Daily Auto-Log Cap: **Top {MAX_DAILY_EQUITY_TRADES} Picks/D
 st.sidebar.caption(f"Sector Exposure Cap: **Max {MAX_ACTIVE_PER_SECTOR} Active/Sector**")
 st.sidebar.caption(f"Break-Even Ratchet: **≥ {int(BREAKEVEN_TRIGGER_RATIO * 100)}% of Target (Net of Tax)**")
 st.sidebar.caption(f"Post-Exit Cooldown: **{COOLDOWN_CALENDAR_DAYS} Days Anti-Churn**")
+st.sidebar.caption(f"Time-Decay Half-Life: **{int(HALF_LIFE_DAYS)} Days**")
 st.sidebar.caption("UK TCA Friction: **0.50% SDRT (Main) / 0% (AIM) + Spread**")
 
 st.sidebar.markdown("---")
@@ -1115,8 +1248,11 @@ if is_new_loop_tick:
     hydrate_duckdb_from_supabase()
     st.session_state["last_loop_tick"] = loop_tick
 
+if "retrain_notice" in st.session_state:
+    st.sidebar.success(st.session_state["retrain_notice"])
+
 if "db_error" in st.session_state:
-    st.sidebar.error(f"⚠️ Cloud Sync Warning: {st.session_state['db_error']}")
+    st.sidebar.error(f"⚠️️ Cloud Sync Warning: {st.session_state['db_error']}")
 
 if st.sidebar.button("🚪 Log Out", width="stretch"):
     st.session_state["password_correct"] = False
@@ -1128,7 +1264,7 @@ macro_bar = get_cross_asset_macro_regime()
 
 st.title("⚡ ALPHA-LSE Quant Terminal")
 st.caption(
-    f"Status: **CIA-Hardened Institutional AI** • Database: **{db_status_text}** • Market (LON): **{market_status}** • "
+    f"Status: **10-Year Autonomous Quant AI** • Database: **{db_status_text}** • Market (LON): **{market_status}** • "
     f"5D Macro: **FTSE {macro_bar['ftse_5d']:+.1f}% | Brent {macro_bar['brent_5d']:+.1f}% | Copper {macro_bar['copper_5d']:+.1f}% | GBP/USD {macro_bar['gbpusd_5d']:+.1f}%**"
 )
 
@@ -1237,7 +1373,7 @@ with tab_scanner:
             display_cols = ["Ticker", "Sector", "Tax Regime", "Price (p)", "Target (p)", "Stop Loss (p)", "Expected Return", "Base ML", "Learner Delta", "AI Win Confidence", "Recommended Shares", "RNS"]
             st.dataframe(df_res[[c for c in display_cols if c in df_res.columns]], width="stretch", hide_index=True)
         else:
-            st.warning("🛡️ **Capital Protection Active:** No equities currently pass all combined volume, trend, sector availability, and ML filters.")
+            st.warning("🛡️️ **Capital Protection Active:** No equities currently pass all combined volume, trend, sector availability, and ML filters.")
 
 # ==============================================================================
 # 11. TAB 2: OPTIONS ALPHA
@@ -1387,7 +1523,7 @@ with tab_journal:
         def format_eq_status(row):
             st_val = str(row["status"])
             if st_val == "ACTIVE" and is_stop_breakeven_protected(float(row["entry_price"]), float(row["stop_loss"]), str(row["ticker"])):
-                return "🟢 ACTIVE (🛡️️ BE STOP)"
+                return "🟢 ACTIVE (🛡️ BE STOP)"
             return st_val
 
         df_eq_disp["status"] = df_eq_disp.apply(format_eq_status, axis=1)
@@ -1525,10 +1661,10 @@ with tab_reasoning:
                 st.write(f"**Entry:** `{c_row['entry_price']:.2f}p` | **Exit/Last:** `{c_row['latest_price']:.2f}p` | **Sector:** `{get_ticker_sector(c_row['ticker'])}`")
                 st.code(f"Recorded Feature Vector: {c_row['features_json']}", language="json")
                 if "LOSS" in str(c_row['status']):
-                    st.error("Active Rule Applied: Future setups on this ticker receive a -15% confidence penalty, and its ATR volatility signature feeds the 75th-percentile regime filter (min 3.0% floor).")
+                    st.error("Active Rule Applied: Future setups on this ticker receive a 30-day exponential time-decayed penalty (-15% initial), and ATR feeds the 75th-percentile volatility floor.")
                 elif "BREAK-EVEN" in str(c_row['status']):
                     st.info("Active Rule Applied: Capital & UK Stamp Duty preserved via 65% Break-Even Stop Ratchet. Neutral memory weight (0% penalty).")
                 else:
-                    st.success("Active Rule Applied: Future setups on this ticker receive a +5% track-record confidence boost.")
+                    st.success("Active Rule Applied: Future setups on this ticker receive a 30-day exponential time-decayed boost (+5% initial).")
     else:
         st.success("🏆 **Zero Closed/Stopped-Out Trades in Current Memory.**\n\nAs trades hit their target or stop-loss, their feature vectors are permanently stored in Supabase and used to penalize or boost future scans.")
