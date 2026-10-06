@@ -62,23 +62,32 @@ AIM_EXEMPT_TICKERS = {
 }
 
 SECTOR_MAP = {
+    # Energy
     "SHEL.L": "Energy", "BP.L": "Energy", "PTAL.L": "Energy", "RKH.L": "Energy", "ITM.L": "Energy",
+    # Basic Materials
     "RIO.L": "Basic Materials", "GLEN.L": "Basic Materials", "LTHM.L": "Basic Materials",
     "CMCL.L": "Basic Materials", "CAML.L": "Basic Materials", "SAV.L": "Basic Materials", "KP2.L": "Basic Materials",
+    # Financials
     "HSBA.L": "Financials", "BARC.L": "Financials", "LSEG.L": "Financials", "BUR.L": "Financials",
     "LLOY.L": "Financials", "NWG.L": "Financials", "PRU.L": "Financials", "LGEN.L": "Financials", "AV.L": "Financials",
+    # Healthcare
     "AZN.L": "Healthcare", "GSK.L": "Healthcare", "HLN.L": "Healthcare", "SN.L": "Healthcare", "HIK.L": "Healthcare",
+    # Consumer
     "ULVR.L": "Consumer", "BATS.L": "Consumer", "FEVR.L": "Consumer", "JET2.L": "Consumer", "NFG.L": "Consumer",
     "TSCO.L": "Consumer", "SBRY.L": "Consumer", "MKS.L": "Consumer", "NXT.L": "Consumer", "DGE.L": "Consumer", "RKT.L": "Consumer",
+    # Telecom & Utilities
     "NG.L": "Telecom & Utilities", "VOD.L": "Telecom & Utilities", "BT-A.L": "Telecom & Utilities", "SSE.L": "Telecom & Utilities", "CNA.L": "Telecom & Utilities",
+    # Technology
     "DOTD.L": "Technology", "BIG.L": "Technology", "SEE.L": "Technology", "AOM.L": "Technology",
     "YOU.L": "Technology", "CER.L": "Technology", "RWS.L": "Technology", "KGH.L": "Technology", "AUTO.L": "Technology", "SGE.L": "Technology",
+    # Defense & Aero
     "CHRT.L": "Defense & Aero", "CNC.L": "Defense & Aero", "BA.L": "Defense & Aero", "RR.L": "Defense & Aero", "QQ.L": "Defense & Aero",
+    # Industrials
     "CRW.L": "Industrials", "BRCK.L": "Industrials", "MIDW.L": "Industrials", "VIC.L": "Industrials",
     "SRC.L": "Industrials", "JHD.L": "Industrials", "REL.L": "Industrials", "EXPN.L": "Industrials", "AHT.L": "Industrials"
 }
 
-FTSE_EXPORTERS = {"AZN.L", "GSK.L", "SHEL.L", "BP.L", "ULVR.L", "BATS.L", "RIO.L", "GLEN.L", "DIAGEO.L", "REL.L", "CRW.L"}
+FTSE_EXPORTERS = {"AZN.L", "GSK.L", "SHEL.L", "BP.L", "ULVR.L", "BATS.L", "RIO.L", "GLEN.L", "DGE.L", "REL.L", "CRW.L"}
 
 RNS_BULLISH_LEXICON = {
     "ahead of expectations": 0.08, "exceeds expectations": 0.08, "materially ahead": 0.09,
@@ -139,7 +148,7 @@ def evaluate_rns_nlp_sentiment(ticker: str) -> dict:
     for phrase, weight in RNS_BEARISH_LEXICON.items():
         if phrase in headline:
             lex_delta += weight
-            matched_tags.append(f"⚠️ {phrase.title()}")
+            matched_tags.append(f"⚠️️ {phrase.title()}")
     for phrase, weight in RNS_BULLISH_LEXICON.items():
         if phrase in headline:
             lex_delta += weight
@@ -246,7 +255,6 @@ def record_db_error(context: str, err: Exception):
     st.session_state["db_error"] = f"[{context}] {sanitized[:140]}"
 
 def hydrate_duckdb_from_supabase():
-    """Restores all historical and active trades from Supabase with thread locking."""
     if not supabase:
         return
     with DB_LOCK:
@@ -772,7 +780,6 @@ def get_todays_logged_equities() -> pd.DataFrame:
             con.close()
 
 def get_recent_cooldown_tickers() -> set:
-    """Anti-Churn Rule: Identifies tickers closed within COOLDOWN_CALENDAR_DAYS to prevent immediate re-entry."""
     lon_zone = pytz.timezone('Europe/London')
     today_dt = datetime.now(lon_zone).date()
     cooldown = set()
@@ -918,11 +925,24 @@ def get_live_lse_universe() -> list:
         pass
 
     fallback_pool = [
-        "SHEL.L", "AZN.L", "HSBA.L", "ULVR.L", "BP.L", "BARC.L", "RIO.L", "GLEN.L",
-        "GSK.L", "BATS.L", "LSEG.L", "NG.L", "BUR.L", "BRCK.L", "MIDW.L", "VIC.L",
-        "AOM.L", "SEE.L", "SRC.L", "SAV.L", "YOU.L", "PTAL.L", "JET2.L", "CER.L",
-        "RWS.L", "RKH.L", "KGH.L", "NFG.L", "KP2.L", "BIG.L", "JHD.L", "LTHM.L",
-        "CMCL.L", "CAML.L", "CHRT.L", "CNC.L", "CRW.L", "DOTD.L", "FEVR.L", "ITM.L"
+        # Energy
+        "SHEL.L", "BP.L", "PTAL.L", "RKH.L", "ITM.L",
+        # Basic Materials
+        "RIO.L", "GLEN.L", "LTHM.L", "CMCL.L", "CAML.L", "SAV.L", "KP2.L",
+        # Financials (Expanded FTSE 100/250)
+        "HSBA.L", "BARC.L", "LSEG.L", "BUR.L", "LLOY.L", "NWG.L", "AV.L", "PRU.L", "LGEN.L",
+        # Healthcare (Expanded FTSE 100/250)
+        "AZN.L", "GSK.L", "HLN.L", "SN.L", "HIK.L",
+        # Consumer
+        "ULVR.L", "BATS.L", "FEVR.L", "JET2.L", "NFG.L", "TSCO.L", "SBRY.L", "MKS.L", "NXT.L", "DGE.L", "RKT.L",
+        # Telecom & Utilities (Expanded FTSE 100/250)
+        "NG.L", "SSE.L", "CNA.L", "VOD.L", "BT-A.L",
+        # Technology
+        "DOTD.L", "BIG.L", "SEE.L", "AOM.L", "YOU.L", "CER.L", "RWS.L", "KGH.L", "AUTO.L", "SGE.L",
+        # Defense & Aero
+        "CHRT.L", "CNC.L", "BA.L", "RR.L", "QQ.L",
+        # Industrials
+        "CRW.L", "BRCK.L", "MIDW.L", "VIC.L", "SRC.L", "JHD.L", "REL.L", "EXPN.L", "AHT.L"
     ]
     combined = set(raw_tickers + fallback_pool)
     return sorted([t for t in combined if is_valid_lse_ticker(t)])
@@ -1157,7 +1177,7 @@ with tab_scanner:
                     sec_name = f_meta.get("sector") or get_ticker_sector(tkr_sym)
                     tax_tag = f_meta.get("tax_regime") or ("AIM (0% SDRT)" if is_aim_exempt(tkr_sym) else "Main (0.5% SDRT)")
                     be_active = is_stop_breakeven_protected(float(t_row["entry_price"]), float(t_row["stop_loss"]), tkr_sym)
-                    stop_tag = f"{t_row['stop_loss']:.2f}p (🛡️ BE+Tax Locked)" if be_active else f"{t_row['stop_loss']:.2f}p"
+                    stop_tag = f"{t_row['stop_loss']:.2f}p (🛡️️ BE+Tax Locked)" if be_active else f"{t_row['stop_loss']:.2f}p"
 
                     st.success(f"✅ TODAY'S SLOT #{idx + 1} • {sec_name.upper()}")
                     st.subheader(tkr_sym)
@@ -1367,7 +1387,7 @@ with tab_journal:
         def format_eq_status(row):
             st_val = str(row["status"])
             if st_val == "ACTIVE" and is_stop_breakeven_protected(float(row["entry_price"]), float(row["stop_loss"]), str(row["ticker"])):
-                return "🟢 ACTIVE (🛡️ BE STOP)"
+                return "🟢 ACTIVE (🛡️️ BE STOP)"
             return st_val
 
         df_eq_disp["status"] = df_eq_disp.apply(format_eq_status, axis=1)
@@ -1458,7 +1478,7 @@ with tab_reasoning:
                     st.markdown(f"""
                     **Institutional Layer Breakdown:**
                     * 🤖 **Calibrated ML Ensemble:** LightGBM + CatBoost (`{base_c}%`)
-                    * 🏛️️ **UK TCA Regime:** `{tax_tag}` (`-{get_uk_friction_pct(tkr_sym):.2f}%`)
+                    * 🏛️ **UK TCA Regime:** `{tax_tag}` (`-{get_uk_friction_pct(tkr_sym):.2f}%`)
                     * 🧠 **Recorded ATR Regime:** `{f_meta.get('atr_pct', 'N/A')}%`
                     * 🛡️ **Stop-Loss Protection:** `{'Break-Even + Tax Locked' if be_locked else 'Initial ATR Stop'}`
                     * ⚖️ **Capital Allocation:** £{t_row['capital_allocated']:.0f} (`{int(t_row['shares'])} shares`)
