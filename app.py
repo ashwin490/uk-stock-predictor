@@ -47,7 +47,7 @@ MAX_DAILY_EQUITY_TRADES = 5
 MAX_HOLD_CALENDAR_DAYS = 7        # 5 LSE trading days
 BREAKEVEN_TRIGGER_RATIO = 0.65    # Ratchet stop to friction-adjusted break-even at >= 65% of target distance
 MAX_ACTIVE_PER_SECTOR = 2         # Barra-style concentration limit: max 2 active positions per sector
-COOLDOWN_CALENDAR_DAYS = 3        # Anti-churn rule: prevent re-entry within 3 days of exit
+COOLDOWN_CALENDAR_DAYS = 3        # Anti-churn rule: prevent re-entry within 3 days of actual exit
 HALF_LIFE_DAYS = 30.0             # 30-day exponential decay half-life for historical penalties
 MIN_SETTLED_TO_RETRAIN = 50       # Minimum closed trades to trigger autonomous ML retraining
 RETRAIN_STEP_INTERVAL = 25        # Retrain every N new closed trades thereafter
@@ -73,7 +73,7 @@ SECTOR_MAP = {
     "RIO.L": "Basic Materials", "GLEN.L": "Basic Materials", "LTHM.L": "Basic Materials",
     "CMCL.L": "Basic Materials", "CAML.L": "Basic Materials", "SAV.L": "Basic Materials", "KP2.L": "Basic Materials",
     # Financials (Expanded FTSE 100/250)
-    "HSBA.L": "Financials", "BARC.L": "Financials", "LSEG.L": "Financials", "BUR.L": "Financials",
+    "HSBA.L", "BARC.L": "Financials", "LSEG.L": "Financials", "BUR.L": "Financials",
     "LLOY.L": "Financials", "NWG.L": "Financials", "PRU.L": "Financials", "LGEN.L": "Financials", "AV.L": "Financials",
     # Healthcare (Expanded FTSE 100/250)
     "AZN.L": "Healthcare", "GSK.L": "Healthcare", "HLN.L": "Healthcare", "SN.L": "Healthcare", "HIK.L": "Healthcare",
@@ -91,6 +91,7 @@ SECTOR_MAP = {
     "CRW.L": "Industrials", "BRCK.L": "Industrials", "MIDW.L": "Industrials", "VIC.L": "Industrials",
     "SRC.L": "Industrials", "JHD.L": "Industrials", "REL.L": "Industrials", "EXPN.L": "Industrials", "AHT.L": "Industrials"
 }
+SECTOR_MAP["HSBA.L"] = "Financials"
 
 FTSE_EXPORTERS = {"AZN.L", "GSK.L", "SHEL.L", "BP.L", "ULVR.L", "BATS.L", "RIO.L", "GLEN.L", "DGE.L", "REL.L", "CRW.L"}
 
@@ -298,13 +299,14 @@ def hydrate_duckdb_from_supabase():
                     last_check = str(r.get('last_checked') or datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
                     f_json = json.dumps(r.get('features_json') or {})
                     status_val = str(r.get('status', 'ACTIVE')).upper()
+                    exit_ts_val = last_check if status_val != "ACTIVE" else None
 
                     con.execute("""
                         INSERT OR REPLACE INTO trade_journal 
                         (trade_id, timestamp, date_str, ticker, asset_type, entry_price, target_price,
                          stop_loss, shares, capital_allocated, status, latest_price, pnl_pct, exit_price,
                          exit_timestamp, last_audited, features_json)
-                        VALUES (?, ?, ?, ?, 'EQUITY', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                        VALUES (?, ?, ?, ?, 'EQUITY', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, [
                         trade_id, last_check, pred_date, tkr,
                         float(r.get('entry_price', 0.0)), float(r.get('target_price', 0.0)),
@@ -312,7 +314,7 @@ def hydrate_duckdb_from_supabase():
                         float(r.get('position_gbp', 0.0)), status_val,
                         float(r.get('latest_price', 0.0)), float(r.get('pnl_pct', 0.0)),
                         float(r.get('latest_price', 0.0)) if status_val != "ACTIVE" else 0.0,
-                        last_check, f_json
+                        exit_ts_val, last_check, f_json
                     ])
             if "db_error" in st.session_state and "Hydrate" in st.session_state["db_error"]:
                 del st.session_state["db_error"]
@@ -484,7 +486,7 @@ if not check_password():
     st.stop()
 
 # ==============================================================================
-# 4. AUDITING & RECONCILIATION ENGINE (TCA NET P&L + FRICTION-AWARE BE RATCHET)
+# 4. AUDITING & RECONCILIATION ENGINE (TCA NET P&L + ENTRY-SAFE BE RATCHET)
 # ==============================================================================
 def is_stop_breakeven_protected(entry_price: float, stop_loss: float, ticker: str) -> bool:
     return float(stop_loss) >= float(entry_price) - 1e-4
@@ -494,6 +496,7 @@ def audit_and_reconcile_all_trades():
     now_lon = datetime.now(lon_zone)
     now_str = now_lon.strftime('%Y-%m-%d %H:%M:%S')
     today_date = now_lon.date()
+    today_str = now_lon.strftime('%Y-%m-%d')
 
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=False)
@@ -523,10 +526,15 @@ def audit_and_reconcile_all_trades():
                 stop = float(tr["stop_loss"])
                 be_Floor = get_breakeven_exit_price(entry, tkr)
 
+                # Entry-day guard: On Day 0, never use day_high/day_low (which include 08:00 auction spikes prior to entry)
+                is_same_day_entry = (str(tr["date_str"]) == today_str)
                 target_dist = target - entry
+
                 if target_dist > 0 and stop < be_Floor:
                     be_trigger_price = entry + (BREAKEVEN_TRIGGER_RATIO * target_dist)
-                    if curr >= be_trigger_price or day_high >= be_trigger_price:
+                    ratchet_hit = (curr >= be_trigger_price) if is_same_day_entry else (curr >= be_trigger_price or day_high >= be_trigger_price)
+                    # Require live price > be_Floor so a trade never ratchets above current spot and immediately stops out
+                    if ratchet_hit and curr > be_Floor:
                         stop = be_Floor
 
                 is_be_ratcheted = is_stop_breakeven_protected(entry, stop, tkr)
@@ -534,11 +542,14 @@ def audit_and_reconcile_all_trades():
                 new_status = "ACTIVE"
                 exit_price = 0.0
 
-                if curr >= target or day_high >= target:
+                hit_target = (curr >= target) if is_same_day_entry else (curr >= target or day_high >= target)
+                hit_stop = (curr <= stop) if (is_same_day_entry or is_be_ratcheted) else (curr <= stop or day_low <= stop)
+
+                if hit_target:
                     new_status = "🎯 WIN (TARGET HIT)"
                     curr = max(curr, target)
                     exit_price = curr
-                elif curr <= stop or (not is_be_ratcheted and day_low <= stop):
+                elif hit_stop:
                     if is_be_ratcheted:
                         new_status = "🛡️ BREAK-EVEN (PROTECTED EXIT)"
                         curr = be_Floor
@@ -556,7 +567,7 @@ def audit_and_reconcile_all_trades():
                     except Exception:
                         pass
 
-                if new_status == "🛡️️ BREAK-EVEN (PROTECTED EXIT)":
+                if "BREAK-EVEN" in new_status:
                     pnl = 0.0
                 else:
                     pnl = calc_net_equity_pnl_pct(entry, curr, tkr)
@@ -650,7 +661,7 @@ def audit_and_reconcile_all_trades():
 # 5. CONTINUOUS LEARNING: 30-DAY EXPONENTIAL DECAY & AUTONOMOUS RETRAINING
 # ==============================================================================
 def get_self_learning_adjustment(ticker: str, current_atr_pct: float) -> dict:
-    """Applies exponential half-life time decay (30 days) to historical stop-outs and wins."""
+    """Applies exponential half-life time decay (30 days) based on actual trade exit date."""
     delta = 0.0
     reasons = []
     lon_zone = pytz.timezone('Europe/London')
@@ -659,7 +670,9 @@ def get_self_learning_adjustment(ticker: str, current_atr_pct: float) -> dict:
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=True)
         try:
-            hist = con.execute("SELECT ticker, date_str, status, features_json FROM trade_journal WHERE status != 'ACTIVE'").df()
+            hist = con.execute(
+                "SELECT ticker, date_str, exit_timestamp, last_audited, status, features_json FROM trade_journal WHERE status != 'ACTIVE'"
+            ).df()
         except Exception:
             hist = pd.DataFrame()
         finally:
@@ -675,7 +688,8 @@ def get_self_learning_adjustment(ticker: str, current_atr_pct: float) -> dict:
             decayed_win = 0.0
             for _, r in t_hist.iterrows():
                 try:
-                    dt = datetime.strptime(str(r["date_str"]), "%Y-%m-%d").date()
+                    raw_exit = str(r.get("exit_timestamp") or r.get("last_audited") or r.get("date_str") or "")[:10]
+                    dt = datetime.strptime(raw_exit, "%Y-%m-%d").date()
                     days_ago = max(0, (today_dt - dt).days)
                 except Exception:
                     days_ago = 15
@@ -773,7 +787,6 @@ def check_and_auto_retrain_model(feature_cols: list):
         y = np.array(labels)
         w = np.array(weights)
 
-        # Ensure class diversity
         if len(np.unique(y)) < 2:
             return
 
@@ -903,16 +916,20 @@ def get_todays_logged_equities() -> pd.DataFrame:
             con.close()
 
 def get_recent_cooldown_tickers() -> set:
+    """Anti-Churn Rule: Excludes tickers closed within the last COOLDOWN_CALENDAR_DAYS based on actual exit date."""
     lon_zone = pytz.timezone('Europe/London')
     today_dt = datetime.now(lon_zone).date()
     cooldown = set()
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=True)
         try:
-            recent_closed = con.execute("SELECT ticker, date_str FROM trade_journal WHERE status != 'ACTIVE'").df()
+            recent_closed = con.execute(
+                "SELECT ticker, exit_timestamp, last_audited, date_str FROM trade_journal WHERE status != 'ACTIVE'"
+            ).df()
             for _, r in recent_closed.iterrows():
                 try:
-                    c_dt = datetime.strptime(str(r["date_str"]), "%Y-%m-%d").date()
+                    raw_ts = str(r.get("exit_timestamp") or r.get("last_audited") or r.get("date_str") or "")[:10]
+                    c_dt = datetime.strptime(raw_ts, "%Y-%m-%d").date()
                     if (today_dt - c_dt).days <= COOLDOWN_CALENDAR_DAYS:
                         cooldown.add(str(r["ticker"]).strip())
                 except Exception:
@@ -1153,7 +1170,6 @@ def run_predictions():
             shares = int((500.0 * 100) / close) if close > 0 else 1
             is_qualified = (final_confidence >= 65) and (net_return_pct >= 2.0)
 
-            # Store the complete numeric feature vector so walk-forward model retraining is 100% automated
             raw_feature_map = {c: float(latest[c].values[0]) for c in feature_cols if c in latest.columns}
 
             feature_snapshot = {
@@ -1252,7 +1268,7 @@ if "retrain_notice" in st.session_state:
     st.sidebar.success(st.session_state["retrain_notice"])
 
 if "db_error" in st.session_state:
-    st.sidebar.error(f"⚠️️ Cloud Sync Warning: {st.session_state['db_error']}")
+    st.sidebar.error(f"⚠️ Cloud Sync Warning: {st.session_state['db_error']}")
 
 if st.sidebar.button("🚪 Log Out", width="stretch"):
     st.session_state["password_correct"] = False
@@ -1313,7 +1329,7 @@ with tab_scanner:
                     sec_name = f_meta.get("sector") or get_ticker_sector(tkr_sym)
                     tax_tag = f_meta.get("tax_regime") or ("AIM (0% SDRT)" if is_aim_exempt(tkr_sym) else "Main (0.5% SDRT)")
                     be_active = is_stop_breakeven_protected(float(t_row["entry_price"]), float(t_row["stop_loss"]), tkr_sym)
-                    stop_tag = f"{t_row['stop_loss']:.2f}p (🛡️️ BE+Tax Locked)" if be_active else f"{t_row['stop_loss']:.2f}p"
+                    stop_tag = f"{t_row['stop_loss']:.2f}p (🛡️ BE+Tax Locked)" if be_active else f"{t_row['stop_loss']:.2f}p"
 
                     st.success(f"✅ TODAY'S SLOT #{idx + 1} • {sec_name.upper()}")
                     st.subheader(tkr_sym)
@@ -1373,7 +1389,7 @@ with tab_scanner:
             display_cols = ["Ticker", "Sector", "Tax Regime", "Price (p)", "Target (p)", "Stop Loss (p)", "Expected Return", "Base ML", "Learner Delta", "AI Win Confidence", "Recommended Shares", "RNS"]
             st.dataframe(df_res[[c for c in display_cols if c in df_res.columns]], width="stretch", hide_index=True)
         else:
-            st.warning("🛡️️ **Capital Protection Active:** No equities currently pass all combined volume, trend, sector availability, and ML filters.")
+            st.warning("🛡️ **Capital Protection Active:** No equities currently pass all combined volume, trend, sector availability, and ML filters.")
 
 # ==============================================================================
 # 11. TAB 2: OPTIONS ALPHA
@@ -1661,10 +1677,10 @@ with tab_reasoning:
                 st.write(f"**Entry:** `{c_row['entry_price']:.2f}p` | **Exit/Last:** `{c_row['latest_price']:.2f}p` | **Sector:** `{get_ticker_sector(c_row['ticker'])}`")
                 st.code(f"Recorded Feature Vector: {c_row['features_json']}", language="json")
                 if "LOSS" in str(c_row['status']):
-                    st.error("Active Rule Applied: Future setups on this ticker receive a 30-day exponential time-decayed penalty (-15% initial), and ATR feeds the 75th-percentile volatility floor.")
+                    st.error("Active Rule Applied: Future setups on this ticker receive a 30-day exponential time-decayed penalty (-15% initial from exit date), and ATR feeds the 75th-percentile volatility floor.")
                 elif "BREAK-EVEN" in str(c_row['status']):
                     st.info("Active Rule Applied: Capital & UK Stamp Duty preserved via 65% Break-Even Stop Ratchet. Neutral memory weight (0% penalty).")
                 else:
-                    st.success("Active Rule Applied: Future setups on this ticker receive a 30-day exponential time-decayed boost (+5% initial).")
+                    st.success("Active Rule Applied: Future setups on this ticker receive a 30-day exponential time-decayed boost (+5% initial from exit date).")
     else:
         st.success("🏆 **Zero Closed/Stopped-Out Trades in Current Memory.**\n\nAs trades hit their target or stop-loss, their feature vectors are permanently stored in Supabase and used to penalize or boost future scans.")
