@@ -11,7 +11,7 @@ import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 import random
 import requests
 
@@ -990,10 +990,13 @@ def audit_and_reconcile_all_trades():
             except Exception:
                 continue
 
-    # ---------------- Options (SIMULATED) ----------------
+    # ---------------- Options (real quotes for new ones; old practice rows keep their formula) ----------------
     if not active_opts.empty:
         for _, opt in active_opts.iterrows():
             try:
+                if is_real_option(opt["option_contract"]):
+                    audit_real_option(opt, now_str, today_date)
+                    continue
                 share = str(opt['share_name'])
                 h = fetch_cached_history(f"{share}.L", period="15d")
                 if h.empty:
@@ -1292,12 +1295,120 @@ def check_and_auto_retrain_model(feature_cols: list, closed_df: pd.DataFrame):
         record_db_error("Retrain ML", e)
 
 # ==============================================================================
-# 6. OPTIONS ENGINE (SIMULATED — BLUE-CHIP SELECTION UNDER £500 CAP)
+# 6. OPTIONS ENGINE (REAL US-LISTED OPTION QUOTES ON UK COMPANIES — PAPER TRADED)
 # ==============================================================================
+# Several UK companies also trade in New York (as ADRs) and those have real, liquid options. Quotes come from Yahoo
+# (~15 min delayed, US dollars, 100 shares per contract). Nothing is bought for real — trades are tracked with pretend money.
+US_OPTION_UNDERLYINGS = {"SHEL": "Shell", "BP": "BP", "HSBC": "HSBC", "AZN": "AstraZeneca", "GSK": "GSK",
+                         "RIO": "Rio Tinto", "BCS": "Barclays", "BTI": "British American Tobacco", "UL": "Unilever", "VOD": "Vodafone"}
+ADR_TO_LSE = {"SHEL": "SHEL.L", "BP": "BP.L", "HSBC": "HSBA.L", "AZN": "AZN.L", "GSK": "GSK.L",
+              "RIO": "RIO.L", "BCS": "BARC.L", "BTI": "BATS.L", "UL": "ULVR.L", "VOD": "VOD.L"}
+OPTION_MULTIPLIER = 100             # one US option contract = 100 shares
+OPTION_BUDGET_GBP = 500.0
+OPTION_MIN_DAYS = 14
+OPTION_MAX_DAYS = 45
+OPTION_MIN_OPEN_INTEREST = 50       # must be genuinely traded
+OPTION_MAX_SPREAD_PCT = 15.0        # buy/sell gap must be tight
+
+def is_real_option(contract) -> bool:
+    return "$" in str(contract)
+
+def us_options_open() -> bool:
+    ny = london_now().astimezone(pytz.timezone('America/New_York'))
+    return ny.weekday() <= 4 and dtime(9, 35) <= ny.time() <= dtime(15, 55)
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_gbpusd() -> float:
+    try:
+        h = yf.Ticker("GBPUSD=X").history(period="5d", timeout=5)
+        v = float(h["Close"].iloc[-1])
+        if 0.8 < v < 2.0:
+            return v
+    except Exception:
+        pass
+    return 1.30
+
+def _quote_from_row(r):
+    """Valid real quote (bid & ask both live) or None."""
+    try:
+        bid = float(r.get("bid", 0) or 0)
+        ask = float(r.get("ask", 0) or 0)
+    except Exception:
+        return None
+    if not (math.isfinite(bid) and math.isfinite(ask) and bid > 0 and ask > 0 and ask >= bid):
+        return None
+    try:
+        oi = float(r.get("openInterest", 0) or 0)
+        oi = oi if math.isfinite(oi) else 0.0
+    except Exception:
+        oi = 0.0
+    try:
+        iv = float(r.get("impliedVolatility", 0) or 0)
+        iv = iv if math.isfinite(iv) else 0.0
+    except Exception:
+        iv = 0.0
+    return {"bid": bid, "ask": ask, "oi": oi, "iv": iv * 100.0, "spread_pct": (ask - bid) / ((ask + bid) / 2.0) * 100.0}
+
+def get_option_quote(sym: str, expiry_str: str, strike: float):
+    try:
+        ch = yf.Ticker(sym).option_chain(expiry_str).calls
+        row = ch[(ch["strike"] - float(strike)).abs() < 1e-6]
+        if row.empty:
+            return None
+        return _quote_from_row(row.iloc[0])
+    except Exception:
+        return None
+
+def find_real_option_idea(sym: str, gbpusd: float):
+    """One candidate per underlying: ~2% out-of-the-money call, ~4 weeks out, only if the REAL quote is good enough."""
+    try:
+        h = _download_history_raw(sym, "30d")
+        if h.empty or len(h) < 15:
+            return None
+        spot = float(h["Close"].iloc[-1])
+        ret_5d = spot / float(h["Close"].iloc[-5]) - 1.0
+        tk = yf.Ticker(sym)
+        today = london_now().date()
+        best_exp, best_gap = None, 999
+        for e in list(tk.options or []):
+            d = _to_date(e)
+            if d is None:
+                continue
+            days = (d - today).days
+            if OPTION_MIN_DAYS <= days <= OPTION_MAX_DAYS and abs(days - 28) < best_gap:
+                best_exp, best_gap = e, abs(days - 28)
+        if best_exp is None:
+            return None
+        calls = tk.option_chain(best_exp).calls
+        calls = calls[calls["strike"] >= spot * 1.02].sort_values("strike")
+        if calls.empty:
+            return None
+        r = calls.iloc[0]
+        q = _quote_from_row(r)
+        if q is None or q["oi"] < OPTION_MIN_OPEN_INTEREST or q["spread_pct"] > OPTION_MAX_SPREAD_PCT:
+            return None
+        cost_gbp = q["ask"] * OPTION_MULTIPLIER / gbpusd
+        if cost_gbp > OPTION_BUDGET_GBP:
+            return None
+        return {"sym": sym, "spot": spot, "ret_5d": ret_5d, "strike": float(r["strike"]), "expiry": str(best_exp),
+                "bid": q["bid"], "ask": q["ask"], "iv": q["iv"], "oi": q["oi"], "cost_gbp": round(cost_gbp, 2)}
+    except Exception:
+        return None
+
+@st.cache_data(ttl=600, show_spinner=False)
+def scan_real_option_ideas(gbpusd_key: float, day_key: str, skip: tuple) -> list:
+    syms = [s for s in US_OPTION_UNDERLYINGS if s not in skip]
+    if not syms:
+        return []
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        res = list(ex.map(lambda s: find_real_option_idea(s, gbpusd_key), syms))
+    return [r for r in res if r]
+
 def generate_daily_options_alpha() -> dict:
     now_lon = london_now()
     today_str = now_lon.strftime('%Y-%m-%d')
     now_str = now_lon.strftime('%Y-%m-%d %H:%M:%S')
+    st.session_state["opt_note"] = ""
 
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=True)
@@ -1305,53 +1416,37 @@ def generate_daily_options_alpha() -> dict:
             df = con.execute("SELECT * FROM daily_options_journal WHERE date_key = ?", [today_str]).df()
             if not df.empty:
                 return df.iloc[0].to_dict()
-            active_underlyings = set(con.execute("SELECT DISTINCT share_name FROM daily_options_journal WHERE status = 'ACTIVE'").df()["share_name"].tolist())
+            active_underlyings = set(con.execute(
+                "SELECT DISTINCT share_name FROM daily_options_journal WHERE status = 'ACTIVE' AND option_contract LIKE '%$%'").df()["share_name"].tolist())
         except Exception:
             active_underlyings = set()
         finally:
             con.close()
 
-    candidates = ["BARC", "BP", "HSBA", "GLEN", "SHEL"]
-    best_sig = None
-    best_score = -999.0
-
-    for sym in candidates:
-        if sym in active_underlyings:        # avoid stacking correlated calls on the same underlying
-            continue
-        try:
-            h = fetch_cached_history(f"{sym}.L", period="30d")
-            if h.empty or len(h) < 15:
-                continue
-            spot = float(h["Close"].iloc[-1])
-            ret_5d = float((spot - h["Close"].iloc[-5]) / h["Close"].iloc[-5])
-            returns = np.log(h["Close"] / h["Close"].shift(1)).dropna()
-            sigma = max(0.15, min(0.45, float(returns.std() * np.sqrt(252))))   # 30d REALISED vol
-
-            days_to_expiry = 21
-            lot_size = LOT_SIZES.get(sym, 1000)
-            strike = round(spot * 1.02)
-            q = OPTION_DIV_YIELD.get(sym, 0.03)
-            entry_prem = option_ask_price(spot, strike, days_to_expiry, sigma, q)
-            total_cap = round((entry_prem * lot_size) / 100.0, 2)
-
-            if total_cap <= 500.0 and ret_5d > best_score:
-                best_score = ret_5d
-                score = round(min(92.0, max(68.0, 78.0 + (ret_5d * 150.0))), 1)   # heuristic momentum score, NOT a probability
-                best_sig = {
-                    "date_key": today_str, "timestamp": now_str, "share_name": sym,
-                    "option_contract": f"{sym} {int(strike)}p Call", "strike_price": float(strike),
-                    "expiry_days": days_to_expiry, "underlying_spot": float(spot), "lot_size": lot_size,
-                    "entry_premium": float(entry_prem), "current_option_price": option_bid_price(spot, strike, days_to_expiry, sigma, q),
-                    "target_premium": round(entry_prem * 1.60, 2), "stop_loss_premium": round(entry_prem * 0.50, 2),
-                    "total_capital": float(total_cap), "ai_confidence": score, "implied_vol": round(sigma * 100, 1),
-                    "status": "ACTIVE", "pnl_pct": 0.0, "last_audited": now_str
-                }
-        except Exception:
-            continue
-
-    if best_sig is None:
+    if not us_options_open():
+        st.session_state["opt_note"] = "The US options market is closed right now. Real quotes are available roughly 14:30–21:00 UK time, Monday to Friday — the idea of the day appears then."
         return {}
-    best_sig["pnl_pct"] = round(((best_sig["current_option_price"] - best_sig["entry_premium"]) / best_sig["entry_premium"]) * 100.0, 2)
+
+    ideas = scan_real_option_ideas(round(get_gbpusd(), 3), today_str, tuple(sorted(active_underlyings)))
+    if not ideas:
+        st.session_state["opt_note"] = ("No option passed the quality checks right now (a live quote, enough real trading, a tight buy/sell gap and a cost under £"
+                                        f"{OPTION_BUDGET_GBP:.0f}). That's normal — it will try again when the page refreshes.")
+        return {}
+
+    best = max(ideas, key=lambda i: i["ret_5d"])
+    exp_d = _to_date(best["expiry"])
+    days_to_expiry = max(1, (exp_d - now_lon.date()).days)
+    ask, bid = float(best["ask"]), float(best["bid"])
+    score = round(min(92.0, max(68.0, 78.0 + best["ret_5d"] * 150.0)), 1)      # trend-strength score, NOT a probability
+    sig = {
+        "date_key": today_str, "timestamp": now_str, "share_name": best["sym"],
+        "option_contract": f"{best['sym']} ${best['strike']:g} Call · exp {exp_d.strftime('%d %b %Y')}",
+        "strike_price": float(best["strike"]), "expiry_days": int(days_to_expiry), "underlying_spot": float(best["spot"]),
+        "lot_size": OPTION_MULTIPLIER, "entry_premium": ask, "current_option_price": bid,
+        "target_premium": round(ask * 1.60, 2), "stop_loss_premium": round(ask * 0.50, 2),
+        "total_capital": float(best["cost_gbp"]), "ai_confidence": score, "implied_vol": round(float(best["iv"]), 1),
+        "status": "ACTIVE", "pnl_pct": round((bid - ask) / ask * 100.0, 2), "last_audited": now_str
+    }
 
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=False)
@@ -1359,7 +1454,7 @@ def generate_daily_options_alpha() -> dict:
             con.execute("""
                 INSERT OR REPLACE INTO daily_options_journal 
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)
-            """, [best_sig[k] for k in ["date_key", "timestamp", "share_name", "option_contract", "strike_price", "expiry_days", "underlying_spot", "lot_size", "entry_premium", "current_option_price", "target_premium", "stop_loss_premium", "total_capital", "ai_confidence", "implied_vol", "pnl_pct", "last_audited"]])
+            """, [sig[k] for k in ["date_key", "timestamp", "share_name", "option_contract", "strike_price", "expiry_days", "underlying_spot", "lot_size", "entry_premium", "current_option_price", "target_premium", "stop_loss_premium", "total_capital", "ai_confidence", "implied_vol", "pnl_pct", "last_audited"]])
         finally:
             con.close()
 
@@ -1367,11 +1462,62 @@ def generate_daily_options_alpha() -> dict:
         try:
             c_check = supabase.table("options_journal").select("date_key").eq("date_key", today_str).execute()
             if not c_check.data:
-                supabase.table("options_journal").insert(best_sig).execute()
+                supabase.table("options_journal").insert(sig).execute()
         except Exception as e:
             record_db_error("Insert Option", e)
 
-    return best_sig
+    return sig
+
+def audit_real_option(opt, now_str: str, today_date):
+    """Re-quote a real option contract. Checks happen when the app updates during US market hours, so intraday
+    spikes between updates can be missed. If no live quote is available the last known price is kept."""
+    share = str(opt["share_name"])
+    strike = float(opt["strike_price"])
+    entry_prem = float(opt["entry_premium"])
+    target_prem = float(opt["target_premium"])
+    stop_prem = float(opt["stop_loss_premium"])
+    opt_dt = _to_date(opt["date_key"]) or today_date
+    expiry_dt = opt_dt + timedelta(days=int(opt["expiry_days"]))
+    last_price = float(opt["current_option_price"])
+    elapsed = max(0, (today_date - opt_dt).days)
+
+    bid = None
+    if us_options_open():
+        q = get_option_quote(share, expiry_dt.strftime("%Y-%m-%d"), strike)
+        if q:
+            bid = q["bid"]
+    live = bid if bid is not None else last_price
+
+    status = "ACTIVE"
+    if bid is not None:
+        if bid >= target_prem:
+            status = "🎯 WIN (TARGET HIT)"
+        elif bid <= stop_prem:
+            status = "🛑 LOSS (STOPPED OUT)"
+    if status == "ACTIVE" and today_date >= expiry_dt:
+        status = "⏱️ EXPIRED (TIME EXIT)"
+        try:
+            hh = _download_history_raw(share, "5d")
+            if not hh.empty:
+                live = max(0.0, float(hh["Close"].iloc[-1]) - strike)     # value at expiry = intrinsic value
+        except Exception:
+            pass
+    elif status == "ACTIVE" and elapsed >= MAX_HOLD_CALENDAR_DAYS:
+        status = "⏱️ EXPIRED (TIME EXIT)"
+
+    pnl_pct = round(((live - entry_prem) / entry_prem) * 100.0, 2) if entry_prem > 0 else 0.0
+    with DB_LOCK:
+        con = duckdb.connect(DB_PATH, read_only=False)
+        try:
+            con.execute("""
+                UPDATE daily_options_journal
+                SET current_option_price = ?, pnl_pct = ?, status = ?, last_audited = ?
+                WHERE date_key = ?
+            """, [live, pnl_pct, status, now_str, opt["date_key"]])
+        finally:
+            con.close()
+    cloud_update("options_journal", {"date_key": opt["date_key"]},
+                 {"status": status, "current_option_price": live, "pnl_pct": pnl_pct, "last_audited": now_str}, "Audit Option Sync")
 
 # ==============================================================================
 # 7. LOGGING, DAILY QUOTA, SECTOR & PORTFOLIO-RISK GUARDRAILS
@@ -2139,26 +2285,6 @@ def chart_rolling(perf_df: pd.DataFrame, window: int = 10):
     fig.update_layout(height=300, margin=dict(l=10, r=10, t=30, b=10), yaxis=dict(range=[0, 100], title="% won"), xaxis_title="Finished trade number", showlegend=False)
     show_fig(fig)
 
-def chart_position(ticker: str, entry: float, target: float, stop: float):
-    """Simple price line (last 3 months) with three labelled lines: Bought at / Goal / Safety exit."""
-    h = fetch_cached_history(ticker, period="3mo")
-    if h.empty:
-        st.info("No price history available right now.")
-        return
-    xs = [str(d) for d in _bar_dates(h)]
-    close = [float(v) for v in h["Close"]]
-    if not PLOTLY_OK:
-        st.line_chart(pd.DataFrame({"Price": close, "Goal": target, "Bought at": entry, "Safety exit": stop}, index=xs))
-        return
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=xs, y=close, mode="lines", name="Share price", line=dict(color="#6366f1", width=3),
-                             hovertemplate="%{x}<br>%{y:.2f}p<extra></extra>"))
-    fig.add_trace(go.Scatter(x=[xs[0], xs[-1]], y=[stop, target], mode="markers", marker=dict(opacity=0), showlegend=False, hoverinfo="skip"))
-    for label, val, col in [("🎯 Goal", target, "#16a34a"), ("Bought at", entry, "#64748b"), ("🛑 Safety exit", stop, "#dc2626")]:
-        fig.add_hline(y=val, line_dash="dash", line_color=col, annotation_text=f"{label} {val:.2f}p", annotation_position="top left")
-    fig.update_layout(height=380, margin=dict(l=10, r=10, t=20, b=10), showlegend=False, hovermode="x unified", yaxis_title="Price (pence)")
-    show_fig(fig)
-
 def style_ledger(df: pd.DataFrame):
     """Colourised, sortable table; falls back to the plain table if styling is unavailable."""
     try:
@@ -2284,11 +2410,10 @@ market_is_open = is_lse_market_open()
 st.sidebar.header("⚙️ Settings")
 st.sidebar.number_input("Broker fee per trade (£)", min_value=0.0, max_value=25.0, value=DEFAULT_COMMISSION_GBP, step=0.5, key="commission_gbp",
                         help="Charged when you buy and again when you sell. Included in every profit/loss number you see.")
-broker_mode = st.sidebar.selectbox("Trading mode", ["Paper Trading (Simulated)", "Interactive Brokers", "IG Group API"],
-                                   help="Paper trading uses pretend money. Nothing is bought for real.")
+broker_mode = "paper trade"      # everything here is pretend money
 auto_mode = st.sidebar.toggle("Auto-refresh", value=market_is_open, help="Keeps checking your trades while the market is open.")
 refresh_interval_sec = st.sidebar.selectbox("Check every", [300, 600, 3600], format_func=lambda x: f"{x//60} minutes")
-show_sim_options = st.sidebar.toggle("Show practice options in My Trades", value=True)
+show_sim_options = st.sidebar.toggle("Show option paper trades in My Trades", value=True)
 
 with st.sidebar.expander("🛡️ Built-in safety rules"):
     st.markdown(
@@ -2378,7 +2503,7 @@ tab_home, tab_scanner, tab_journal, tab_learn, tab_options = st.tabs([
     "🎯 Today's Picks",
     "📖 My Trades",
     "🧠 What the AI Learned",
-    "🎲 Options (Practice)"
+    "🎲 Options"
 ])
 
 # ==============================================================================
@@ -2492,34 +2617,49 @@ with tab_scanner:
 # 13. OPTIONS (PRACTICE)
 # ==============================================================================
 with tab_options:
-    sec_title("🎲", "Options idea of the day", "practice only")
-    st.caption("⚠️ These are pretend prices worked out with a maths formula (including a typical buy/sell gap). They are not real market prices "
-               "and are **not** counted in your main results. Real UK options on single shares are thin, so real results would differ.")
+    sec_title("🎲", "Options idea of the day", "real quotes · paper trading")
+    st.caption("Real prices from US-listed options on UK companies (about 15 minutes delayed, in US dollars). Nothing is bought for real — it is tracked with "
+               "pretend money, and it is **not** counted in your main share results.")
     opt_signal = generate_daily_options_alpha()
     if opt_signal:
+        real_opt = is_real_option(opt_signal["option_contract"])
         with st.container(border=True):
             o1, o2, o3 = st.columns(3)
-            with o1:
-                st.metric("Idea", opt_signal["option_contract"], help="A 'Call' option gains value if the share price goes up.")
-                st.markdown(f"Share price when picked: **{opt_signal['underlying_spot']:.2f}p**")
-            with o2:
-                st.metric("Value now", f"{opt_signal['current_option_price']:.2f}p", f"{opt_signal['pnl_pct']:+.2f}% vs cost ({opt_signal['entry_premium']:.2f}p)")
-                st.markdown(f"Recent share wobble: **{opt_signal['implied_vol']}%** a year")
-            with o3:
-                st.metric("Trend strength", f"{opt_signal['ai_confidence']}", help="Based on the share's last 5 days. It is NOT a chance of winning.")
-                st.markdown(f"Cost: **£{opt_signal['total_capital']:,.2f}** ({int(opt_signal['lot_size'])} units)")
-            m1, m2, m3 = st.columns(3)
-            m1.info(f"🎯 Goal: {opt_signal['target_premium']:.2f}p (+60%)")
-            m2.warning(f"🛑 Safety exit: {opt_signal['stop_loss_premium']:.2f}p (-50%)")
-            m3.success(f"Status: **{friendly_status(opt_signal['status'])}**")
+            if real_opt:
+                with o1:
+                    st.metric("Idea", opt_signal["option_contract"], help="A 'Call' option gains value if the share price goes up. Strike = the price it needs to beat.")
+                    st.markdown(f"Share price when picked: **${opt_signal['underlying_spot']:.2f}**")
+                with o2:
+                    st.metric("Sell price now", f"${opt_signal['current_option_price']:.2f}", f"{opt_signal['pnl_pct']:+.2f}% vs cost (${opt_signal['entry_premium']:.2f})",
+                              help="What you could sell it for right now (the 'bid'). You buy at the higher 'ask' price, so a new trade starts slightly down.")
+                    st.markdown(f"Market's expected wobble: **{opt_signal['implied_vol']}%** a year")
+                with o3:
+                    st.metric("Cost to buy", f"£{opt_signal['total_capital']:,.0f}", f"${opt_signal['entry_premium'] * int(opt_signal['lot_size']):,.0f} for {int(opt_signal['lot_size'])} shares' worth", delta_color="off")
+                    st.markdown(f"Trend strength: **{opt_signal['ai_confidence']}** (not a chance of winning)")
+                m1, m2, m3 = st.columns(3)
+                m1.info(f"🎯 Goal: ${opt_signal['target_premium']:.2f} (+60%)")
+                m2.warning(f"🛑 Safety exit: ${opt_signal['stop_loss_premium']:.2f} (-50%)")
+                m3.success(f"Status: **{friendly_status(opt_signal['status'])}**")
+                st.caption(f"Last checked {str(opt_signal['last_audited'])[:16]} · prices are only refreshed while the US market is open.")
+            else:
+                st.warning("This is an older pretend-price option from before real quotes were added. It will finish normally.")
+                with o1:
+                    st.metric("Idea", opt_signal["option_contract"])
+                with o2:
+                    st.metric("Value now", f"{opt_signal['current_option_price']:.2f}p", f"{opt_signal['pnl_pct']:+.2f}% vs cost ({opt_signal['entry_premium']:.2f}p)")
+                with o3:
+                    st.metric("Cost", f"£{opt_signal['total_capital']:,.2f}")
+                st.info(f"Status: **{friendly_status(opt_signal['status'])}**")
     else:
-        st.info("No practice option fits today (budget limit, or each candidate share already has one open).")
-    with st.expander("How the practice options work"):
+        st.info(st.session_state.get("opt_note") or "No option idea today.")
+    with st.expander("How the options idea works"):
         st.markdown(
-            f"- Prices come from a standard maths formula (Black-Scholes) using recent share wobble and typical dividends, with a ±{OPTION_HALF_SPREAD_PCT:.0f}% buy/sell gap.\n"
-            "- The strike is 2% above the current share price. Only one practice option per share is open at a time.\n"
-            "- Goal is +60% and safety exit is -50%. If both could have happened on the same day, the safety exit is assumed to come first.\n"
-            "- These are **not real quotes**, so don't treat them as proof of anything.")
+            "- Shell, BP, HSBC, AstraZeneca, GSK, Rio Tinto, Barclays, BAT, Unilever and Vodafone also trade in New York, where their options are real and well traded.\n"
+            "- The idea is a **call option** about 2% above the share price, expiring in roughly 4 weeks. It's only offered if the live quote is genuine: enough real trading, a tight buy/sell gap, and a cost under £500.\n"
+            "- You \"buy\" at the asking price and are valued at the selling price, so every trade starts slightly down — that's the real cost of trading.\n"
+            "- Goal is +60% and safety exit is -50%. They're checked each time the page updates while the US market is open (about 14:30–21:00 UK time), so quick spikes in between can be missed.\n"
+            "- After 7 days it closes anyway.\n"
+            "- ⚠️ Many UK brokers don't let UK retail investors trade US-listed options. Check yours before ever thinking about real money.")
 
 # ==============================================================================
 # DATA LOAD (after scanner/options so anything just bought is included)
@@ -2644,16 +2784,16 @@ with tab_home:
                 tbl = sg.rename(columns={"n": "Trades", "avg": "Average %", "win_rate": "Win rate %"})[["Sector", "Trades", "Average %", "Win rate %"]].round(1)
                 st.markdown("**Results by sector**")
                 st.dataframe(tbl.sort_values("Average %", ascending=False), width="stretch", hide_index=True)
-        with st.expander("🧪 Practice options (pretend prices — not counted above)"):
+        with st.expander("🎲 Options paper trades (separate from the results above)"):
             perf_opt = compute_performance(perf_opt_df)
             if perf_opt["n"] == 0:
-                st.write("No finished practice options yet.")
+                st.write("No finished option trades yet.")
             else:
                 o1, o2, o3 = st.columns(3)
                 o1.metric("Finished", perf_opt["n"])
                 o2.metric("Win rate", f"{perf_opt['target_hit_rate']:.0f}%")
                 o3.metric("Total profit/loss", f"£{perf_opt['net_gbp']:+,.2f}")
-                chart_cumulative_pnl(perf_opt_df, "Practice options — running profit/loss (£)")
+                chart_cumulative_pnl(perf_opt_df, "Options paper trades — running profit/loss (£)")
 
 # ==============================================================================
 # 15. MY TRADES
@@ -2662,7 +2802,7 @@ with tab_journal:
     sec_title("📖", "My Trades")
     j1, j2 = st.columns([4, 1])
     with j1:
-        st.caption("All profit/loss figures are after fees and UK stamp duty. Share prices from Yahoo can be about 15 minutes behind.")
+        st.caption("Share profit/loss figures are after fees and UK stamp duty. Share prices are in pence; option prices are in US dollars. Prices from Yahoo can be about 15 minutes behind.")
     with j2:
         if st.button("🔄 Update now", width="stretch"):
             audit_and_reconcile_all_trades()
@@ -2688,19 +2828,6 @@ with tab_journal:
         with st.expander("📊 Open trades by sector", expanded=False):
             chart_sector_exposure(sec_exp)
 
-    if not active_eq.empty:
-        sec_title("🔬", "Look closer at an open trade")
-        sel = st.selectbox("Pick a trade", list(active_eq["ticker"]), key="inspect_ticker")
-        r = active_eq[active_eq["ticker"] == sel].iloc[0]
-        ic1, ic2, ic3, ic4 = st.columns(4)
-        ic1.metric("Bought at", f"{r['entry_price']:.2f}p")
-        ic2.metric("Price now", f"{r['latest_price']:.2f}p", f"{r['pnl_pct']:+.2f}% after costs")
-        ic3.metric("Goal", f"{r['target_price']:.2f}p")
-        locked = is_stop_breakeven_protected(float(r["entry_price"]), float(r["stop_loss"]))
-        ic4.metric("Safety exit", f"{r['stop_loss']:.2f}p", "🛡️ moved up — can't lose" if locked else "original level", delta_color="off")
-        st.caption("The purple line is the share price over the last 3 months. Green dashed = your goal. Red dashed = your safety exit.")
-        chart_position(sel, float(r["entry_price"]), float(r["target_price"]), float(r["stop_loss"]))
-
     master_list = []
     if not df_eq.empty:
         d = df_eq.copy()
@@ -2713,8 +2840,8 @@ with tab_journal:
                                              "last_audited": "Last checked"}))
     if show_sim_options and not df_opt.empty:
         d = df_opt.copy()
-        d["Type"] = "Option (practice)"
-        d["Sector"] = d["share_name"].apply(lambda s: get_ticker_sector(f"{s}.L", resolve=False))
+        d["Type"] = d["option_contract"].apply(lambda c: "Option (real quote, $)" if is_real_option(c) else "Option (old practice)")
+        d["Sector"] = d["share_name"].apply(lambda s: get_ticker_sector(ADR_TO_LSE.get(str(s), f"{s}.L"), resolve=False))
         d["_o"] = d["status"].apply(classify_outcome)
         d["Result"] = d["status"].apply(friendly_status)
         master_list.append(d.rename(columns={"date_key": "Date", "option_contract": "Stock", "entry_premium": "Bought at (p)",
