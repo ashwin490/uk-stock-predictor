@@ -90,6 +90,36 @@ RETRAIN_STEP_INTERVAL = 50          # then only after N additional labelled trad
 MIN_CALIBRATION_SAMPLES = 80        # samples required to switch from shrinkage to isotonic calibration
 CONF_SHRINK = 0.5                   # shrink raw model probability toward the realised base rate
 
+# ---- Whole-market scan (every FTSE 350 share + liquid AIM shares) ----
+SCAN_WORKERS = 10                   # parallel price downloads
+SCAN_TIME_BUDGET_SEC = 240          # stop downloading after this long; the rest is checked next time
+SWEEP_TTL_SEC = 900                 # re-download a tradable share's prices at most every 15 min
+QUIET_TTL_SEC = 21600               # thinly traded shares are re-checked every 6 hours
+FRESH_PRICE_TTL_SEC = 60            # finalists get a fresh price (≤1 min old) before any buy
+FRESH_PRICE_MAX_AGE_SEC = 180       # ...and are skipped if that fresh download failed (never buy on an old price)
+MAX_DEEP_CHECKS = 30                # finalists that get the full news / memory / market check
+DEEP_CHECK_MARGIN = 12              # finalists must be within this many points of the confidence bar
+MAX_ATR_PCT = 8.0                   # skip shares that swing more than this % on a normal day
+PULSE_REFRESH_SEC = 1800            # after today's picks are used up, still refresh the market pulse every 30 min
+MIN_EV_PCT = 0.0                    # a pick's expected value after ALL costs must be above this (in %)
+
+# ---- Evidence learner: learns which market conditions really win, from YOUR finished trades ----
+EVIDENCE_MIN_DECIDED = 40           # clear win/loss trades needed before it changes any score
+EVIDENCE_MIN_BUCKET = 6             # trades needed in a group before that group counts
+EVIDENCE_PRIOR_TRADES = 10          # shrinks small groups toward the overall win rate
+EVIDENCE_HALF_LIFE_DAYS = 90        # older trades count less (markets change)
+EVIDENCE_POINTS_PER_PCT = 0.6       # 10 percentage points better win rate -> +6 confidence points
+EVIDENCE_FACTOR_CAP = 5             # max points any one factor can add or take away
+EVIDENCE_TOTAL_CAP = 10             # max points all factors together can add or take away
+EVIDENCE_BACKFILL_PER_RUN = 40      # past trades whose context is rebuilt from price history per check
+
+# ---- Options learner (separate from the share AI; it only ever changes the options idea) ----
+OPT_LEARN_MIN_TRADES = 10
+OPT_LEARN_WINDOW_DAYS = 60
+OPT_REST_THRESHOLD = 0.75
+OPT_BASE_TREND_BAR = 68.0           # the options idea's normal minimum trend strength
+OPT_MAX_TREND_BAR = 88.0
+
 # Strict LSE Ticker Regex (Integrity Gate against untrusted web scraping)
 VALID_LSE_TICKER_RE = re.compile(r"^[A-Z0-9]{1,6}(-[A-Z0-9]{1,2})?\.L$")
 
@@ -151,6 +181,393 @@ YF_SECTOR_BUCKETS = {
     "Technology": "Technology", "Industrials": "Industrials", "Real Estate": "Real Estate",
 }
 
+FTSE100_BUILTIN = """III|Financial services
+ABDN|Financial Services
+ADM|Insurance
+AAF|Telecommunications services
+ALW|Investment Trusts
+AAL|Mining
+ANTO|Mining
+ABF|Food & tobacco
+AZN|Pharmaceuticals & biotechnology
+AUTO|Media
+AV|Life insurance
+BAB|Aerospace & defence
+BA|Aerospace & defence
+BBY|Construction & Materials
+BARC|Banks
+BTRW|Household goods & home construction
+BP|Oil & gas producers
+BATS|Tobacco
+BLND|Real estate
+BT-A|Telecommunications services
+BNZL|Support services
+BRBY|Personal goods
+CNA|Multiline utilities
+CCEP|Beverages
+CCH|Beverages
+CPG|Support services
+CCC|Software & Computer Services
+CTEC|Health care equipment & supplies
+CRDA|Chemicals
+DCC|Support services
+DGE|Beverages
+DPLM|Industrial Support services
+EZJ|Travel and Leisure
+EDV|Mining
+EXPN|Support services
+FCIT|Collective investments
+FRES|Mining
+GAW|Leisure Goods
+GLEN|Mining
+GSK|Pharmaceuticals & biotechnology
+HLN|Pharmaceuticals & biotechnology
+HLMA|Electronic equipment & parts
+HSX|Non-life Insurance
+HWDN|Homebuilding & construction supplies
+HSBA|Banks
+ICG|Financial services
+IGG|Financial services
+IHG|Travel & leisure
+IMI|Industrial engineering
+IMB|Tobacco
+INF|Media
+IAG|Travel & leisure
+ITRK|Support services
+INVP|Financial Services
+ITH|Oil & Gas Producers
+JD|General retailers
+BGEO|Banking Services
+KGF|Retailers
+LAND|Real estate investment trusts
+LGEN|Life insurance
+LLOY|Banks
+LMP|Real Estate Investment Trusts
+LSEG|Financial services
+MNG|Financial services
+MKS|Food & drug retailing
+MRO|Aerospace & defence
+MTLN|Multiline utilities
+NG|Multiline utilities
+NWG|Banks
+NXT|General retailers
+PSON|Media
+PSH|Financial services
+PCT|Investment trusts
+PRU|Life insurance
+RKT|Household goods & home construction
+REL|Media
+RTO|Support services
+RIO|Mining
+RR|Aerospace & defence
+SGE|Software & computer services
+SBRY|Food & drug retailing
+SMT|Collective investments
+SGRO|Real estate investment trusts
+SVT|Multiline utilities
+SHEL|Oil & gas producers
+SMIN|General industrials
+SN|Health care equipment & supplies
+SPX|Industrial engineering
+SSE|Electrical utilities & independent power producers
+STAN|Banks
+SDLF|Life insurance
+STJ|Financial services
+TSCO|Food & drug retailing
+BBOX|Real Estate Investment Trusts
+ULVR|Personal goods
+UU|Multiline utilities
+VOD|Mobile telecommunications
+WEIR|Industrial goods and services
+WTB|Retail hospitality
+WPP|Media"""
+
+FTSE250_BUILTIN = """3IN|Financial Services
+FOUR|Media
+AAS|Investment Trusts
+ASL|Investment Trusts
+AEP|Food Producers
+ALFA|Software and Computer Services
+ATT|Investment Trusts
+AMRQ|Industrial Metals and Mining
+AO|Retail
+APN|Food Producers
+ASHM|Financial Services
+AIE|Investment Trusts
+ASC|Retailers
+ATYM|Industrial Metals and Mining
+ATG|Software and Computer Services
+AGT|Investment Trusts
+AVON|Industrial Goods and Services
+BME|Retailers
+BGFD|Investment Trusts
+USA|Investment Trusts
+BCG|Consumer Digital Services
+BNKR|Investment Trusts
+BAG|Beverages
+AJB|Financial Services
+BWY|Home Construction
+BKG|Household goods & home construction
+BHMG|Hedge Funds
+BYG|Real Estate Investment Trusts
+BPCR|Investment Trusts
+BRGE|Investment Trusts
+BRSC|Investment Trusts
+BRWM|Investment Trusts
+BMY|Media
+BOY|Industrial Engineering
+BREE|Construction & Materials
+BPT|Financial Services
+BUT|Investment Trusts
+BYIT|Software and Computer Services
+CLDN|Investment Trusts
+CGT|Investment Trusts
+CWR|Alternative Energy
+CHG|Aerospace & Defence
+CSN|Life Insurance
+CTY|Investment Trusts
+CKN|Industrial Transportation
+CBG|Financial Services
+CMCX|Financial Services
+COA|Consumer Staples
+CORD|Investment Trusts
+COST|Engineering and Construction
+CWK|Food Producers
+CURY|Retailers
+CVSG|Health Care
+DLN|Real Estate Investment Trusts
+DSCV|Support Services
+DOM|Travel & Leisure
+DRX|Electricity
+DOCS|Retailers
+DNLM|Retailers
+EDIN|Investment Trusts
+EWI|Investment Trusts
+ELM|Chemicals
+ENOG|Oil & Gas Producers
+ENT|Travel & leisure
+ESCT|Investment Trusts
+EWG|Financial Services
+FCSS|Investment Trusts
+FEML|Investment Trusts
+FEV|Investment Trusts
+FSV|Investment Trusts
+FGT|Equity Investments
+FGP|Travel & Leisure
+FGEN|Investment Trusts
+FSG|Investment Banking and Brokerage Services
+FRAS|Retailers
+FCH|Financial Services
+GFRD|Construction
+GAMA|Telecommunications
+GCP|General Financial
+GEN|Construction & Materials
+GNS|Pharmaceuticals & Biotechnology
+DATA|Industrial Goods and Services
+GSCT|Investment Trusts
+GDWN|General Industrials
+GFTU|Support Services
+GRI|Real Estate Investment & Services
+GPE|Real Estate Investment Trusts
+UKW|Gas, Water & Multiutilities
+GNC|Food, Beverage and Tobacco
+GRG|Food & Drug Retailers
+HFD|Retailers
+HMSO|Real Estate Investment Trusts
+HANA|Investment Trusts
+HBR|Oil & Gas Producers
+HVPE|Equity Investments
+HWG|Real Estate
+HAS|Support Services
+HTWS|Telecomms
+HFEL|Investment Trusts
+HSL|Investment Trusts
+HRI|Investment Trusts
+HGT|Investment Trusts
+HICL|Investment Trusts
+HIK|Pharmaceuticals and Biotechnology
+HILS|Industrial Engineering
+HFG|Food Producers
+HOC|Basic Resources
+BOWL|Travel and leisure
+HTG|Oil, Gas and Coal
+ICGT|Investment Trusts
+INCH|Retailers
+IHP|Financial Services
+INPP|Financial Services
+IWG|Support Services
+IAD|Investment Trusts
+IPO|Financial Services
+ITV|Media
+JMAT|Chemicals
+JSG|Industrial Support Services
+JAM|Investment Trusts
+JCH|Investment Trusts
+JEMI|Investment Trusts
+JMGI|Investment Trusts
+JEDT|Investment Trusts
+JEGI|Investment Trusts
+JGGI|Investment Trusts
+JFJ|Investment Trusts
+JUP|Financial Services
+KNOS|Software & Computer Services
+KLR|Construction & Materials
+KIE|Construction & Materials
+LRE|Nonlife Insurance
+LWDB|Investment Trusts
+EMG|Financial Services
+MEGP|Leisure Goods
+MRC|Collective Investments
+MRCH|Investment Trusts
+MNO|Industrial Metals and Mining
+MTRO|Banks
+PAGE|Support Services
+MAB|Travel & Leisure
+MTO|Support Services
+GROW|Financial Services
+MNDI|Containers & packaging
+MNKS|Investment Trusts
+MONY|Media
+MOON|Retailers
+MGAM|Electronic & Electrical Equipment
+MGNS|Construction & Materials
+MUT|Investment Trusts
+MYI|Investment Trusts
+NCC|Software and Computer Services
+NBPE|Collective Investments
+N91|Financial Services
+NAIT|Investment Trusts
+NAS|Investment Trusts
+OCI|Investment Trusts
+OCDO|Food & drug retailers
+OSB|Banks
+OXB|Pharmaceuticals and Biotechnology
+OXIG|Electronic & Electrical Equipment
+ONT|Health Care
+PHI|Investment Trusts
+PAF|Precious Metals and Mining
+PINT|Investment Trusts
+PIN|Equity Investments
+PAG|Financial Services
+PEY|Investment Trusts
+PPET|Investment Trusts
+PNN|Gas, Water & Multiutilities
+PSN|Household goods & home construction
+PNL|Investment Trusts
+PETS|Retailers
+PTEC|Software & Computer Services
+PLUS|Financial Services
+PCGH|Investment Trusts
+POLN|Financial Services
+PPH|Travel and Leisure
+PFD|Food Producers
+PHP|Real Estate Investment Trusts
+PRN|Food Producers
+QQ|Aerospace & Defence
+QLT|Financial Services
+RNK|Travel and Leisure
+RPI|Technology
+RAT|Financial Services
+RSW|Electronic & Electrical Equipment
+RHIM|Support Services
+RMV|Media
+RCP|Investment Trusts
+ROSE|Industrial Goods and Services
+ROR|Industrial Engineering
+RS1|Industrials
+RTW|Investment Trusts
+RICA|Investment Trusts
+SAFE|Real Estate Investment Trusts
+SAGA|Travel and Leisure
+SVS|Real Estate Investment & Services
+MNTN|Investment Trusts
+ATR|Investment Trusts
+SDP|Investment Trusts
+SOI|Investment Trusts
+SAIN|Investment Trusts
+SEIT|Investment Trusts
+SEQI|Investment Trusts
+SSIT|Investment Trusts
+SRP|Support Services
+SHC|Real Estate Investment Trusts
+SHAW|Banks
+SRE|Real Estate
+SCT|Software & Computer Services
+SPI|Health Care Equipment & Services
+SSPG|Travel and Leisure
+SUPR|Real Estate Investment Trusts
+SYNC|Pharmaceuticals & Biotechnology
+THRL|Real Estate Investment Trusts
+TATE|Food Producers
+TW|Household goods & home construction
+TBCG|Banks
+TEP|Telecomms
+TMPL|Collective Investments
+TEM|Investment Trusts
+TRIG|Investment Trusts
+THG|Personal Products
+TCAP|Financial Services
+TRN|Industrial Transportation
+TPK|Support Services
+TRY|Investment Trusts
+TRST|Technology
+TFIF|Investment Trusts
+UTG|Real estate investment trusts
+UEM|Investment Trusts
+VSVS|General Industrials
+VCT|Chemicals
+VEIL|Investment Trusts
+VOF|Investment Trusts
+VTY|Home Construction
+VLX|Industrial Goods and Services
+FAN|Construction & Materials
+WOSG|Personal Goods
+JDW|Travel & Leisure
+SMWH|Retailers
+WIX|Retailers
+WIZZ|Travel & Leisure
+WKP|Real Estate Investment Trusts
+WWH|Investment Trusts
+XPP|Industrial Goods and Services
+XPS|Financial Services
+YNGA|Travel and Leisure
+ZIG|Support Services"""
+
+def wiki_sector_to_bucket(raw) -> str:
+    """Turns an FTSE/ICB sector name into one of the app's sector groups."""
+    s = str(raw or "").strip().lower()
+    if not s or s in ("nan", "none"):
+        return "Unclassified"
+    rules = [
+        (("real estate", "reit"), "Real Estate"),
+        (("investment trust", "collective invest", "equity invest", "hedge fund"), "Investment Trusts"),
+        (("utilit", "electricity", "water", "multiutil"), "Telecom & Utilities"),
+        (("telecom",), "Telecom & Utilities"),
+        (("oil", "gas producer", "alternative energy", "energy", "coal"), "Energy"),
+        (("pharma", "health", "biotech"), "Healthcare"),
+        (("aerospace", "defence", "defense"), "Defense & Aero"),
+        (("software", "technology", "electronic", "computer"), "Technology"),
+        (("mining", "metal", "chemical", "container", "basic resource", "forest"), "Basic Materials"),
+        (("bank", "financ", "insurance", "brokerage"), "Financials"),
+        (("retail", "travel", "leisure", "food", "beverage", "tobacco", "personal", "household", "home construction",
+          "homebuilding", "media", "consumer", "hospitality"), "Consumer"),
+        (("industrial", "support service", "engineering", "construction", "transport", "general industrials"), "Industrials"),
+    ]
+    for keys, label in rules:
+        if any(k in s for k in keys):
+            return label
+    return str(raw).strip().title()[:30]
+
+def _parse_builtin(block: str) -> dict:
+    out = {}
+    for line in block.strip().splitlines():
+        if "|" in line:
+            t, sec = line.split("|", 1)
+            out[f"{t.strip().upper()}.L"] = wiki_sector_to_bucket(sec)
+    return out
+
+BUILTIN_UNIVERSE = {**_parse_builtin(FTSE250_BUILTIN), **_parse_builtin(FTSE100_BUILTIN)}
+
 FTSE_EXPORTERS = {"AZN.L", "GSK.L", "SHEL.L", "BP.L", "ULVR.L", "BATS.L", "RIO.L", "GLEN.L", "DGE.L", "REL.L", "CRW.L"}
 
 # Indicative dividend yields used ONLY by the simulated option pricer (assumptions, not live data)
@@ -204,6 +621,8 @@ def _parse_features(f) -> dict:
         return {}
 
 def _to_date(s):
+    if s is None or str(s).strip().lower() in ("", "none", "nan", "nat"):
+        return None
     try:
         return datetime.strptime(str(s)[:10], "%Y-%m-%d").date()
     except Exception:
@@ -219,6 +638,36 @@ def _first_valid(*vals):
         if sv and sv.lower() not in ("nan", "none", "nat"):
             return sv
     return ""
+
+def gbp(x, d=2, sign=False) -> str:
+    """£1,234.50 · -£12.00 · +£3.10 (sign=True). Never '£-12'."""
+    try:
+        v = float(x)
+        if not math.isfinite(v):
+            return "£–"
+    except Exception:
+        return "£–"
+    txt = f"£{abs(v):,.{d}f}"
+    if round(v, d) < 0:
+        return "-" + txt
+    return ("+" + txt) if (sign and round(v, d) > 0) else txt
+
+def _num(x, default=0.0):
+    if x is None or (isinstance(x, str) and not x.strip()):
+        return default
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else default
+    except Exception:
+        return default
+
+def _int(x, default=0):
+    if x is None or (isinstance(x, str) and not x.strip()):
+        return default
+    try:
+        return int(float(x))
+    except Exception:
+        return default
 
 def _bar_dates(h: pd.DataFrame) -> list:
     return [pd.Timestamp(x).date() for x in h.index]
@@ -243,6 +692,12 @@ def classify_outcome(status) -> str:
         return "ACTIVE"
     return "OTHER"
 
+def _norm_status(raw) -> str:
+    """Any spelling of an open trade ('Active', '🟢 ACTIVE', blank) becomes exactly 'ACTIVE'."""
+    if raw is None or str(raw).strip() == "" or str(raw).strip().lower() in ("nan", "none"):
+        return "ACTIVE"
+    return "ACTIVE" if classify_outcome(raw) == "ACTIVE" else str(raw).strip().upper()
+
 def wilson_interval(k: int, n: int, z: float = 1.96) -> tuple:
     if n <= 0:
         return 0.0, 0.0
@@ -257,6 +712,9 @@ def get_ticker_sector(ticker: str, resolve: bool = True) -> str:
     t = str(ticker).strip().upper()
     if t in SECTOR_MAP:
         return SECTOR_MAP[t]
+    known = get_universe_sectors().get(t)
+    if known and known != "Unclassified":
+        return known
     cache = get_sector_cache()
     hit = cache.get(t)
     if hit and (hit[0] != "Unclassified" or (time.time() - hit[1]) < 3600):
@@ -275,10 +733,13 @@ def get_ticker_sector(ticker: str, resolve: bool = True) -> str:
     return sector
 
 def peek_sector(ticker: str):
-    """Sector if already known (static map or cache); None otherwise. Never hits the network."""
+    """Sector if already known (static map, FTSE lists or cache); None otherwise. Never hits the network."""
     t = str(ticker).strip().upper()
     if t in SECTOR_MAP:
         return SECTOR_MAP[t]
+    known = get_universe_sectors().get(t)
+    if known and known != "Unclassified":
+        return known
     hit = get_sector_cache().get(t)
     if hit and hit[0] != "Unclassified":
         return hit[0]
@@ -289,7 +750,7 @@ def get_trade_sector(ticker: str, f_json) -> str:
     if t in SECTOR_MAP:
         return SECTOR_MAP[t]
     f = _parse_features(f_json)
-    if f.get("sector"):
+    if f.get("sector") and str(f["sector"]) != "Unclassified":
         return str(f["sector"])
     return get_ticker_sector(t, resolve=False)
 
@@ -389,20 +850,32 @@ def evaluate_completed_bar(o, hi, lo, c, entry, target, stop, be_floor, be_trigg
         new_stop = be_floor
     return None, c, new_stop
 
+_RNS_BEAR_RE = [(re.compile(r"\b" + re.escape(p) + r"\b"), p, w) for p, w in RNS_BEARISH_LEXICON.items()]
+_RNS_BULL_RE = [(re.compile(r"\b" + re.escape(p) + r"\b"), p, w) for p, w in RNS_BULLISH_LEXICON.items()]
+
 def evaluate_rns_nlp_sentiment(ticker: str) -> dict:
-    raw_rns = fetch_direct_rns_for_ticker(ticker)
+    try:
+        raw_rns = fetch_direct_rns_for_ticker(ticker) or {}
+    except Exception:
+        raw_rns = {}
+    if not isinstance(raw_rns, dict):
+        raw_rns = {}
     headline = str(raw_rns.get("headline", "")).lower()
     status = str(raw_rns.get("status", "📰 Flow Verified"))
-    base_delta = float(raw_rns.get("delta", 0.0))
+    try:
+        base_delta = float(raw_rns.get("delta", 0.0) or 0.0)
+        base_delta = base_delta if math.isfinite(base_delta) else 0.0
+    except Exception:
+        base_delta = 0.0
 
     lex_delta = 0.0
     matched_tags = []
-    for phrase, weight in RNS_BEARISH_LEXICON.items():
-        if phrase in headline:
+    for pat, phrase, weight in _RNS_BEAR_RE:                 # whole words only: "replacing" is not a "placing"
+        if pat.search(headline):
             lex_delta += weight
             matched_tags.append(f"⚠️ {phrase.title()}")
-    for phrase, weight in RNS_BULLISH_LEXICON.items():
-        if phrase in headline:
+    for pat, phrase, weight in _RNS_BULL_RE:
+        if pat.search(headline):
             lex_delta += weight
             matched_tags.append(f"🚀 {phrase.title()}")
 
@@ -418,6 +891,234 @@ def evaluate_rns_nlp_sentiment(ticker: str) -> dict:
         "delta": round(total_delta, 4),
         "nlp_tags": ", ".join(matched_tags) if matched_tags else "Neutral Regulatory Flow"
     }
+
+# ==============================================================================
+# 0b. THE MARKET: WHICH SHARES (FTSE 350 + LIQUID AIM) AND WHICH DAYS (UK BANK HOLIDAYS, HALF DAYS)
+# ==============================================================================
+UNIVERSE_SAVE_PATH = os.path.join(ROOT_DIR, "uk_universe.json")
+FTSE_LIST_PAGES = [("https://en.wikipedia.org/wiki/FTSE_100_Index", 80), ("https://en.wikipedia.org/wiki/FTSE_250_Index", 200)]
+GOV_UK_HOLIDAYS_URL = "https://www.gov.uk/bank-holidays.json"
+EXTRA_AIM_POOL = ["PTAL.L", "RKH.L", "ITM.L", "LTHM.L", "CMCL.L", "CAML.L", "SAV.L", "KP2.L", "BUR.L", "FEVR.L", "JET2.L", "NFG.L",
+                  "DOTD.L", "BIG.L", "SEE.L", "AOM.L", "YOU.L", "CER.L", "RWS.L", "KGH.L", "CHRT.L", "CNC.L", "CRW.L", "BRCK.L",
+                  "MIDW.L", "SRC.L", "JHD.L"]
+
+@st.cache_resource
+def get_market_box():
+    return {"lock": threading.Lock()}
+
+def _save_json(path: str, obj):
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+def _load_json(path: str):
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+def html_table_rows(page: str, table_id: str = "constituents") -> list:
+    """Plain-Python table reader (no lxml/bs4 needed): returns rows of cell texts."""
+    m = re.search(r"""<table[^>]*id=["']""" + re.escape(table_id) + r"""["'][^>]*>(.*?)</table>""", page or "", re.S | re.I)
+    if not m:
+        return []
+    rows = []
+    for r in re.findall(r"<tr[^>]*>(.*?)</tr>", m.group(1), re.S | re.I):
+        cells = re.findall(r"<t[hd][^>]*>(.*?)</t[hd]>", r, re.S | re.I)
+        rows.append([re.sub(r"\[\d+\]", "", html.unescape(re.sub(r"<[^>]+>", "", c))).strip() for c in cells])
+    return rows
+
+def parse_constituents(page: str) -> dict:
+    """{'TICKER.L': 'Sector group'} from a Wikipedia FTSE constituents table."""
+    rows = html_table_rows(page)
+    if not rows:
+        return {}
+    head = [h.lower() for h in rows[0]]
+    t_i = next((i for i, h in enumerate(head) if "ticker" in h or "epic" in h), None)
+    s_i = next((i for i, h in enumerate(head) if "sector" in h or "industry" in h or "icb" in h), None)
+    if t_i is None:
+        return {}
+    out = {}
+    for r in rows[1:]:
+        if len(r) <= t_i:
+            continue
+        raw = re.sub(r"\s+", "", r[t_i]).upper().replace(".", "-")
+        tkr = f"{raw}.L"
+        if is_valid_lse_ticker(tkr):
+            out[tkr] = wiki_sector_to_bucket(r[s_i]) if s_i is not None and len(r) > s_i else "Unclassified"
+    return out
+
+def _aim_pool() -> dict:
+    pool = {}
+    for t in sorted(set(EXTRA_AIM_POOL) | set(AIM_EXEMPT_TICKERS) | set(SECTOR_MAP)):
+        if is_valid_lse_ticker(t):
+            pool[t] = SECTOR_MAP.get(t, "Unclassified")
+    return pool
+
+def get_uk_universe() -> tuple:
+    """(tickers, {ticker: sector}, where_from). Today's FTSE 100 + FTSE 250 lists when Wikipedia answers, otherwise the
+    last saved copy, otherwise the built-in copy (Oct 2026). Liquid AIM shares are always added. Cached 12 h (2 h on failure)."""
+    box = get_market_box()
+    now = time.time()
+    cached = box.get("universe")
+    if cached and now - cached[0] < (43200 if cached[4] else 7200):
+        return cached[1], cached[2], cached[3]
+    live, fresh_pages = {}, 0
+    for url, min_rows in FTSE_LIST_PAGES:
+        try:
+            resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout=6)
+            if resp.status_code == 200:
+                got = parse_constituents(resp.text)
+                if len(got) >= min_rows:
+                    live.update(got)
+                    fresh_pages += 1
+        except Exception:
+            pass
+    fresh = fresh_pages == len(FTSE_LIST_PAGES)
+    if fresh:
+        sectors = dict(live)
+        source = "today's FTSE 100 + FTSE 250 lists"
+        _save_json(UNIVERSE_SAVE_PATH, {"saved": london_now().strftime("%Y-%m-%d %H:%M"), "sectors": sectors})
+    else:
+        saved = _load_json(UNIVERSE_SAVE_PATH)
+        if isinstance(saved, dict) and isinstance(saved.get("sectors"), dict) and len(saved["sectors"]) >= 250:
+            sectors = {k: str(v) for k, v in saved["sectors"].items() if is_valid_lse_ticker(k)}
+            source = f"FTSE 100 + FTSE 250 lists saved {saved.get('saved', 'earlier')} (list pages not reachable right now)"
+        else:
+            sectors = dict(BUILTIN_UNIVERSE)
+            source = "built-in FTSE 100 + FTSE 250 lists (Oct 2026) — list pages not reachable right now"
+        sectors.update({k: v for k, v in live.items()})
+    for t, sec in _aim_pool().items():
+        sectors.setdefault(t, sec)
+    for t, sec in SECTOR_MAP.items():
+        if t in sectors:
+            sectors[t] = sec
+    tickers = sorted(t for t in sectors if is_valid_lse_ticker(t))
+    source = f"{source} + {sum(1 for t in tickers if is_aim_exempt(t))} AIM shares"
+    box["universe"] = (now, tickers, sectors, source, fresh)
+    return tickers, sectors, source
+
+def get_universe_sectors() -> dict:
+    box = get_market_box()
+    cached = box.get("universe")
+    if cached:
+        return cached[2]
+    return BUILTIN_UNIVERSE
+
+# ---------- UK bank holidays (the LSE is shut) and half days (12:30 close) ----------
+def _easter_sunday(y: int):
+    a, b, c = y % 19, y // 100, y % 100
+    d, e = b // 4, b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    l_ = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l_) // 451
+    month = (h + l_ - 7 * m + 114) // 31
+    day = ((h + l_ - 7 * m + 114) % 31) + 1
+    return datetime(y, month, day).date()
+
+def uk_bank_holidays_calc(y: int) -> dict:
+    """England & Wales bank holidays by rule (used when gov.uk can't be reached). One-off extra holidays are only
+    known from gov.uk."""
+    out = {}
+    d = datetime(y, 1, 1).date()
+    out[(d + timedelta(days={5: 2, 6: 1}.get(d.weekday(), 0))).isoformat()] = "New Year's Day"
+    es = _easter_sunday(y)
+    out[(es - timedelta(days=2)).isoformat()] = "Good Friday"
+    out[(es + timedelta(days=1)).isoformat()] = "Easter Monday"
+    may1 = datetime(y, 5, 1).date()
+    out[(may1 + timedelta(days=(7 - may1.weekday()) % 7)).isoformat()] = "Early May bank holiday"
+    may31 = datetime(y, 5, 31).date()
+    out[(may31 - timedelta(days=may31.weekday())).isoformat()] = "Spring bank holiday"
+    aug31 = datetime(y, 8, 31).date()
+    out[(aug31 - timedelta(days=aug31.weekday())).isoformat()] = "Summer bank holiday"
+    xmas, box_ = datetime(y, 12, 25).date(), datetime(y, 12, 26).date()
+    if xmas.weekday() == 5:                                  # Sat: Mon 27 + Tue 28
+        out[(xmas + timedelta(days=2)).isoformat()] = "Christmas Day (substitute)"
+        out[(xmas + timedelta(days=3)).isoformat()] = "Boxing Day (substitute)"
+    elif xmas.weekday() == 6:                                # Sun: Mon 26 Boxing + Tue 27 substitute
+        out[box_.isoformat()] = "Boxing Day"
+        out[(xmas + timedelta(days=2)).isoformat()] = "Christmas Day (substitute)"
+    else:
+        out[xmas.isoformat()] = "Christmas Day"
+        if box_.weekday() == 5:
+            out[(box_ + timedelta(days=2)).isoformat()] = "Boxing Day (substitute)"
+        else:
+            out[box_.isoformat()] = "Boxing Day"
+    return out
+
+def get_uk_holidays() -> dict:
+    """{'YYYY-MM-DD': name}. gov.uk's official list when reachable (includes one-off holidays), plus the rules above for
+    any year gov.uk doesn't cover. Cached 12 h (2 h if gov.uk didn't answer)."""
+    box = get_market_box()
+    now = time.time()
+    cached = box.get("holidays")
+    if cached and now - cached[0] < (43200 if cached[2] else 7200):
+        return cached[1]
+    official = {}
+    try:
+        resp = requests.get(GOV_UK_HOLIDAYS_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        if resp.status_code == 200:
+            for ev in (resp.json().get("england-and-wales", {}) or {}).get("events", []) or []:
+                d = _to_date(ev.get("date"))
+                if d:
+                    official[d.isoformat()] = str(ev.get("title", "Bank holiday"))[:60]
+    except Exception:
+        official = {}
+    per_year = {}
+    for k in official:
+        per_year[k[:4]] = per_year.get(k[:4], 0) + 1
+    years_official = {y for y, n in per_year.items() if n >= 6}         # only trust a year gov.uk lists in full
+    y0 = london_now().year
+    out = dict(official)
+    for y in (y0 - 1, y0, y0 + 1):
+        if str(y) not in years_official:
+            out.update(uk_bank_holidays_calc(y))
+    box["holidays"] = (now, out, bool(official))
+    return out
+
+def get_market_state() -> dict:
+    """Is the LSE trading today, and when does it close? Weekends, bank holidays and the 12:30 half days on
+    Christmas Eve and New Year's Eve are all handled."""
+    now = london_now()
+    today = now.date()
+    if now.weekday() > 4:
+        return {"trading_day": False, "reason": "Weekend", "close": dtime(16, 30), "half_day": False}
+    hol = get_uk_holidays()
+    if today.isoformat() in hol:
+        return {"trading_day": False, "reason": f"Bank holiday — {hol[today.isoformat()]}", "close": dtime(16, 30), "half_day": False}
+    if (today.month, today.day) in ((12, 24), (12, 31)):
+        return {"trading_day": True, "reason": "Half day — the market closes at 12:30", "close": dtime(12, 30), "half_day": True}
+    return {"trading_day": True, "reason": "", "close": dtime(16, 30), "half_day": False}
+
+def next_open_text() -> str:
+    now = london_now()
+    hol = get_uk_holidays()
+    for add in range(0, 12):
+        d = now.date() + timedelta(days=add)
+        if d.weekday() > 4 or d.isoformat() in hol:
+            continue
+        close_t = dtime(12, 30) if (d.month, d.day) in ((12, 24), (12, 31)) else dtime(16, 30)
+        if add == 0 and now.time() >= close_t:
+            continue
+        if add == 0 and now.time() >= dtime(8, 0):
+            return "now"
+        when = "today" if add == 0 else ("tomorrow" if add == 1 else d.strftime("%a %d %b"))
+        return f"{when} 08:00"
+    return "soon"
+
+def upcoming_holidays(n: int = 5) -> list:
+    today = london_now().date().isoformat()
+    return [(d, name) for d, name in sorted(get_uk_holidays().items()) if d >= today][:n]
 
 # ==============================================================================
 # 1. HYBRID DATABASE (THREAD-SAFE DUCKDB + SUPABASE CLOUD)
@@ -474,10 +1175,32 @@ def init_duckdb_storage():
                     last_audited VARCHAR
                 )
             """)
+            for tbl in ("trade_journal", "daily_options_journal"):
+                try:
+                    con.execute(f"UPDATE {tbl} SET status = 'ACTIVE' WHERE status IS NULL OR TRIM(status) = '' OR (UPPER(status) LIKE '%ACTIVE%' AND status != 'ACTIVE')")
+                except Exception:
+                    pass
         finally:
             con.close()
 
 init_duckdb_storage()
+
+def journal_counts() -> dict:
+    out = {"total": 0, "open": 0, "closed": 0, "opt_total": 0, "opt_open": 0}
+    with DB_LOCK:
+        con = duckdb.connect(DB_PATH, read_only=True)
+        try:
+            for r in con.execute("SELECT status FROM trade_journal").fetchall():
+                out["total"] += 1
+                out["open" if classify_outcome(r[0]) == "ACTIVE" else "closed"] += 1
+            for r in con.execute("SELECT status FROM daily_options_journal").fetchall():
+                out["opt_total"] += 1
+                out["opt_open"] += int(classify_outcome(r[0]) == "ACTIVE")
+        except Exception:
+            pass
+        finally:
+            con.close()
+    return out
 
 try:
     from supabase import create_client
@@ -561,17 +1284,27 @@ def fetch_all_supabase_rows(table_name: str) -> list:
     return all_rows
 
 def hydrate_duckdb_from_supabase():
-    """Restores trades from Supabase WITHOUT clobbering newer local state (a closed trade never reverts to ACTIVE)."""
+    """Restore trades from the online backup. Each row is handled on its own, so ONE unreadable old row can never stop
+    the newer rows (usually your open trades) from loading. Newer local data is never overwritten, and a trade that has
+    closed here never re-opens."""
+    info = {"remote": 0, "remote_active": 0, "restored": 0, "kept_local": 0, "bad_rows": 0, "first_error": ""}
+    st.session_state["hydrate_info"] = info
     if not supabase:
         return
     eq_data = fetch_all_supabase_rows("predictions")      # network I/O outside the DB lock
     opt_data = fetch_all_supabase_rows("options_journal")
+    info["remote"] = len(eq_data or [])
+    info["remote_active"] = sum(1 for r in (eq_data or []) if _norm_status(r.get("status")) == "ACTIVE" and is_valid_lse_ticker(str(r.get("ticker", "")).strip().upper()))
+
+    def bad(e):
+        info["bad_rows"] += 1
+        if not info["first_error"]:
+            info["first_error"] = f"{type(e).__name__}: {str(e)[:90]}"
 
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=False)
         try:
-            local_eq = {}
-            local_opt = {}
+            local_eq, local_opt = {}, {}
             try:
                 for r in con.execute("SELECT trade_id, status, last_audited, ticker, date_str, stop_loss, latest_price, pnl_pct FROM trade_journal").fetchall():
                     local_eq[r[0]] = r
@@ -580,80 +1313,84 @@ def hydrate_duckdb_from_supabase():
             except Exception:
                 pass
 
-            try:
-                for r in (eq_data or []):
-                    tkr = str(r.get('ticker', '')).strip()
+            for r in (eq_data or []):
+                try:
+                    tkr = str(r.get('ticker', '')).strip().upper()
                     if not is_valid_lse_ticker(tkr):
                         continue
-                    pred_date = str(r.get('predicted_date', london_now().strftime('%Y-%m-%d')))
+                    pred_date = str(r.get('predicted_date') or london_now().strftime('%Y-%m-%d'))[:10]
                     trade_id = f"{tkr}_{pred_date}"
-                    remote_status = str(r.get('status', 'ACTIVE')).upper()
+                    remote_status = _norm_status(r.get('status'))
                     remote_ts = str(r.get('last_checked') or "")
                     loc = local_eq.get(trade_id)
                     if loc:
                         l_status, l_ts = str(loc[1]), str(loc[2] or "")
-                        local_closed_remote_active = (l_status != "ACTIVE" and remote_status == "ACTIVE")
+                        closed_vs_active = (classify_outcome(l_status) != "ACTIVE" and remote_status == "ACTIVE")
                         local_newer = bool(l_ts) and (not remote_ts or l_ts >= remote_ts)
-                        if local_closed_remote_active or local_newer:
-                            if local_closed_remote_active:
+                        if closed_vs_active or local_newer:
+                            info["kept_local"] += 1
+                            if closed_vs_active:
                                 cloud_update("predictions", {"ticker": loc[3], "predicted_date": loc[4]},
-                                             {"status": l_status, "stop_loss": float(loc[5] or 0.0), "latest_price": float(loc[6] or 0.0),
-                                              "pnl_pct": float(loc[7] or 0.0), "last_checked": l_ts}, "Re-push Closed Trade")
+                                             {"status": l_status, "stop_loss": _num(loc[5]), "latest_price": _num(loc[6]),
+                                              "pnl_pct": _num(loc[7]), "last_checked": l_ts}, "Re-push Closed Trade")
                             continue
+                    entry, tgt, stp = _num(r.get('entry_price')), _num(r.get('target_price')), _num(r.get('stop_loss'))
+                    if remote_status == "ACTIVE" and (entry <= 0 or tgt <= 0 or stp <= 0 or tgt <= stp):
+                        raise ValueError(f"{tkr}: missing or impossible prices (bought {r.get('entry_price')}, goal {r.get('target_price')}, exit {r.get('stop_loss')})")
                     last_check = remote_ts or london_now().strftime('%Y-%m-%d %H:%M:%S')
-                    f_json = json.dumps(r.get('features_json') or {})
-                    exit_ts_val = last_check if remote_status != "ACTIVE" else None
+                    f_obj = r.get('features_json')
+                    f_json = json.dumps(_parse_features(f_obj) if not isinstance(f_obj, dict) else f_obj)
+                    shares_n = max(1, _int(r.get('shares_qty'), 1))
+                    cap = _num(r.get('position_gbp'))
+                    if cap <= 0:
+                        cap = round(shares_n * entry / 100.0, 2) if entry > 0 else POSITION_SIZE_GBP
+                    latest = _num(r.get('latest_price'), entry)
                     con.execute("""
                         INSERT OR REPLACE INTO trade_journal 
                         (trade_id, timestamp, date_str, ticker, asset_type, entry_price, target_price,
                          stop_loss, shares, capital_allocated, status, latest_price, pnl_pct, exit_price,
                          exit_timestamp, last_audited, features_json)
                         VALUES (?, ?, ?, ?, 'EQUITY', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, [
-                        trade_id, last_check, pred_date, tkr,
-                        float(r.get('entry_price', 0.0)), float(r.get('target_price', 0.0)),
-                        float(r.get('stop_loss', 0.0)), int(r.get('shares_qty', 1)),
-                        float(r.get('position_gbp', 0.0)), remote_status,
-                        float(r.get('latest_price', 0.0)), float(r.get('pnl_pct', 0.0)),
-                        float(r.get('latest_price', 0.0)) if remote_status != "ACTIVE" else 0.0,
-                        exit_ts_val, last_check, f_json
-                    ])
-                if "db_error" in st.session_state and "Hydrate" in st.session_state["db_error"]:
-                    del st.session_state["db_error"]
-            except Exception as e:
-                record_db_error("Hydrate Equities", e)
+                    """, [trade_id, last_check, pred_date, tkr, entry, tgt, stp, shares_n, cap, remote_status,
+                          latest, _num(r.get('pnl_pct')), latest if remote_status != "ACTIVE" else 0.0,
+                          last_check if remote_status != "ACTIVE" else None, last_check, f_json])
+                    info["restored"] += 1
+                except Exception as e:
+                    bad(e)
 
-            try:
-                for o in (opt_data or []):
-                    date_k = str(o.get('date_key', london_now().strftime('%Y-%m-%d')))
-                    remote_status = str(o.get('status', 'ACTIVE')).upper()
+            for o in (opt_data or []):
+                try:
+                    date_k = str(o.get('date_key') or london_now().strftime('%Y-%m-%d'))[:10]
+                    remote_status = _norm_status(o.get('status'))
                     remote_ts = str(o.get('last_audited') or "")
                     loc = local_opt.get(date_k)
                     if loc:
                         l_status, l_ts = str(loc[1]), str(loc[2] or "")
-                        if (l_status != "ACTIVE" and remote_status == "ACTIVE") or (l_ts and (not remote_ts or l_ts >= remote_ts)):
-                            if l_status != "ACTIVE" and remote_status == "ACTIVE":
+                        if (classify_outcome(l_status) != "ACTIVE" and remote_status == "ACTIVE") or (l_ts and (not remote_ts or l_ts >= remote_ts)):
+                            if classify_outcome(l_status) != "ACTIVE" and remote_status == "ACTIVE":
                                 cloud_update("options_journal", {"date_key": date_k},
-                                             {"status": l_status, "current_option_price": float(loc[3] or 0.0),
-                                              "pnl_pct": float(loc[4] or 0.0), "last_audited": l_ts}, "Re-push Closed Option")
+                                             {"status": l_status, "current_option_price": _num(loc[3]),
+                                              "pnl_pct": _num(loc[4]), "last_audited": l_ts}, "Re-push Closed Option")
                             continue
+                    cur_p = _num(o.get('current_option_price'))
+                    if _num(o.get('entry_premium'), cur_p) <= 0 or not str(o.get('option_contract') or '').strip():
+                        raise ValueError(f"option {date_k}: missing contract or price")
                     con.execute("""
                         INSERT OR REPLACE INTO daily_options_journal 
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, [
-                        date_k, str(o.get('timestamp') or ""), str(o.get('share_name')),
-                        str(o.get('option_contract')), float(o.get('strike_price', 0.0)),
-                        int(o.get('expiry_days', 21)), float(o.get('underlying_spot', 0.0)),
-                        int(o.get('lot_size', 5000)), float(o.get('entry_premium', 0.0)),
-                        float(o.get('current_option_price', 0.0)), float(o.get('target_premium', 0.0)),
-                        float(o.get('stop_loss_premium', 0.0)), float(o.get('total_capital', 0.0)),
-                        float(o.get('ai_confidence', 80.0)), float(o.get('implied_vol', 20.0)),
-                        remote_status, float(o.get('pnl_pct', 0.0)), remote_ts
-                    ])
-            except Exception as e:
-                record_db_error("Hydrate Options", e)
+                    """, [date_k, str(o.get('timestamp') or ""), str(o.get('share_name') or ""), str(o.get('option_contract')),
+                          _num(o.get('strike_price')), _int(o.get('expiry_days'), 21), _num(o.get('underlying_spot')),
+                          _int(o.get('lot_size'), 100), _num(o.get('entry_premium'), cur_p), cur_p, _num(o.get('target_premium')),
+                          _num(o.get('stop_loss_premium')), _num(o.get('total_capital')), _num(o.get('ai_confidence'), 80.0),
+                          _num(o.get('implied_vol'), 20.0), remote_status, _num(o.get('pnl_pct')), remote_ts])
+                except Exception as e:
+                    bad(e)
         finally:
             con.close()
+    if info["bad_rows"]:
+        record_db_error("Restore from cloud", Exception(f"{info['bad_rows']} backup row(s) were unreadable and skipped ({info['first_error']})"))
+    elif "db_error" in st.session_state and "Restore" in str(st.session_state.get("db_error")):
+        del st.session_state["db_error"]
 
 # ==============================================================================
 # 2. TIMEZONE, MARKET CLOCK, MACRO FEED & PARALLEL DATA CACHING
@@ -661,12 +1398,18 @@ def hydrate_duckdb_from_supabase():
 LOT_SIZES = {"SHEL": 1000, "AZN": 500, "HSBA": 2000, "ULVR": 500, "BP": 3000, "BARC": 5000, "RIO": 250, "GLEN": 4000}
 
 def is_lse_market_open() -> bool:
-    now_lon = london_now()
-    return dtime(8, 0) <= now_lon.time() <= dtime(16, 30) and now_lon.weekday() <= 4
+    """Open 08:00–16:30 London on trading days (12:30 close on half days); shut at weekends and on bank holidays."""
+    state = get_market_state()
+    return state["trading_day"] and dtime(8, 0) <= london_now().time() <= state["close"]
+
+def entry_window_end() -> dtime:
+    close = get_market_state()["close"]
+    half_hour_before = (datetime.combine(datetime(2000, 1, 1), close) - timedelta(minutes=30)).time()
+    return min(ENTRY_WINDOW_END, half_hour_before)
 
 def is_entry_window_open() -> bool:
-    now_lon = london_now()
-    return ENTRY_WINDOW_START <= now_lon.time() <= ENTRY_WINDOW_END and now_lon.weekday() <= 4
+    state = get_market_state()
+    return state["trading_day"] and ENTRY_WINDOW_START <= london_now().time() <= entry_window_end()
 
 def norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
@@ -712,28 +1455,59 @@ def _download_history_raw(ticker: str, period: str) -> pd.DataFrame:
             time.sleep(0.4)
     return pd.DataFrame()
 
-def prefetch_histories(tickers: list, period: str = "120d", ttl: int = 300):
-    """Parallel download for the scan (no Streamlit calls inside worker threads)."""
+def prefetch_histories(tickers: list, period: str = "120d", ttl=300, workers: int = 8, progress=None, time_budget: float = None) -> bool:
+    """Parallel download into a shared in-memory store (no Streamlit calls inside worker threads).
+    ttl can be a number or a function(ticker)->seconds. Returns False if the time budget ran out first."""
     store = get_hist_store()
     now = time.time()
+    ttl_of = ttl if callable(ttl) else (lambda _t: ttl)
     with store["lock"]:
-        for k in [k for k, v in store["data"].items() if now - v[0] > 3600]:
+        for k in [k for k, v in store["data"].items() if now - v[0] > QUIET_TTL_SEC + 600]:
             del store["data"][k]
-        todo = [t for t in tickers if is_valid_lse_ticker(t) and ((t, period) not in store["data"] or now - store["data"][(t, period)][0] > ttl)]
+        todo = [t for t in dict.fromkeys(tickers) if (is_valid_lse_ticker(t) or str(t).startswith("^")) and
+                ((t, period) not in store["data"] or now - store["data"][(t, period)][0] > ttl_of(t))]
     if not todo:
-        return
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        results = list(ex.map(lambda t: (t, _download_history_raw(t, period)), todo))
-    with store["lock"]:
-        for t, df in results:
-            store["data"][(t, period)] = (now, df)
+        if progress:
+            progress(1, 1)
+        return True
+    started, done, complete = time.time(), 0, True
+    batch_n = max(workers * 5, 20)
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        for i in range(0, len(todo), batch_n):
+            if time_budget is not None and time.time() - started > time_budget:
+                complete = False
+                break
+            part = todo[i:i + batch_n]
+            res = list(ex.map(lambda t: (t, _download_history_raw(t, period)), part))
+            stamp = time.time()
+            with store["lock"]:
+                for t, df in res:
+                    old = store["data"].get((t, period))
+                    if (df is None or df.empty) and old is not None and old[1] is not None and not old[1].empty:
+                        continue                                    # never replace good prices with a failed download
+                    store["data"][(t, period)] = (stamp, df if df is not None else pd.DataFrame())
+            done += len(part)
+            if progress:
+                progress(done, len(todo))
+            if len(part) >= 10 and sum(1 for _, d in res if d is None or d.empty) > len(part) * 0.6:
+                time.sleep(1.5)                                     # the price service looks busy: back off politely
+    return complete
 
-def get_history_fast(ticker: str, period: str = "120d") -> pd.DataFrame:
+def peek_history(ticker: str, period: str = "120d", max_age: float = None) -> pd.DataFrame:
+    """Prices already downloaded by prefetch_histories (no network). With max_age, older copies count as missing."""
     store = get_hist_store()
     with store["lock"]:
         item = store["data"].get((ticker, period))
-    if item is not None and item[1] is not None and not item[1].empty:
-        return item[1].copy()
+    if item is None or item[1] is None or item[1].empty:
+        return pd.DataFrame()
+    if max_age is not None and time.time() - item[0] > max_age:
+        return pd.DataFrame()
+    return item[1].copy()
+
+def get_history_fast(ticker: str, period: str = "120d") -> pd.DataFrame:
+    df = peek_history(ticker, period, max_age=SWEEP_TTL_SEC)
+    if not df.empty:
+        return df
     return fetch_cached_history(ticker, period)
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -761,6 +1535,19 @@ def get_ftse_close_series() -> pd.Series:
         s = h["Close"].copy()
         s.index = pd.to_datetime([pd.Timestamp(x).date() for x in s.index])
         return s.sort_index()
+    except Exception:
+        return pd.Series(dtype=float)
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_ftse_close_series_long() -> pd.Series:
+    """About a year of FTSE 100 closes — used to rebuild the market context of older trades."""
+    try:
+        h = yf.Ticker("^FTSE").history(period="1y", timeout=6)
+        if h is None or h.empty:
+            return pd.Series(dtype=float)
+        s_ = h["Close"].copy()
+        s_.index = pd.to_datetime([pd.Timestamp(x).date() for x in s_.index])
+        return s_.sort_index()
     except Exception:
         return pd.Series(dtype=float)
 
@@ -875,12 +1662,15 @@ def audit_and_reconcile_all_trades():
     today_date = now_lon.date()
 
     flush_pending_cloud_sync()
+    st.session_state["price_feed_problem"] = False
 
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=False)
         try:
             active_trades = con.execute("SELECT * FROM trade_journal WHERE status = 'ACTIVE'").df()
             active_opts = con.execute("SELECT * FROM daily_options_journal WHERE status = 'ACTIVE'").df()
+        except Exception:
+            active_trades, active_opts = pd.DataFrame(), pd.DataFrame()
         finally:
             con.close()
 
@@ -891,9 +1681,10 @@ def audit_and_reconcile_all_trades():
             if not is_valid_lse_ticker(tkr):
                 continue
             try:
-                h = fetch_cached_history(tkr, period="15d")
+                h = fetch_cached_history(tkr, period="1mo")
                 if h.empty:
-                    continue
+                    st.session_state["price_feed_problem"] = True
+                    continue                                       # do NOT pretend we checked
                 dates = _bar_dates(h)
 
                 entry = float(tr["entry_price"])
@@ -998,7 +1789,7 @@ def audit_and_reconcile_all_trades():
                     audit_real_option(opt, now_str, today_date)
                     continue
                 share = str(opt['share_name'])
-                h = fetch_cached_history(f"{share}.L", period="15d")
+                h = fetch_cached_history(f"{share}.L", period="1mo")
                 if h.empty:
                     continue
                 dates = _bar_dates(h)
@@ -1138,6 +1929,197 @@ def get_self_learning_adjustment(ticker: str, current_atr_pct: float, hist=None)
         pass
 
     return {"delta": int(round(delta)), "reason": " | ".join(reasons) if reasons else "No adverse historical match"}
+
+
+# ---------- market context of a trade (same maths at buying time and when rebuilding old trades) ----------
+def compute_context(df_model: pd.DataFrame, ftse_series: pd.Series = None, breadth=None) -> dict:
+    """Plain facts about a share on its last COMPLETED bar: strength vs the FTSE 100, momentum, distance above its
+    20-day average, volume vs normal, daily jumpiness, and how much of the market was rising."""
+    c = pd.to_numeric(df_model["Close"], errors="coerce").astype(float)
+    v = pd.to_numeric(df_model["Volume"], errors="coerce").fillna(0.0).astype(float)
+    hi = pd.to_numeric(df_model["High"], errors="coerce").astype(float)
+    lo = pd.to_numeric(df_model["Low"], errors="coerce").astype(float)
+    last = float(c.iloc[-1])
+    ema20 = c.ewm(span=20, adjust=False).mean()
+    delta = c.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    g_, l_ = float(gain.iloc[-1]), float(loss.iloc[-1])
+    rsi = 100.0 if l_ == 0 and g_ > 0 else (50.0 if l_ == 0 else 100.0 - 100.0 / (1.0 + g_ / l_))
+    prev_c = c.shift(1)
+    tr = pd.concat([hi - lo, (hi - prev_c).abs(), (lo - prev_c).abs()], axis=1).max(axis=1)
+    atr = float(tr.rolling(14).mean().iloc[-1])
+    vol_norm = float(v.iloc[-21:-1].mean()) if len(v) > 21 else float(v.mean())
+    ret20 = (last / float(c.iloc[-21]) - 1.0) * 100.0 if len(c) > 21 and float(c.iloc[-21]) > 0 else 0.0
+    ctx = {
+        "rsi14": round(rsi, 1),
+        "dist20": round((last / float(ema20.iloc[-1]) - 1.0) * 100.0, 2) if float(ema20.iloc[-1]) > 0 else 0.0,
+        "rvol": round(float(v.iloc[-1]) / vol_norm, 2) if vol_norm > 0 else 1.0,
+        "atr_pct": round(atr / last * 100.0, 2) if last > 0 and math.isfinite(atr) else 0.0,
+        "mom5": round((last / float(c.iloc[-6]) - 1.0) * 100.0, 2) if len(c) > 6 and float(c.iloc[-6]) > 0 else 0.0,
+        "ret20": round(ret20, 2),
+        "uptrend": bool(last >= float(ema20.iloc[-1]) and ret20 > 0),
+    }
+    if ftse_series is not None and not ftse_series.empty:
+        try:
+            end = pd.Timestamp(pd.Timestamp(df_model.index[-1]).date())
+            fs = ftse_series[ftse_series.index <= end]
+            if len(fs) > 50:
+                f20 = (float(fs.iloc[-1]) / float(fs.iloc[-21]) - 1.0) * 100.0
+                ctx["rs20"] = round(ret20 - f20, 2)
+                ctx["ftse_up"] = int(float(fs.iloc[-1]) > float(fs.iloc[-50:].mean()))
+            elif len(fs) > 21:
+                ctx["rs20"] = round(ret20 - (float(fs.iloc[-1]) / float(fs.iloc[-21]) - 1.0) * 100.0, 2)
+        except Exception:
+            pass
+    if breadth is not None:
+        ctx["breadth"] = round(float(breadth), 1)
+    for k, val in list(ctx.items()):
+        if isinstance(val, float) and not math.isfinite(val):
+            ctx.pop(k)
+    return ctx
+
+EVIDENCE_FACTORS = [
+    ("rs20", "Strength vs the FTSE 100 (last 20 days)", [(-1e9, -3, "Lagging the FTSE by 3%+"), (-3, 0, "Lagging it a little"), (0, 3, "Beating it a little"), (3, 1e9, "Beating it by 3%+")]),
+    ("rsi14", "Momentum (RSI)", [(-1e9, 45, "Weak (under 45)"), (45, 55, "Neutral (45–55)"), (55, 65, "Firm (55–65)"), (65, 75, "Strong (65–75)"), (75, 1e9, "Very strong (75+)")]),
+    ("dist20", "Distance above its 20-day average", [(-1e9, 0, "Below its average"), (0, 2, "Just above (0–2%)"), (2, 5, "Well above (2–5%)"), (5, 1e9, "Stretched (5%+)")]),
+    ("rvol", "Trading volume vs normal", [(-1e9, 0.8, "Quieter than usual"), (0.8, 1.3, "Normal"), (1.3, 2.0, "Busy (1.3–2×)"), (2.0, 1e9, "Very busy (2×+)")]),
+    ("atr_pct", "How jumpy the share is", [(-1e9, 1.5, "Calm (under 1.5% a day)"), (1.5, 2.5, "Normal (1.5–2.5%)"), (2.5, 4.0, "Lively (2.5–4%)"), (4.0, 1e9, "Very jumpy (4%+)")]),
+    ("breadth", "How much of the market was rising", [(-1e9, 35, "Most shares falling"), (35, 55, "Mixed market"), (55, 1e9, "Most shares rising")]),
+    ("ftse_up", "FTSE 100 above its 50-day average", [(-0.5, 0.5, "No — market in a dip"), (0.5, 1.5, "Yes — market trending up")]),
+]
+
+def ctx_bucket(bins: list, value):
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(v):
+        return None
+    for lo_, hi_, label in bins:
+        if lo_ <= v < hi_:
+            return label
+    return None
+
+def build_evidence_model(closed_df: pd.DataFrame) -> dict:
+    """Which conditions have really won for YOU. Win rate per group, shrunk toward your overall win rate so small groups
+    can't fool it, with older trades counting less. Only used once there are enough clear wins/losses."""
+    model = {"ready": False, "n": 0, "with_ctx": 0, "p0": None, "factors": {}}
+    if closed_df is None or closed_df.empty:
+        return model
+    today = london_now().date()
+    rows = []
+    for _, r in closed_df.iterrows():
+        o = classify_outcome(r["status"])
+        if o not in ("WIN", "LOSS"):
+            continue
+        ctx = _parse_features(r["features_json"]).get("ctx")
+        if not isinstance(ctx, dict) or ctx.get("unavailable"):
+            continue
+        d = _to_date(_first_valid(r.get("exit_timestamp"), r.get("last_audited"), r.get("date_str")))
+        w = math.pow(0.5, max(0, (today - d).days) / EVIDENCE_HALF_LIFE_DAYS) if d else 0.5
+        rows.append((ctx, 1 if o == "WIN" else 0, w))
+    model["with_ctx"] = len(rows)
+    model["n"] = len(rows)
+    if not rows:
+        return model
+    w_tot = sum(w for _, _, w in rows)
+    p0 = sum(w * y for _, y, w in rows) / w_tot if w_tot > 0 else 0.5
+    model["p0"] = p0
+    model["ready"] = len(rows) >= EVIDENCE_MIN_DECIDED
+    for key, title, bins in EVIDENCE_FACTORS:
+        groups = {}
+        for ctx, y, w in rows:
+            b = ctx_bucket(bins, ctx.get(key))
+            if b is None:
+                continue
+            g = groups.setdefault(b, {"n": 0, "wins": 0, "w": 0.0, "wy": 0.0})
+            g["n"] += 1
+            g["wins"] += y
+            g["w"] += w
+            g["wy"] += w * y
+        out = {}
+        for _, _, label in bins:
+            g = groups.get(label)
+            if not g:
+                continue
+            shrunk = (g["wy"] + EVIDENCE_PRIOR_TRADES * p0) / (g["w"] + EVIDENCE_PRIOR_TRADES)
+            diff = (shrunk - p0) * 100.0
+            active = g["n"] >= EVIDENCE_MIN_BUCKET
+            pts = max(-EVIDENCE_FACTOR_CAP, min(EVIDENCE_FACTOR_CAP, diff * EVIDENCE_POINTS_PER_PCT)) if active else 0.0
+            out[label] = {"n": g["n"], "raw_rate": g["wins"] / g["n"] * 100.0, "shrunk": shrunk * 100.0, "diff": diff, "points": round(pts, 1), "active": active}
+        model["factors"][key] = {"title": title, "groups": out}
+    return model
+
+def evidence_adjustment(model: dict, ctx: dict) -> tuple:
+    """(points, [plain-English reasons]) — 0 until the learner has enough evidence."""
+    if not model or not model.get("ready") or not isinstance(ctx, dict):
+        return 0, []
+    total, notes = 0.0, []
+    for key, title, bins in EVIDENCE_FACTORS:
+        b = ctx_bucket(bins, ctx.get(key))
+        g = (model["factors"].get(key, {}).get("groups", {}) or {}).get(b) if b else None
+        if not g or not g["active"] or abs(g["points"]) < 0.5:
+            continue
+        total += g["points"]
+        notes.append(f"{g['points']:+.0f} ({b}: {g['raw_rate']:.0f}% won of {g['n']})")
+    total = max(-EVIDENCE_TOTAL_CAP, min(EVIDENCE_TOTAL_CAP, total))
+    return int(round(total)), notes
+
+def backfill_trade_context(limit: int = EVIDENCE_BACKFILL_PER_RUN) -> int:
+    """Rebuilds the market context of finished trades bought before context was recorded, from their price history,
+    so the evidence learner can learn from your past trades straight away. A few per check; saved once done."""
+    closed = load_closed_trades_df()
+    if closed is None or closed.empty:
+        return 0
+    today_s = london_now().strftime("%Y-%m-%d")
+    todo = []
+    for _, r in closed.iterrows():
+        if classify_outcome(r["status"]) not in ("WIN", "LOSS"):
+            continue
+        f = _parse_features(r["features_json"])
+        c = f.get("ctx")
+        if isinstance(c, dict) and (not c.get("unavailable") or c.get("tried") == today_s):
+            continue
+        if not is_valid_lse_ticker(str(r["ticker"])):
+            continue
+        todo.append((r["trade_id"], str(r["ticker"]), str(r["date_str"])[:10], f))
+        if len(todo) >= limit:
+            break
+    if not todo:
+        return 0
+    prefetch_histories([t for _, t, _, _ in todo], "1y", ttl=QUIET_TTL_SEC, workers=SCAN_WORKERS)
+    ftse_long = get_ftse_close_series_long()
+    done = 0
+    for trade_id, tkr, d_str, f in todo:
+        try:
+            h = peek_history(tkr, "1y")
+            entry_bar = _to_date(f.get("entry_bar"))
+            buy_day = _to_date(d_str)
+            if h.empty or buy_day is None:
+                ctx = {"unavailable": True, "tried": today_s}
+            else:
+                dates = _bar_dates(h)
+                cutoff = entry_bar or (buy_day - timedelta(days=1))
+                keep = [i for i, d in enumerate(dates) if d <= cutoff]
+                if len(keep) < 30:
+                    ctx = {"unavailable": True, "tried": today_s}
+                else:
+                    ctx = compute_context(h.iloc[: keep[-1] + 1], ftse_long)
+                    ctx["source"] = "rebuilt from price history"
+            f["ctx"] = ctx
+            with DB_LOCK:
+                con = duckdb.connect(DB_PATH, read_only=False)
+                try:
+                    con.execute("UPDATE trade_journal SET features_json = ? WHERE trade_id = ?", [json.dumps(f), trade_id])
+                finally:
+                    con.close()
+            done += int(not ctx.get("unavailable"))
+        except Exception:
+            continue
+    return done
 
 def build_calibrator(closed_df: pd.DataFrame):
     """Maps raw model probability -> honest probability using realised outcomes.
@@ -1404,6 +2386,66 @@ def scan_real_option_ideas(gbpusd_key: float, day_key: str, skip: tuple) -> list
         res = list(ex.map(lambda s: find_real_option_idea(s, gbpusd_key), syms))
     return [r for r in res if r]
 
+
+# ---------- the OPTIONS learner: simple, visible rules that adapt to its own option results ----------
+def load_options_journal_df() -> pd.DataFrame:
+    with DB_LOCK:
+        con = duckdb.connect(DB_PATH, read_only=True)
+        try:
+            return con.execute("SELECT * FROM daily_options_journal ORDER BY date_key ASC").df()
+        except Exception:
+            return pd.DataFrame()
+        finally:
+            con.close()
+
+def _opt_group(g: pd.DataFrame):
+    if g is None or g.empty:
+        return None
+    return {"n": int(len(g)), "avg": round(float(g["pnl_pct"].mean()), 1),
+            "win_rate": round(float((g["outcome"] == "WIN").mean() * 100.0), 0),
+            "wavg": round(float((g["w"] * g["pnl_pct"]).sum() / max(1e-9, g["w"].sum())), 1)}
+
+def options_learning(df_all: pd.DataFrame = None) -> dict:
+    """Learns ONLY from finished option ideas and ONLY changes the options idea:
+       1) a share whose option lost recently takes a break from options (fades by half every 30 days),
+       2) after enough results, if recent ideas lose on average, it only takes shares with a stronger 5-day climb.
+       Rule 2 looks at the last 60 days only, so if it ever stops all ideas it lifts by itself and gets re-tested."""
+    out = {"n": 0, "recent_n": 0, "ready": False, "bar": OPT_BASE_TREND_BAR, "rest": {}, "wavg": None, "real": None, "old": None, "by_share": {}}
+    if df_all is None:
+        df_all = load_options_journal_df()
+    d = prep_perf_frame(df_all, "total_capital", is_option=True)
+    if d is None or d.empty:
+        return out
+    today = london_now().date()
+    d = d.copy()
+    d["age"] = d["exit_date"].apply(lambda x: max(0, (today - x).days) if x else 0)
+    d["w"] = 0.5 ** (d["age"] / HALF_LIFE_DAYS)
+    d["real_src"] = d["option_contract"].apply(is_real_option)
+    out["n"] = int(len(d))
+    out["real"], out["old"] = _opt_group(d[d["real_src"]]), _opt_group(d[~d["real_src"]])
+    for share, g in d.groupby("share_name"):
+        out["by_share"][str(share)] = _opt_group(g)
+        sc = 0.0
+        for _, r in g.iterrows():
+            o = r["outcome"]
+            v = 1.0 if o == "WIN" else (-1.0 if o == "LOSS" else (-0.5 if float(r["pnl_pct"]) < 0 else 0.0))
+            sc += float(r["w"]) * v
+        if sc <= -OPT_REST_THRESHOLD:
+            out["rest"][str(share)] = max(1, int(math.ceil(HALF_LIFE_DAYS * math.log2(abs(sc) / OPT_REST_THRESHOLD))))
+    recent = d[d["age"] <= OPT_LEARN_WINDOW_DAYS]
+    out["recent_n"] = int(len(recent))
+    if len(recent) >= OPT_LEARN_MIN_TRADES:
+        out["ready"] = True
+        wavg = float((recent["w"] * recent["pnl_pct"]).sum() / max(1e-9, recent["w"].sum()))
+        out["wavg"] = round(wavg, 1)
+        if wavg < 0:
+            out["bar"] = round(min(OPT_MAX_TREND_BAR, OPT_BASE_TREND_BAR + abs(wavg) * 0.5), 1)
+    return out
+
+def trend_bar_to_rise(bar: float) -> float:
+    """Options trend strength = 78 + 5-day rise(%) × 1.5  ->  the 5-day rise (%) needed for a given bar."""
+    return (float(bar) - 78.0) / 1.5
+
 def generate_daily_options_alpha() -> dict:
     now_lon = london_now()
     today_str = now_lon.strftime('%Y-%m-%d')
@@ -1427,17 +2469,28 @@ def generate_daily_options_alpha() -> dict:
         st.session_state["opt_note"] = "The US options market is closed right now. Real quotes are available roughly 14:30–21:00 UK time, Monday to Friday — the idea of the day appears then."
         return {}
 
-    ideas = scan_real_option_ideas(round(get_gbpusd(), 3), today_str, tuple(sorted(active_underlyings)))
+    learn = options_learning()
+    resting = set(learn["rest"])
+    ideas = scan_real_option_ideas(round(get_gbpusd(), 3), today_str, tuple(sorted(active_underlyings | resting)))
     if not ideas:
+        why = f" The options learner is also resting {', '.join(sorted(resting))} after recent losses." if resting else ""
         st.session_state["opt_note"] = ("No option passed the quality checks right now (a live quote, enough real trading, a tight buy/sell gap and a cost under £"
-                                        f"{OPTION_BUDGET_GBP:.0f}). That's normal — it will try again when the page refreshes.")
+                                        f"{OPTION_BUDGET_GBP:.0f}). That's normal — it will try again when the page refreshes." + why)
+        return {}
+    def _trend_score(i):
+        return round(min(92.0, max(68.0, 78.0 + i["ret_5d"] * 150.0)), 1)          # trend-strength score, NOT a probability
+    strong = [i for i in ideas if _trend_score(i) >= learn["bar"]]
+    if not strong:
+        st.session_state["opt_note"] = (f"No option idea today — the options learner is being picky: recent ideas lost money on average, so it now needs "
+                                        f"trend strength {learn['bar']:.0f}+ (a 5-day rise of about {max(0.0, trend_bar_to_rise(learn['bar'])):.1f}%+), and none of today's "
+                                        f"{len(ideas)} candidate(s) had that. Doing nothing is a valid choice.")
         return {}
 
-    best = max(ideas, key=lambda i: i["ret_5d"])
+    best = max(strong, key=lambda i: i["ret_5d"])
     exp_d = _to_date(best["expiry"])
     days_to_expiry = max(1, (exp_d - now_lon.date()).days)
     ask, bid = float(best["ask"]), float(best["bid"])
-    score = round(min(92.0, max(68.0, 78.0 + best["ret_5d"] * 150.0)), 1)      # trend-strength score, NOT a probability
+    score = _trend_score(best)
     sig = {
         "date_key": today_str, "timestamp": now_str, "share_name": best["sym"],
         "option_contract": f"{best['sym']} ${best['strike']:g} Call · exp {exp_d.strftime('%d %b %Y')}",
@@ -1616,7 +2669,7 @@ def log_equity_signal_safely(sig: dict, enforce_sector_cap: bool = True) -> bool
     if not is_valid_lse_ticker(ticker):
         return fail("Invalid ticker")
     if not is_entry_window_open():
-        return fail("It is outside buying hours (08:30–16:00 London, Mon–Fri)")
+        return fail("It is outside buying hours (08:30–16:00 London on trading days; shut at weekends and on bank holidays)")
     if not sig.get("Loggable", True):
         return fail("No live price from today yet")
     if is_market_stress(get_cross_asset_macro_regime()):
@@ -1727,51 +2780,96 @@ def get_ml_model():
                 continue
     return None
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_live_lse_universe() -> list:
-    raw_tickers = []
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    for url in ("https://en.wikipedia.org/wiki/FTSE_100_Index", "https://en.wikipedia.org/wiki/FTSE_250_Index"):
-        try:
-            resp = requests.get(url, headers=headers, timeout=4)
-            if resp.status_code == 200:
-                df_idx = pd.read_html(resp.text, attrs={'id': 'constituents'})[0]
-                raw_tickers.extend([f"{str(t).strip().replace('.', '-')}.L" for t in df_idx['Ticker'].dropna()])
-        except Exception:
-            pass
+def analyse_share(ticker: str, df: pd.DataFrame, today_date, market_open: bool, ftse_series: pd.Series = None):
+    """Cheap checks every share gets. Returns (code, info); code is one of no_data / illiquid / wild / ok."""
+    if df is None or df.empty:
+        return "no_data", None
+    dates = _bar_dates(df)
+    live_bar_today = (dates[-1] == today_date)
+    partial_bar = live_bar_today and market_open
+    live_price = float(df["Close"].iloc[-1])
+    df_model = df.iloc[:-1] if partial_bar else df          # model sees COMPLETED bars only (train/inference parity)
+    if len(df_model) < 55 or not math.isfinite(live_price) or live_price <= 0:
+        return "no_data", None
+    recent = df_model.tail(20)
+    avg_turnover = float((recent["Close"] * recent["Volume"]).mean() / 100.0)      # pence -> £
+    if (not math.isfinite(avg_turnover)) or live_price < MIN_PRICE_P or avg_turnover < MIN_AVG_TURNOVER_GBP:
+        return "illiquid", None
+    last10 = df_model.tail(10)
+    frozen = int(((last10["High"] - last10["Low"]).abs() <= last10["Close"].abs() * 0.0005).sum()) + int((last10["Volume"] <= 0).sum())
+    if frozen >= 3:
+        return "wild", None                                  # suspended / not really trading
+    ctx = compute_context(df_model, ftse_series)
+    if float(ctx.get("atr_pct", 0.0)) > MAX_ATR_PCT:
+        return "wild", None
+    return "ok", {"dates": dates, "live_bar_today": live_bar_today, "live_price": live_price, "df_model": df_model,
+                  "avg_turnover": avg_turnover, "ctx": ctx}
 
-    fallback_pool = [
-        "SHEL.L", "BP.L", "PTAL.L", "RKH.L", "ITM.L",
-        "RIO.L", "GLEN.L", "LTHM.L", "CMCL.L", "CAML.L", "SAV.L", "KP2.L",
-        "HSBA.L", "BARC.L", "LSEG.L", "BUR.L", "LLOY.L", "NWG.L", "AV.L", "PRU.L", "LGEN.L",
-        "AZN.L", "GSK.L", "HLN.L", "SN.L", "HIK.L",
-        "ULVR.L", "BATS.L", "FEVR.L", "JET2.L", "NFG.L", "TSCO.L", "SBRY.L", "MKS.L", "NXT.L", "DGE.L", "RKT.L",
-        "NG.L", "SSE.L", "CNA.L", "VOD.L", "BT-A.L",
-        "DOTD.L", "BIG.L", "SEE.L", "AOM.L", "YOU.L", "CER.L", "RWS.L", "KGH.L", "AUTO.L", "SGE.L",
-        "CHRT.L", "CNC.L", "BA.L", "RR.L", "QQ.L",
-        "CRW.L", "BRCK.L", "MIDW.L", "VIC.L", "SRC.L", "JHD.L", "REL.L", "EXPN.L", "AHT.L"
-    ]
-    combined = set(raw_tickers + fallback_pool)
-    return sorted([t for t in combined if is_valid_lse_ticker(t)])
+def _model_prob(ml_bundle, feature_cols, df_model):
+    """Raw blended model probability (before news and calibration) + the feature row, from completed bars only."""
+    d2 = df_model.copy()
+    d2.reset_index(inplace=True)
+    feats = engineer_features(d2)
+    if feats is None or feats.empty:
+        raise ValueError("no features")
+    latest = feats.iloc[-1:].copy()
+    p1 = float(ml_bundle['lgb'].predict_proba(latest[feature_cols])[:, 1][0])
+    p2 = float(ml_bundle['catboost'].predict_proba(latest[feature_cols])[:, 1][0])
+    p = 0.5 * p1 + 0.5 * p2
+    if not math.isfinite(p):
+        raise ValueError("model returned a non-number")
+    return p, latest
+
+def expected_value_pct(p_win: float, entry: float, target: float, stop: float, friction_pct: float) -> float:
+    """What a pick is worth on average, in %, after ALL costs: chance × net gain − (1 − chance) × net loss."""
+    if entry <= 0:
+        return 0.0
+    gain = (target - entry) / entry * 100.0 - friction_pct
+    loss = (entry - stop) / entry * 100.0 + friction_pct
+    return round(p_win * gain - (1.0 - p_win) * loss, 2)
 
 def run_predictions():
+    """Looks at EVERY FTSE 350 share plus liquid AIM shares:
+       1) download prices for all of them (in parallel; quiet shares are re-checked less often),
+       2) cheap checks for everyone (easy to trade, not suspended, not wildly jumpy) + an AI score,
+       3) the best finalists get a fresh price, the news check, past lessons, the market, and the evidence learner,
+       4) only picks expected to make money AFTER all costs are kept."""
+    stats = {"listed": 0, "priced": 0, "no_data": 0, "illiquid": 0, "wild": 0, "scanned": 0, "uptrend": 0, "held": 0,
+             "model_errors": 0, "low_score": 0, "candidates": 0, "deep": 0, "rns_blocked": 0, "sector_blocked": 0,
+             "qualified": 0, "stale": 0, "logged": 0, "paused": False, "capacity": {}, "window_open": False, "source": "",
+             "partial": False, "sector_breadth": {}, "leaders": [], "ftse_20d": 0.0, "breadth_pct": None, "seconds": 0.0,
+             "backfilled": 0, "evidence_ready": False}
+    t_start = time.time()
     ml_bundle = get_ml_model()
     if ml_bundle is None:
-        st.session_state["scan_stats"] = {"error": "ML model file not found"}
+        stats["error"] = "The AI model file wasn't found, so picks are paused (nothing is guessed)."
+        st.session_state["scan_stats"] = stats
+        return pd.DataFrame(), False
+    if engineer_features is None:
+        stats["error"] = "The feature_engine module wasn't found, so the AI can't score shares. Picks are paused (nothing is guessed)."
+        st.session_state["scan_stats"] = stats
         return pd.DataFrame(), False
 
     feature_cols = ml_bundle['feature_cols']
+    try:
+        stats["backfilled"] = backfill_trade_context()
+    except Exception:
+        stats["backfilled"] = 0
     closed_df = load_closed_trades_df()
     check_and_auto_retrain_model(feature_cols, closed_df)
     ml_bundle = get_ml_model() or ml_bundle
     feature_cols = ml_bundle['feature_cols']
     calibrate, cal_info = build_calibrator(closed_df)
     st.session_state["cal_info"] = cal_info
+    evidence = build_evidence_model(closed_df)
+    st.session_state["evidence_model"] = evidence
+    stats["evidence_ready"] = bool(evidence.get("ready"))
 
     now_lon = london_now()
     today_date = now_lon.date()
     market_open = is_lse_market_open()
     window_open = is_entry_window_open()
+    stats["window_open"] = window_open
 
     active_held = get_currently_active_tickers()
     active_sectors = get_active_sector_exposure()
@@ -1779,78 +2877,118 @@ def run_predictions():
     cooldown_tickers = get_recent_cooldown_tickers()
     macro_regime = get_cross_asset_macro_regime()
     entries_paused = is_market_stress(macro_regime)
-    capacity = get_portfolio_capacity()
+    stats["paused"] = entries_paused
+    stats["capacity"] = get_portfolio_capacity()
 
-    stats = {"scanned": 0, "no_data": 0, "illiquid": 0, "rns_blocked": 0, "sector_blocked": 0, "model_errors": 0,
-             "paused": entries_paused, "capacity": capacity, "window_open": window_open, "logged": 0}
+    universe, uni_sectors, source = get_uk_universe()
+    stats["listed"], stats["source"] = len(universe), source
+    box = get_market_box()
+    quiet_seen = box.setdefault("quiet_seen", {})
+    ttl_for = lambda t: QUIET_TTL_SEC if (time.time() - quiet_seen.get(t, 0.0)) < QUIET_TTL_SEC else SWEEP_TTL_SEC
+    prog = st.progress(0, text=f"Downloading prices for {len(universe):,} UK shares...")
+    def _tick(done, total):
+        try:
+            prog.progress(min(1.0, done / max(1, total)), text=f"Downloading prices: {done:,} of {total:,} still needed")
+        except Exception:
+            pass
+    complete = prefetch_histories(universe, "120d", ttl=ttl_for, workers=SCAN_WORKERS, progress=_tick, time_budget=SCAN_TIME_BUDGET_SEC)
+    stats["partial"] = not complete
 
-    full_universe = [
-        t for t in get_live_lse_universe()
-        if t not in active_held and t not in cooldown_tickers and peek_sector(t) not in saturated_sectors
-    ]
-    if not full_universe:
-        st.session_state["scan_stats"] = stats
-        return pd.DataFrame(), False
+    ftse_series = get_ftse_close_series()
+    try:
+        stats["ftse_20d"] = round((float(ftse_series.iloc[-1]) / float(ftse_series.iloc[-21]) - 1.0) * 100.0, 2) if len(ftse_series) > 21 else 0.0
+    except Exception:
+        stats["ftse_20d"] = 0.0
 
-    scan_chunk = random.sample(full_universe, min(35, len(full_universe)))
+    breadth, leaders, candidates = {}, [], []
+    for ticker in universe:
+        df = peek_history(ticker, "120d")
+        if df.empty:
+            stats["no_data"] += 1
+            continue
+        stats["priced"] += 1
+        try:
+            code, info = analyse_share(ticker, df, today_date, market_open, ftse_series)
+        except Exception:
+            stats["model_errors"] += 1
+            continue
+        if code != "ok":
+            stats[code] += 1
+            if code == "illiquid":
+                quiet_seen[ticker] = time.time()
+            continue
+        quiet_seen.pop(ticker, None)
+        stats["scanned"] += 1
+        sector = SECTOR_MAP.get(ticker) or uni_sectors.get(ticker) or peek_sector(ticker) or "Unclassified"
+        b = breadth.setdefault(sector, [0, 0])
+        b[1] += 1
+        if info["ctx"].get("uptrend"):
+            stats["uptrend"] += 1
+            b[0] += 1
+        if "rs20" in info["ctx"]:
+            leaders.append((float(info["ctx"]["rs20"]), ticker, sector))
+        if ticker in active_held or ticker in cooldown_tickers or sector in saturated_sectors:
+            stats["held"] += 1
+            continue
+        try:
+            p_raw, _ = _model_prob(ml_bundle, feature_cols, info["df_model"])
+        except Exception:
+            stats["model_errors"] += 1
+            continue
+        base_conf = int(min(95, max(25, round(calibrate(max(0.01, min(0.99, p_raw))) * 100.0))))
+        if base_conf < MIN_QUALIFY_CONFIDENCE - DEEP_CHECK_MARGIN:
+            stats["low_score"] += 1
+            continue
+        candidates.append((base_conf, ticker))
+    breadth_pct = round(stats["uptrend"] / stats["scanned"] * 100.0, 1) if stats["scanned"] else None
+    stats["breadth_pct"] = breadth_pct
+    stats["sector_breadth"] = {k: (v[0], v[1]) for k, v in breadth.items()}
+    stats["leaders"] = [(t, sec, round(rs, 1)) for rs, t, sec in sorted(leaders, reverse=True)[:8]]
+
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+    stats["candidates"] = len(candidates)
+    finalists = [t for _, t in candidates[:MAX_DEEP_CHECKS]]
+    stats["low_score"] += max(0, len(candidates) - len(finalists))
+    if finalists:
+        prog.progress(1.0, text=f"Double-checking the best {len(finalists)} shares with fresh prices...")
+        prefetch_histories(finalists, "120d", ttl=FRESH_PRICE_TTL_SEC, workers=6)
 
     results = []
-    lgb_model = ml_bundle['lgb']
-    cb_model = ml_bundle['catboost']
-
-    prog = st.progress(0, text=f"Downloading price history for {len(scan_chunk)} UK equities in parallel...")
-    prefetch_histories(scan_chunk, "120d")
-
-    for i, ticker in enumerate(scan_chunk):
+    for ticker in finalists:
         try:
-            df = get_history_fast(ticker, "120d")
-            if df.empty or engineer_features is None:
-                stats["no_data"] += 1
+            df = peek_history(ticker, "120d", max_age=FRESH_PRICE_MAX_AGE_SEC)
+            if df.empty:
+                stats["stale"] += 1                          # no fresh price -> never buy on an old one
                 continue
-
-            dates = _bar_dates(df)
-            live_bar_today = (dates[-1] == today_date)
-            partial_bar = live_bar_today and market_open
-            live_price = float(df["Close"].iloc[-1])
-            df_model = df.iloc[:-1] if partial_bar else df          # model sees COMPLETED bars only (train/inference parity)
-            if len(df_model) < 55:
-                stats["no_data"] += 1
+            code, info = analyse_share(ticker, df, today_date, market_open, ftse_series)
+            if code != "ok":
+                stats[code] += 1
                 continue
-
-            recent = df_model.tail(20)
-            avg_turnover = float((recent["Close"] * recent["Volume"]).mean() / 100.0)
-            if (not math.isfinite(avg_turnover)) or live_price < MIN_PRICE_P or avg_turnover < MIN_AVG_TURNOVER_GBP:
-                stats["illiquid"] += 1
-                continue
-
-            sector = get_ticker_sector(ticker)
+            live_price, df_model, dates = info["live_price"], info["df_model"], info["dates"]
+            avg_turnover = info["avg_turnover"]
+            ctx = dict(info["ctx"])
+            if breadth_pct is not None:
+                ctx["breadth"] = breadth_pct
+            sector = SECTOR_MAP.get(ticker) or uni_sectors.get(ticker) or peek_sector(ticker) or "Unclassified"
+            if sector == "Unclassified":
+                sector = get_ticker_sector(ticker, resolve=True)
             if sector in saturated_sectors:
                 stats["sector_blocked"] += 1
                 continue
-
-            d2 = df_model.copy()
-            d2.reset_index(inplace=True)
-            feats = engineer_features(d2)
-            if feats.empty:
-                stats["no_data"] += 1
-                continue
-            latest = feats.iloc[-1:].copy()
-
+            p_raw, latest = _model_prob(ml_bundle, feature_cols, df_model)
             rns_data = evaluate_rns_nlp_sentiment(ticker)
-            if "Dilution" in rns_data['status']:
+            blocked = "Dilution" in rns_data["status"]
+            if blocked:
                 stats["rns_blocked"] += 1
-                continue
-
-            p1 = float(lgb_model.predict_proba(latest[feature_cols])[:, 1][0])
-            p2 = float(cb_model.predict_proba(latest[feature_cols])[:, 1][0])
-            blended = max(0.01, min(0.99, (0.5 * p1 + 0.5 * p2) + rns_data['delta']))
+            blended = max(0.01, min(0.99, p_raw + rns_data['delta']))
 
             atr = float(latest['atr_14'].values[0])
-            atr_pct = round((atr / live_price) * 100.0, 2) if live_price > 0 else 0.0
-
-            target = live_price + (1.8 * atr)
-            stop = live_price - (1.2 * atr)
-            gross_return_pct = ((target - live_price) / live_price) * 100.0 if live_price > 0 else 0.0
+            if not math.isfinite(atr) or atr <= 0:
+                atr = live_price * float(ctx.get("atr_pct", 2.0)) / 100.0
+            atr_pct = round((atr / live_price) * 100.0, 2)
+            target = round(live_price + (1.8 * atr), 2)
+            stop = round(live_price - (1.2 * atr), 2)
+            gross_return_pct = ((target - live_price) / live_price) * 100.0
 
             spread_pct = estimate_spread_pct(ticker, avg_turnover)
             commission = get_commission_gbp()
@@ -1861,60 +2999,66 @@ def run_predictions():
             base_confidence = int(min(95, max(25, round(calibrate(blended) * 100.0))))
             learner = get_self_learning_adjustment(ticker, atr_pct, closed_df)
             macro_delta, macro_note = compute_macro_lead_lag_adjustment(ticker, sector, macro_regime)
-
-            total_delta = learner["delta"] + macro_delta
+            ev_delta, ev_notes = evidence_adjustment(evidence, ctx)
+            total_delta = int(learner["delta"] + macro_delta + ev_delta)
             final_confidence = int(min(98, max(25, base_confidence + total_delta)))
+            ev_pct = expected_value_pct(final_confidence / 100.0, live_price, target, stop, friction_pct)
 
-            shares = max(1, int((POSITION_SIZE_GBP * 100) / live_price)) if live_price > 0 else 1
-            is_qualified = (final_confidence >= MIN_QUALIFY_CONFIDENCE) and (net_return_pct >= MIN_NET_RETURN_PCT)
+            shares = max(1, int((POSITION_SIZE_GBP * 100) / live_price))
+            capital = round(shares * live_price / 100.0, 2)            # what those shares really cost (£)
+            is_qualified = (not blocked and final_confidence >= MIN_QUALIFY_CONFIDENCE and net_return_pct >= MIN_NET_RETURN_PCT and ev_pct > MIN_EV_PCT)
+            if blocked:
+                reason = f"Bad news: {rns_data['nlp_tags']}"
+            elif final_confidence < MIN_QUALIFY_CONFIDENCE:
+                reason = f"AI confidence {final_confidence}% is below the {MIN_QUALIFY_CONFIDENCE}% needed"
+            elif net_return_pct < MIN_NET_RETURN_PCT:
+                reason = f"Possible profit after costs is only {net_return_pct:+.1f}% (needs {MIN_NET_RETURN_PCT:.0f}%+)"
+            elif ev_pct <= MIN_EV_PCT:
+                reason = f"Expected to lose {ev_pct:+.2f}% on average once costs are counted"
+            else:
+                reason = "Passed every check"
 
             raw_feature_map = {c: float(latest[c].values[0]) for c in feature_cols if c in latest.columns}
             feature_snapshot = {
-                "raw_features": raw_feature_map,
-                "atr_pct": atr_pct,
-                "raw_prob": round(blended, 4),
-                "base_ml_conf": base_confidence,
-                "learner_delta": learner["delta"],
-                "macro_delta": macro_delta,
-                "sector": sector,
-                "spread_pct": spread_pct,
-                "commission_gbp": commission,
-                "friction_pct": round(get_sdrt_pct(ticker) + spread_pct, 3),   # SDRT + spread (commission stored separately)
-                "avg_turnover_gbp": round(avg_turnover, 0),
-                "tax_regime": tax_regime,
-                "nlp_tags": rns_data["nlp_tags"],
-                "entry_bar": str(dates[-1]),
+                "raw_features": raw_feature_map, "atr_pct": atr_pct, "raw_prob": round(blended, 4),
+                "base_ml_conf": base_confidence, "learner_delta": learner["delta"], "macro_delta": macro_delta,
+                "evidence_delta": ev_delta, "ev_pct": ev_pct, "ctx": ctx, "sector": sector, "spread_pct": spread_pct,
+                "commission_gbp": commission, "friction_pct": round(get_sdrt_pct(ticker) + spread_pct, 3),
+                "avg_turnover_gbp": round(avg_turnover, 0), "tax_regime": tax_regime, "nlp_tags": rns_data["nlp_tags"],
+                "entry_bar": str(df_model.index[-1].date()) if hasattr(df_model.index[-1], "date") else str(dates[-1]),
                 "cal_mode": cal_info["mode"],
             }
-
-            stats["scanned"] += 1
+            note_parts = [learner["reason"], f"Macro: {macro_note}"]
+            if ev_notes:
+                note_parts.append("Evidence: " + "; ".join(ev_notes))
             results.append({
                 "Ticker": ticker, "Company": ticker, "Sector": sector, "Tax Regime": tax_regime,
                 "Friction": f"-{friction_pct:.2f}%", "Price (p)": round(live_price, 2),
                 "Expected Return": f"+{net_return_pct}% Net", "ReturnNum": net_return_pct,
+                "Expected value": ev_pct, "Vs FTSE (20d)": ctx.get("rs20"),
                 "Est. Time to Target": "3-7 Days", "Recommended Shares": f"{shares} shares",
-                "Total Cost (£)": "£500", "Capital": POSITION_SIZE_GBP,
-                "Target (p)": round(target, 2), "Stop Loss (p)": round(stop, 2),
+                "Total Cost (£)": gbp(capital), "Capital": capital,
+                "Target (p)": target, "Stop Loss (p)": stop,
                 "Base ML": f"{base_confidence}%", "Learner Delta": f"{total_delta:+d}%",
-                "Learner Note": f"{learner['reason']} | Macro: {macro_note}",
+                "Learner Note": " | ".join(note_parts),
                 "AI Win Confidence": f"{final_confidence}%", "Adjusted Score": final_confidence,
                 "RNS": rns_data['status'], "RNSHeadline": rns_data['headline'],
                 "Liquidity (£m/day)": round(avg_turnover / 1e6, 1),
-                "Loggable": bool(live_bar_today and window_open),
-                "FeaturesDict": feature_snapshot, "Qualified": is_qualified
+                "Loggable": bool(info["live_bar_today"] and window_open),
+                "FeaturesDict": feature_snapshot, "Qualified": is_qualified, "Rejection Reason": reason,
             })
         except Exception:
             stats["model_errors"] += 1
-        finally:
-            prog.progress((i + 1) / len(scan_chunk))
-
     prog.empty()
+    stats["deep"] = len(results)
+    stats["seconds"] = round(time.time() - t_start, 1)
     if not results:
         st.session_state["scan_stats"] = stats
         return pd.DataFrame(), False
 
-    df_out = pd.DataFrame(results).sort_values(by=["Qualified", "Adjusted Score", "ReturnNum"], ascending=[False, False, False]).reset_index(drop=True)
+    df_out = pd.DataFrame(results).sort_values(by=["Qualified", "Expected value", "Adjusted Score"], ascending=[False, False, False]).reset_index(drop=True)
     qualified_only = df_out[df_out["Qualified"] == True].copy().reset_index(drop=True)
+    stats["qualified"] = int(len(qualified_only))
 
     if not qualified_only.empty and not entries_paused:
         for _, sig in qualified_only.iterrows():
@@ -1926,7 +3070,7 @@ def run_predictions():
                 stats["logged"] += 1
 
     st.session_state["scan_stats"] = stats
-    return qualified_only, not qualified_only.empty
+    return df_out, not qualified_only.empty
 
 # ==============================================================================
 # 9. PERFORMANCE ANALYTICS (HONEST NUMBERS)
@@ -1934,7 +3078,7 @@ def run_predictions():
 def prep_perf_frame(df: pd.DataFrame, cap_col: str, is_option: bool = False) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
-    d = df[df["status"].astype(str).str.upper() != "ACTIVE"].copy()
+    d = df[df["status"].apply(classify_outcome) != "ACTIVE"].copy()
     if d.empty:
         return d
     d["cap"] = pd.to_numeric(d[cap_col], errors="coerce").fillna(POSITION_SIZE_GBP)
@@ -2038,7 +3182,7 @@ footer{visibility:hidden;}
 .neg{color:var(--bad);}
 .sub2{font-size:.78rem;opacity:.72;}
 .rbar{position:relative;height:10px;border-radius:999px;background:linear-gradient(90deg,rgba(220,38,38,.55),rgba(217,119,6,.45),rgba(22,163,74,.6));margin:18px 0 4px;}
-.rbar.c{margin:12px 0 4px;height:8px;}
+.rbar.c{margin:12px 0 12px;height:8px;}
 .rdot{position:absolute;top:-4px;width:18px;height:18px;border-radius:50%;background:#fff;border:3px solid var(--a1);transform:translateX(-50%);box-shadow:0 2px 8px rgba(0,0,0,.35);}
 .rbar.c .rdot{top:-4px;width:16px;height:16px;}
 .rtick{position:absolute;top:-3px;width:2px;height:16px;background:rgba(128,128,128,.9);transform:translateX(-50%);}
@@ -2062,9 +3206,29 @@ footer{visibility:hidden;}
 .lesson{padding:12px 16px;margin-bottom:8px;font-size:.9rem;}
 .disc{font-size:.76rem;opacity:.6;text-align:center;margin:30px 0 6px;}
 [data-testid="stMetric"]{border:1px solid var(--line);border-radius:14px;padding:12px 14px;background:var(--soft);}
-button[data-baseweb="tab"]{font-weight:700;font-size:1rem;}
+[data-baseweb="tab-list"]{gap:6px;flex-wrap:wrap;}
+button[data-baseweb="tab"],button[data-testid="stTab"],.stTabs button[role="tab"]{height:auto !important;padding:12px 18px !important;border-radius:12px 12px 0 0;}
+button[data-baseweb="tab"],button[data-baseweb="tab"] p,button[data-baseweb="tab"] div,button[data-baseweb="tab"] span,
+button[data-testid="stTab"] p,.stTabs button[role="tab"] p{font-size:1.15rem !important;font-weight:700 !important;line-height:1.3 !important;}
+button[data-baseweb="tab"][aria-selected="true"],button[data-testid="stTab"][aria-selected="true"]{background:var(--soft);}
+.mini.opt{border-left:4px solid var(--a1);}
+.brief{border:1px solid var(--line);border-radius:20px;padding:18px 22px;margin:4px 0 14px;background:linear-gradient(120deg,rgba(99,102,241,.10),rgba(6,182,212,.08));}
+.brief .bh{font-size:.78rem;font-weight:800;letter-spacing:.06em;text-transform:uppercase;opacity:.7;margin-bottom:6px;}
+.brief .bt{font-size:1.02rem;line-height:1.65;}
+.tags{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;}
+.funnel{display:flex;flex-direction:column;gap:7px;margin:6px 0 12px;}
+.fn{display:grid;grid-template-columns:210px 1fr 80px;gap:10px;align-items:center;font-size:.86rem;}
+.fn .t{height:22px;border-radius:8px;background:rgba(128,128,128,.12);overflow:hidden;}
+.fn .f{height:100%;border-radius:8px;background:linear-gradient(90deg,var(--a1),var(--a2));opacity:.9;}
+.fn .f.last{background:linear-gradient(90deg,#16a34a,#4ade80);}
+.fn .c{text-align:right;font-weight:800;font-variant-numeric:tabular-nums;}
+.gauge{height:14px;border-radius:999px;background:linear-gradient(90deg,rgba(220,38,38,.6),rgba(217,119,6,.5) 50%,rgba(22,163,74,.65));position:relative;margin:12px 0 6px;}
+.gauge .needle{position:absolute;top:-5px;width:6px;height:24px;border-radius:3px;background:#fff;border:2px solid #111;transform:translateX(-50%);box-shadow:0 2px 8px rgba(0,0,0,.35);}
+.leaders{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 4px;}
+.ld{border:1px solid var(--line);border-radius:12px;padding:7px 11px;background:var(--soft);font-size:.84rem;}
+.ld b{font-weight:800;margin-right:6px;}
 .stButton>button{border-radius:12px;font-weight:600;}
-@media(max-width:700px){.hb{grid-template-columns:96px 1fr 80px;}.sc .val{font-size:1.8rem;}.hero h1{font-size:1.5rem;}}
+@media(max-width:700px){button[data-baseweb="tab"],button[data-testid="stTab"]{padding:9px 11px !important;}button[data-baseweb="tab"],button[data-baseweb="tab"] p,button[data-baseweb="tab"] div,button[data-baseweb="tab"] span,button[data-testid="stTab"] p,.stTabs button[role="tab"] p{font-size:1rem !important;}.fn{grid-template-columns:120px 1fr 56px;font-size:.78rem;}.hb{grid-template-columns:96px 1fr 80px;}.sc .val{font-size:1.8rem;}.hero h1{font-size:1.5rem;}}
 """
 
 def inject_css():
@@ -2109,6 +3273,76 @@ def hbars_html(rows: list) -> str:
         cls = "pos" if v >= 0 else "neg"
         parts.append(f'<div class="hb"><div>{esc(label)}</div><div class="t"><div class="f {cls}" style="width:{w:.0f}%"></div></div><div><b>{esc(txt)}</b></div></div>')
     return _collapse('<div class="hbars">' + "".join(parts) + '</div>')
+
+def funnel_html(rows: list) -> str:
+    rows = [(lbl, int(max(0, n or 0))) for lbl, n in rows]
+    top = max([n for _, n in rows] + [1])
+    parts = []
+    for i, (lbl, n) in enumerate(rows):
+        w = 0.0 if n == 0 else max(1.5, n / top * 100.0)
+        last = " last" if i == len(rows) - 1 else ""
+        parts.append(f'<div class="fn"><div>{esc(lbl)}</div><div class="t"><div class="f{last}" style="width:{w:.1f}%"></div></div><div class="c">{n:,}</div></div>')
+    return _collapse('<div class="funnel">' + "".join(parts) + '</div>')
+
+def breadth_word(pct: float) -> str:
+    pct = round(float(pct))
+    if pct >= 60:
+        return "Rising broadly"
+    if pct >= 45:
+        return "Mixed"
+    if pct >= 30:
+        return "Mostly weak"
+    return "Falling broadly"
+
+def gauge_html(pct: float) -> str:
+    p = max(0.0, min(100.0, float(pct)))
+    return _collapse(f'<div class="gauge"><div class="needle" style="left:{p:.1f}%"></div></div>'
+                     '<div class="rlab" style="margin-bottom:14px"><span>Most shares falling</span><span>Half and half</span><span>Most shares rising</span></div>')
+
+def sector_heat_html(breadth: dict, min_n: int = 5, top: int = 8) -> str:
+    rows = [(sec, up / n * 100.0, up, n) for sec, (up, n) in breadth.items() if n >= min_n and sec != "Unclassified"]
+    rows.sort(key=lambda x: (-x[1], -x[3]))
+    if not rows:
+        return ""
+    parts = []
+    for sec, pct, up, n in rows[:top]:
+        cls = "pos" if pct >= 50 else "neg"
+        parts.append(f'<div class="hb"><div>{esc(sec)}</div><div class="t"><div class="f {cls}" style="width:{max(3.0, pct):.0f}%"></div></div>'
+                     f'<div><b>{pct:.0f}% rising</b> <span class="sub2">of {n}</span></div></div>')
+    return _collapse('<div class="hbars">' + "".join(parts) + '</div>')
+
+def leaders_html(leaders: list) -> str:
+    if not leaders:
+        return ""
+    chips = [f'<span class="ld"><b>{esc(str(t).replace(".L", ""))}</b><span class="{"pos" if rs >= 0 else "neg"}">{rs:+.1f}%</span> <span class="sub2">{esc(sec)}</span></span>'
+             for t, sec, rs in leaders]
+    return _collapse('<div class="leaders">' + "".join(chips) + '</div>')
+
+def option_short_name(contract) -> str:
+    return str(contract).split(" · ")[0]
+
+def option_mini_html(o) -> str:
+    entry, target, stop = _num(o["entry_premium"]), _num(o["target_premium"]), _num(o["stop_loss_premium"])
+    live, pnl = _num(o["current_option_price"]), _num(o["pnl_pct"])
+    real = is_real_option(o["option_contract"])
+    unit = "$" if real else ""
+    src = '<span class="tag good">Real US quote</span>' if real else '<span class="tag warn">Old practice price</span>'
+    cls = "pos" if pnl >= 0 else "neg"
+    return _collapse(f"""
+    <div class="mini opt">
+      <div class="tags"><span class="tag info">Option</span>{src}</div>
+      <div class="row"><span class="mtk">{esc(option_short_name(o['option_contract']))}</span><span class="mp {cls}">{pnl:+.2f}%</span></div>
+      {price_bar_html(entry, target, stop, live, compact=True)}
+      <div class="sub2">bought {unit}{entry:,.2f} · now {unit}{live:,.2f} · cost {gbp(o['total_capital'])} · since {esc(str(o['date_key']))}</div>
+    </div>
+    """)
+
+def _fmt_pct(v) -> str:
+    try:
+        v = float(v)
+        return f"{v:+.1f}%" if math.isfinite(v) else "–"
+    except Exception:
+        return "–"
 
 def price_bar_html(entry: float, target: float, stop: float, live: float, compact: bool = False) -> str:
     span = target - stop
@@ -2163,28 +3397,29 @@ def signal_card_html(rank, row, loggable) -> str:
       <div class="pnl pos" style="text-align:left;margin-top:8px">{esc(str(row['Expected Return']).replace(' Net', ''))}</div><div class="sub2">possible profit if it reaches the goal (after fees &amp; tax)</div>
       {price_bar_html(float(row['Price (p)']), float(row['Target (p)']), float(row['Stop Loss (p)']), float(row['Price (p)']))}
       <div class="grid2">
-        <div><b>Shares</b>{esc(row['Recommended Shares'])}</div><div><b>Money in</b>£500</div>
+        <div><b>Shares</b>{esc(row['Recommended Shares'])}</div><div><b>Money in</b>{gbp(row.get('Capital', POSITION_SIZE_GBP))}</div>
         <div><b>Easy to trade</b>£{row.get('Liquidity (£m/day)', 0)}m a day</div><div><b>Costs</b>{esc(row['Friction'])}</div>
+        <div><b>Worth on average</b>{_fmt_pct(row.get('Expected value'))} after costs</div><div><b>Vs FTSE 100</b>{_fmt_pct(row.get('Vs FTSE (20d)'))} (20 days)</div>
       </div>
       <div class="note">🧠 {esc(row['Learner Note'])}</div>
     </div>
     """)
 
 # ---------- charts ----------
-def show_fig(fig):
+def show_fig(fig, key=None):
     if not PLOTLY_OK or fig is None:
         return
     try:
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, width="stretch", key=key)
     except TypeError:
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key=key)
 
 def _base_layout(fig, height=320, title=None):
     fig.update_layout(height=height, margin=dict(l=10, r=10, t=44 if title else 16, b=10), title=title,
                       legend=dict(orientation="h", y=1.14), hovermode="x unified")
     return fig
 
-def chart_cumulative_pnl(perf_df: pd.DataFrame, title: str):
+def chart_cumulative_pnl(perf_df: pd.DataFrame, title: str, key: str = None):
     if perf_df.empty:
         return
     x = [str(d) for d in perf_df["exit_date"]]
@@ -2196,18 +3431,18 @@ def chart_cumulative_pnl(perf_df: pd.DataFrame, title: str):
     fig = go.Figure(go.Scatter(x=x, y=cum, mode="lines+markers", line=dict(color=colour, width=3, shape="hv"),
                                fill="tozeroy", name="Running profit/loss (£)",
                                hovertemplate="%{x}<br>£%{y:,.2f}<extra></extra>"))
-    show_fig(_base_layout(fig, 320, title))
+    show_fig(_base_layout(fig, 320, title), key=key)
 
-def chart_outcome_donut(perf: dict):
+def chart_outcome_donut(perf: dict, title: str = "How your trades ended", key: str = None):
     labels = ["Hit the goal", "Safety exit", "Sold with no loss", "Time ran out"]
     vals = [perf["wins"], perf["losses"], perf["be"], perf["expired"]]
     if not PLOTLY_OK:
-        st.bar_chart(pd.DataFrame({"trades": vals}, index=labels))
+        st.bar_chart(pd.DataFrame({title: vals}, index=labels))
         return
     fig = go.Figure(go.Pie(labels=labels, values=vals, hole=0.62, sort=False,
                            marker=dict(colors=["#16a34a", "#dc2626", "#d97706", "#64748b"]), textinfo="label+percent"))
-    fig.update_layout(height=320, margin=dict(l=10, r=10, t=44, b=10), title="How your trades ended", showlegend=False)
-    show_fig(fig)
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=44, b=10), title=title, showlegend=False)
+    show_fig(fig, key=key)
 
 def chart_pnl_hist(perf_df: pd.DataFrame):
     if perf_df.empty:
@@ -2405,15 +3640,21 @@ def current_streak(perf_df: pd.DataFrame) -> tuple:
 # ==============================================================================
 inject_css()
 
+mkt_state = get_market_state()
 market_is_open = is_lse_market_open()
 
 st.sidebar.header("⚙️ Settings")
+st.sidebar.caption("🔭 Looks at **every FTSE 350 share plus liquid AIM shares** each time.")
 st.sidebar.number_input("Broker fee per trade (£)", min_value=0.0, max_value=25.0, value=DEFAULT_COMMISSION_GBP, step=0.5, key="commission_gbp",
-                        help="Charged when you buy and again when you sell. Included in every profit/loss number you see.")
+                        help="Charged when you buy and again when you sell. Included in every profit/loss number you see. Many UK apps charge £0 — "
+                             "set yours, because on a £500 trade a £3 fee each way costs 1.2%, which decides which picks are worth it.")
 broker_mode = "paper trade"      # everything here is pretend money
-auto_mode = st.sidebar.toggle("Auto-refresh", value=market_is_open, help="Keeps checking your trades while the market is open.")
-refresh_interval_sec = st.sidebar.selectbox("Check every", [300, 600, 3600], format_func=lambda x: f"{x//60} minutes")
-show_sim_options = st.sidebar.toggle("Show option paper trades in My Trades", value=True)
+if "auto_loop_toggle" not in st.session_state or st.session_state.get("last_market_open_state") != market_is_open:
+    st.session_state["auto_loop_toggle"] = market_is_open
+    st.session_state["last_market_open_state"] = market_is_open
+auto_mode = st.sidebar.toggle("Auto-refresh", key="auto_loop_toggle", help="Turns on by itself when the London market opens and off when it closes (including bank holidays).")
+refresh_interval_sec = st.sidebar.selectbox("Check every", [300, 900, 3600], format_func=lambda x: f"{x//60} minutes",
+                                            help="Open trades are checked every time. Prices for the whole market are re-downloaded at most every 15 minutes; finalists always get a fresh price.")
 
 with st.sidebar.expander("🛡️ Built-in safety rules"):
     st.markdown(
@@ -2423,10 +3664,18 @@ with st.sidebar.expander("🛡️ Built-in safety rules"):
         f"- Once a trade is about **{int(BREAKEVEN_TRIGGER_RATIO * 100)}%** of the way to its goal, its safety exit moves up so it can't lose money\n"
         f"- A stock isn't bought again for **{COOLDOWN_CALENDAR_DAYS} days** after you sell it\n"
         f"- Buying only **{ENTRY_WINDOW_START.strftime('%H:%M')}–{ENTRY_WINDOW_END.strftime('%H:%M')}** London time, using real prices\n"
-        f"- Skips tiny or hard-to-trade shares\n"
+        f"- Skips shares under {MIN_PRICE_P:.0f}p, trading under £{MIN_AVG_TURNOVER_GBP / 1e6:.0f}m a day, suspended, or swinging more than {MAX_ATR_PCT:.0f}% on a normal day\n"
+        f"- Only buys when a pick is **expected to make money after all costs**\n"
         f"- Buying pauses if the UK market falls sharply in a week\n"
+        f"- Shut at weekends and on UK bank holidays; closes at 12:30 on Christmas Eve and New Year's Eve\n"
         f"- Every result includes UK stamp duty, spread and your broker fee"
     )
+
+with st.sidebar.expander("🏖️ Market holidays"):
+    for d_, name_ in upcoming_holidays(5):
+        st.write(f"**{datetime.strptime(d_, '%Y-%m-%d').strftime('%a %d %b %Y')}** — {name_}")
+    _hb = get_market_box().get("holidays")
+    st.caption("From gov.uk's official list." if _hb and _hb[2] else "gov.uk isn't reachable right now, so these come from the standard bank-holiday rules.")
 
 loop_tick = 0
 if auto_mode and st_autorefresh:
@@ -2449,6 +3698,16 @@ with st.sidebar.expander("🩺 System health"):
     st.write(f"{'🟢' if supabase else '🔴'} Online backup {'connected' if supabase else 'not connected'}")
     st.write(f"{'🟢' if get_ml_model() is not None else '🔴'} AI model {'loaded' if get_ml_model() is not None else 'missing'}")
     st.write(f"🕒 Last check: {st.session_state.get('last_audit_str', '-')}")
+    _ub = get_market_box().get("universe")
+    if _ub:
+        st.write(f"{'🟢' if _ub[4] else '🟠'} Share list: {len(_ub[1]):,} shares — {_ub[3]}")
+    jc, hi_ = journal_counts(), st.session_state.get("hydrate_info", {})
+    st.write(f"📒 Journal: {jc['total']} share trades — {jc['open']} open, {jc['closed']} finished · {jc['opt_total']} option ideas ({jc['opt_open']} open)")
+    if supabase:
+        st.write(f"☁️ Backup: {hi_.get('remote', 0)} trades online ({hi_.get('remote_active', 0)} open) · last sync added {hi_.get('restored', 0)}, "
+                 f"{hi_.get('kept_local', 0)} already up to date here, {hi_.get('bad_rows', 0)} unreadable")
+    if not st_autorefresh:
+        st.caption("Auto-refresh library not installed — use “Find new picks now” to update.")
 
 if "retrain_notice" in st.session_state:
     st.sidebar.success(st.session_state["retrain_notice"])
@@ -2464,7 +3723,6 @@ if st.sidebar.button("🚪 Log Out", width="stretch"):
     st.session_state["password_correct"] = False
     st.rerun()
 
-market_status = "OPEN" if market_is_open else "CLOSED"
 macro_bar = get_cross_asset_macro_regime()
 
 def macro_chip(label, v):
@@ -2473,15 +3731,25 @@ def macro_chip(label, v):
     return f'<span class="chip {cls}">{esc(label)} {arrow} {v:+.1f}%</span>'
 
 stress_chip = '<span class="chip down">⛔ Buying paused — UK market fell sharply this week</span>' if is_market_stress(macro_bar) else ""
+if not mkt_state["trading_day"]:
+    mkt_chip = f'<span class="chip down">🏖️ {esc(mkt_state["reason"])} · opens {esc(next_open_text())}</span>'
+elif market_is_open:
+    mkt_chip = '<span class="chip up">UK market OPEN</span>' + (f'<span class="chip">⏰ {esc(mkt_state["reason"])}</span>' if mkt_state.get("half_day") else "")
+else:
+    mkt_chip = f'<span class="chip down">UK market CLOSED · opens {esc(next_open_text())}</span>'
+feed_chip = '<span class="chip down">⚠️ Price feed problem</span>' if st.session_state.get("price_feed_problem") else ""
+_ps = st.session_state.get("scan_stats", {}) or {}
+pulse_chip = (f'<span class="chip {"up" if (_ps.get("breadth_pct") or 0) >= 50 else "down"}">🔭 {_ps["scanned"]:,} shares checked · {(_ps.get("breadth_pct") or 0):.0f}% rising</span>'
+              if _ps.get("scanned") else "")
 st.markdown(_collapse(f"""
 <div class="hero">
   <h1>⚡ ALPHA-LSE Quant Terminal</h1>
   <div class="sub">An AI that picks UK shares and practises trading them with pretend money — so you can see if it really works.</div>
   <div class="chips">
-    <span class="chip {'up' if market_is_open else 'down'}">UK market {market_status}</span>
+    {mkt_chip}
     <span class="chip {'up' if supabase else 'down'}">{'☁️ Saved online' if supabase else '☁️ Not saved online'}</span>
     {macro_chip('UK market this week', macro_bar['ftse_5d'])}{macro_chip('Oil', macro_bar['brent_5d'])}{macro_chip('Copper', macro_bar['copper_5d'])}{macro_chip('£ vs $', macro_bar['gbpusd_5d'])}
-    {stress_chip}
+    {stress_chip}{feed_chip}{pulse_chip}
     <span class="chip">Last checked {esc(st.session_state.get('last_audit_str', '-'))}</span>
   </div>
 </div>
@@ -2490,18 +3758,18 @@ st.markdown(_collapse(f"""
 with st.expander("💡 New here? 30-second guide"):
     st.markdown(
         "- This app **pretends to buy** UK shares, about **£500 each**. It's practice — no real money is used.\n"
+        "- Every time it checks, it looks at **every FTSE 350 share plus liquid AIM shares**, throws out the ones that are hard to trade or risky, and only buys picks that are expected to make money after all costs.\n"
         "- Every pick has a **Goal** (the price to sell at for a profit) and a **Safety exit** (the price to sell at to limit the loss).\n"
         "- When a trade gets about two-thirds of the way to its goal, the safety exit moves up so the trade **can't lose money** any more.\n"
         "- **AI confidence** is how sure the AI is that the goal is reached before the safety exit. It's a rough guide, not a promise.\n"
         "- Every profit/loss number is **after fees and UK stamp duty**.\n"
         "- If neither the goal nor the safety exit is reached, the trade closes after **7 days**.\n"
-        "- The **Overview** tab tells you honestly whether it's making money. The **What the AI Learned** tab shows how it's improving."
+        "- **Today** is your daily briefing: what's open, what it might buy, and how the market looks. **Performance** tells you honestly whether it's making money. **What the AI Learned** shows how it's improving."
     )
 
-tab_home, tab_scanner, tab_journal, tab_learn, tab_options = st.tabs([
-    "🏠 Overview",
-    "🎯 Today's Picks",
-    "📖 My Trades",
+tab_home, tab_perf, tab_learn, tab_options = st.tabs([
+    "☀️ Today",
+    "📈 Performance",
     "🧠 What the AI Learned",
     "🎲 Options"
 ])
@@ -2513,7 +3781,7 @@ if "dispatched_orders" not in st.session_state:
     st.session_state["dispatched_orders"] = set()
 
 def render_cohort(todays_df: pd.DataFrame):
-    cols = st.columns(min(len(todays_df), 3))
+    cols = st.columns(min(len(todays_df), 2))
     for pos_i, (_, t_row) in enumerate(todays_df.iterrows()):
         tkr_sym = str(t_row["ticker"])
         f_meta = _parse_features(t_row.get("features_json"))
@@ -2522,96 +3790,165 @@ def render_cohort(todays_df: pd.DataFrame):
         sec_name = get_trade_sector(tkr_sym, f_meta)
         tax_tag = f_meta.get("tax_regime") or ("AIM (0% SDRT)" if is_aim_exempt(tkr_sym) else "Main (0.5% SDRT)")
         be_active = is_stop_breakeven_protected(float(t_row["entry_price"]), float(t_row["stop_loss"]), tkr_sym)
-        with cols[pos_i % 3]:
+        with cols[pos_i % len(cols)]:
             st.markdown(trade_card_html(
                 pos_i + 1, tkr_sym, sec_name, t_row["status"], float(t_row["entry_price"]), float(t_row["target_price"]),
                 float(t_row["stop_loss"]), float(t_row["latest_price"]), float(t_row["pnl_pct"]), int(t_row["shares"]),
                 float(t_row["capital_allocated"]), base_c + adj, base_c, adj, tax_tag,
                 get_trade_friction_pct(tkr_sym, f_meta), t_row["last_audited"], be_active), unsafe_allow_html=True)
 
-with tab_scanner:
+with tab_home:
+    brief_box = st.container()
     if "flash" in st.session_state:
         st.info(st.session_state.pop("flash"))
+    col_pos, col_picks = st.columns([1.1, 1], gap="large")
+    pos_box = col_pos.container()
+    with col_picks:
 
-    todays_logged_df = get_todays_logged_equities()
-    quota_filled = len(todays_logged_df) >= MAX_DAILY_EQUITY_TRADES
+        todays_logged_df = get_todays_logged_equities()
+        quota_filled = len(todays_logged_df) >= MAX_DAILY_EQUITY_TRADES
 
-    c1, c2, c3, c4 = st.columns([1, 1, 1, 1.2])
-    cap_state = get_portfolio_capacity()
-    c1.metric("Picks today", f"{len(todays_logged_df)} of {MAX_DAILY_EQUITY_TRADES}")
-    c2.metric("Trades open", f"{cap_state['open']} of {MAX_OPEN_POSITIONS}")
-    c3.metric("Money at risk", f"£{cap_state['risk_gbp']:.0f}", help="Roughly what you'd lose if every open trade hit its safety exit.")
-    with c4:
-        st.write("")
+        cap_state = get_portfolio_capacity()
+        sec_title("🎯", "Today's picks", f"{len(todays_logged_df)} of {MAX_DAILY_EQUITY_TRADES} used")
         re_scan = st.button("🔄 Find new picks now", width="stretch", type="primary")
 
-    if is_market_stress(macro_bar):
-        st.error("⛔ The UK market has fallen sharply this week, so buying is paused to protect you. Picks are shown for information only.")
-    elif not cap_state["ok"]:
-        st.warning(f"🧯 {cap_state['reason']}. New buying resumes when some trades close.")
-    elif not is_entry_window_open():
-        st.info("🕗 The market isn't in its buying window (08:30–16:00 London, Mon–Fri). Picks below are a watch-list only, so every purchase is made at a real price.")
+        if not mkt_state["trading_day"]:
+            st.warning(f"🏖️ **The London market is shut today ({mkt_state['reason']}).** Nothing will be bought, and open trades keep the last trading day's prices. Opens {next_open_text()}.")
+        elif is_market_stress(macro_bar):
+            st.error("⛔ The UK market has fallen sharply this week, so buying is paused to protect you. Picks are shown for information only.")
+        elif not cap_state["ok"]:
+            st.warning(f"🧯 {cap_state['reason']}. New buying resumes when some trades close.")
+        elif not is_entry_window_open():
+            st.info(f"🕗 The market isn't in its buying window (08:30–{entry_window_end().strftime('%H:%M')} London on trading days). Picks below are a watch-list only, so every purchase is made at a real price.")
 
-    if quota_filled and not re_scan:
-        st.info(f"🔒 You've used all {MAX_DAILY_EQUITY_TRADES} picks for today. This stops over-trading.")
-        sec_title("📌", "Today's trades")
-        render_cohort(todays_logged_df)
-    else:
-        if re_scan or is_new_loop_tick or "scan_results" not in st.session_state:
-            with st.spinner("Looking through UK shares and checking your open trades..."):
-                if re_scan:
-                    audit_and_reconcile_all_trades()
-                    hydrate_duckdb_from_supabase()
-                    st.session_state["last_audit_str"] = london_now().strftime("%d %b %H:%M")
+        pulse_stale = (time.time() - float(st.session_state.get("scan_epoch", 0.0))) > PULSE_REFRESH_SEC
+        if quota_filled and not re_scan and (is_new_loop_tick and pulse_stale):
+            with st.spinner("Refreshing the market pulse..."):
                 res_df, has_cleared = run_predictions()
                 st.session_state["scan_results"] = res_df
                 st.session_state["has_cleared"] = has_cleared
                 st.session_state["scan_ts"] = london_now().strftime("%H:%M:%S")
-            todays_logged_df = get_todays_logged_equities()
-
-        if not todays_logged_df.empty:
-            with st.expander(f"📌 Already bought today ({len(todays_logged_df)})", expanded=False):
+                st.session_state["scan_epoch"] = time.time()
+        if quota_filled and not re_scan:
+            st.info(f"🔒 You've used all {MAX_DAILY_EQUITY_TRADES} picks for today. This stops over-trading. They're in Your positions.")
+            with st.expander(f"📌 Today's {len(todays_logged_df)} trades in detail (costs, confidence, tax)"):
                 render_cohort(todays_logged_df)
-
-        df_res = st.session_state.get("scan_results", pd.DataFrame())
-        stats = st.session_state.get("scan_stats", {})
-        if stats and "error" not in stats:
-            st.caption(
-                f"Last check {st.session_state.get('scan_ts', '-')}: looked at {stats.get('scanned', 0)} shares · "
-                f"skipped {stats.get('illiquid', 0)} (too small or hard to trade) · {stats.get('rns_blocked', 0)} blocked by bad news · "
-                f"{stats.get('sector_blocked', 0)} in a full sector · bought {stats.get('logged', 0)} automatically")
-        elif stats.get("error"):
-            st.error(stats["error"])
-
-        if st.session_state.get("has_cleared", False) and not df_res.empty:
-            st.success(f"🟢 {len(df_res)} share(s) passed every check")
-            sec_title("🔥", "Best picks right now")
-            cols = st.columns(min(len(df_res), 3))
-            today_key = london_now().strftime('%Y-%m-%d')
-            for idx, row in df_res.head(3).iterrows():
-                with cols[idx % 3]:
-                    st.markdown(signal_card_html(idx + 1, row, bool(row.get("Loggable", False))), unsafe_allow_html=True)
-                    idem_token = hashlib.sha256(f"{row['Ticker']}_{today_key}_{broker_mode}".encode()).hexdigest()[:12]
-                    already_sent = idem_token in st.session_state["dispatched_orders"]
-                    btn_label = "✅ Already bought" if already_sent else f"🚀 Buy now ({broker_mode})"
-                    if st.button(btn_label, key=f"exec_{idem_token}", width="stretch", disabled=already_sent):
-                        ok = log_equity_signal_safely(row.to_dict(), enforce_sector_cap=True)
-                        if ok:
-                            st.session_state["dispatched_orders"].add(idem_token)
-                            st.session_state["flash"] = f"✅ Bought {row['Ticker']} ({broker_mode})."
-                        else:
-                            st.session_state["flash"] = f"⚠️ Couldn't buy {row['Ticker']}: {st.session_state.get('last_log_reason', 'a safety rule blocked it')}."
-                        st.rerun()
-
-            sec_title("📋", f"All {len(df_res)} picks", "best first")
-            table = df_res.rename(columns={
-                "Ticker": "Stock", "Price (p)": "Buy at (p)", "Target (p)": "Goal (p)", "Stop Loss (p)": "Safety exit (p)",
-                "Expected Return": "Possible profit", "AI Win Confidence": "AI confidence", "Recommended Shares": "Shares",
-                "RNS": "News check", "Loggable": "Ready to buy"})
-            show_cols = ["Stock", "Sector", "Buy at (p)", "Goal (p)", "Safety exit (p)", "Possible profit", "AI confidence", "Shares", "News check", "Ready to buy"]
-            st.dataframe(table[[c for c in show_cols if c in table.columns]], width="stretch", hide_index=True)
         else:
-            st.warning("🛡️ **Nothing to buy right now.** No share passes all the checks (trend, trading volume, news, sector room, AI confidence). Doing nothing is a valid choice.")
+            if re_scan or is_new_loop_tick or "scan_results" not in st.session_state:
+                with st.spinner("Checking every FTSE 350 + liquid AIM share and your open trades (the first check of the day takes a minute or two)..."):
+                    if re_scan:
+                        audit_and_reconcile_all_trades()
+                        hydrate_duckdb_from_supabase()
+                        st.session_state["last_audit_str"] = london_now().strftime("%d %b %H:%M")
+                    res_df, has_cleared = run_predictions()
+                    st.session_state["scan_results"] = res_df
+                    st.session_state["has_cleared"] = has_cleared
+                    st.session_state["scan_ts"] = london_now().strftime("%H:%M:%S")
+                    st.session_state["scan_epoch"] = time.time()
+                todays_logged_df = get_todays_logged_equities()
+
+            if not todays_logged_df.empty:
+                with st.expander(f"📌 Already bought today ({len(todays_logged_df)})", expanded=False):
+                    render_cohort(todays_logged_df)
+
+            df_all_res = st.session_state.get("scan_results", pd.DataFrame())
+            held_now = get_currently_active_tickers() | set(todays_logged_df["ticker"].tolist() if not todays_logged_df.empty else [])
+            df_res = (df_all_res[(df_all_res["Qualified"] == True) & (~df_all_res["Ticker"].isin(held_now))].reset_index(drop=True)
+                      if (not df_all_res.empty and "Qualified" in df_all_res.columns) else pd.DataFrame())
+            quota_now = len(todays_logged_df) >= MAX_DAILY_EQUITY_TRADES
+            stats = st.session_state.get("scan_stats", {})
+            if stats and not stats.get("error"):
+                st.caption(
+                    f"Last check {st.session_state.get('scan_ts', '-')} (took {stats.get('seconds', 0):.0f}s): {stats.get('scanned', 0):,} tradable shares checked out of "
+                    f"{stats.get('listed', 0):,} · {stats.get('deep', 0)} finalists · {stats.get('rns_blocked', 0)} blocked by bad news · "
+                    f"bought {stats.get('logged', 0)} automatically · {len(todays_logged_df)} of {MAX_DAILY_EQUITY_TRADES} picks used today")
+                if stats.get("listed", 0) >= 50 and stats.get("priced", 0) < stats["listed"] * 0.5:
+                    st.warning(f"📡 Prices arrived for only {stats.get('priced', 0):,} of {stats['listed']:,} shares. The price service may be busy. "
+                               "Nothing is guessed: shares without prices are simply skipped, and the next check tries again.")
+                elif stats.get("partial"):
+                    st.info("⏳ Some shares' prices were still downloading when the time limit was reached. They'll be included in the next check.")
+                if stats.get("source") and "today's" not in str(stats.get("source")):
+                    st.caption(f"📃 Share list: {stats['source']}.")
+            elif stats.get("error"):
+                st.error(stats["error"])
+
+            if quota_now:
+                st.info(f"🔒 All {MAX_DAILY_EQUITY_TRADES} picks for today are used (they're in Your positions). This stops over-trading."
+                        + (f" {len(df_res)} more share(s) passed every check — see the finalists list below." if not df_res.empty else ""))
+            elif st.session_state.get("has_cleared", False) and not df_res.empty:
+                st.success(f"🟢 {len(df_res)} share(s) passed every check")
+
+                today_key = london_now().strftime('%Y-%m-%d')
+                for idx, row in df_res.head(3).iterrows():
+                    with st.container():
+                        st.markdown(signal_card_html(idx + 1, row, bool(row.get("Loggable", False))), unsafe_allow_html=True)
+                        idem_token = hashlib.sha256(f"{row['Ticker']}_{today_key}_{broker_mode}".encode()).hexdigest()[:12]
+                        already_sent = idem_token in st.session_state["dispatched_orders"]
+                        btn_label = "✅ Already bought" if already_sent else f"🚀 Buy now ({broker_mode})"
+                        if st.button(btn_label, key=f"exec_{idem_token}", width="stretch", disabled=already_sent):
+                            ok = log_equity_signal_safely(row.to_dict(), enforce_sector_cap=True)
+                            if ok:
+                                st.session_state["dispatched_orders"].add(idem_token)
+                                st.session_state["flash"] = f"✅ Bought {row['Ticker']} ({broker_mode})."
+                            else:
+                                st.session_state["flash"] = f"⚠️ Couldn't buy {row['Ticker']}: {st.session_state.get('last_log_reason', 'a safety rule blocked it')}."
+                            st.rerun()
+
+                with st.expander(f"📋 All {len(df_res)} picks · best first"):
+                    table = df_res.rename(columns={
+                        "Ticker": "Stock", "Price (p)": "Buy at (p)", "Target (p)": "Goal (p)", "Stop Loss (p)": "Safety exit (p)",
+                        "Expected Return": "Possible profit", "AI Win Confidence": "AI confidence", "Recommended Shares": "Shares",
+                        "RNS": "News check", "Loggable": "Ready to buy"})
+                    show_cols = ["Stock", "Sector", "Buy at (p)", "Goal (p)", "Safety exit (p)", "Possible profit", "Expected value", "AI confidence", "Shares", "News check", "Ready to buy"]
+                    st.dataframe(table[[c for c in show_cols if c in table.columns]], width="stretch", hide_index=True)
+            else:
+                st.warning("🛡️ **Nothing to buy right now.** No share passes every check (easy to trade, no bad news, room in its sector, enough AI confidence, "
+                           "and expected to make money after all costs). Doing nothing is a valid choice.")
+
+    # ---------------- market pulse (the whole UK market, from the latest check) ----------------
+    stats_p = st.session_state.get("scan_stats", {}) or {}
+    if stats_p.get("scanned"):
+        sec_title("🌡️", "Market pulse", "the whole UK market, from this check")
+        n_sc = int(stats_p.get("scanned", 0))
+        up_pct = float(stats_p.get("breadth_pct") or 0.0)
+        f20 = float(stats_p.get("ftse_20d", 0.0) or 0.0)
+        score_cards([
+            ("Shares looked at", f"{stats_p.get('listed', 0):,}", "FTSE 350 + liquid AIM", "", ""),
+            ("Easy to trade", f"{n_sc:,}", f"{stats_p.get('illiquid', 0):,} too thin · {stats_p.get('wild', 0):,} too risky", "", ""),
+            ("Market mood", f"{up_pct:.0f}% rising", breadth_word(up_pct), "good" if up_pct >= 55 else ("bad" if up_pct < 40 else ""), "pos" if up_pct >= 50 else "neg"),
+            ("FTSE 100, last 20 days", f"{f20:+.1f}%", "the market as a whole", "good" if f20 > 0 else ("bad" if f20 < 0 else ""), "pos" if f20 >= 0 else "neg"),
+        ])
+        p1, p2 = st.columns([1.1, 1])
+        with p1:
+            st.markdown("**How today's picks were found**")
+            st.markdown(funnel_html([
+                ("Shares looked at", stats_p.get("listed", 0)),
+                ("Prices available", stats_p.get("priced", 0)),
+                ("Easy & safe to trade", n_sc),
+                ("Room to buy (not held, sector free)", max(0, n_sc - int(stats_p.get("held", 0)))),
+                ("Strong AI score", stats_p.get("candidates", 0)),
+                ("Finalists, fully checked", stats_p.get("deep", 0)),
+                ("Passed every check", stats_p.get("qualified", 0)),
+            ]), unsafe_allow_html=True)
+            st.caption(f"{stats_p.get('held', 0)} shares were left out because you already own them, sold them in the last {COOLDOWN_CALENDAR_DAYS} days, or their sector is full.")
+        with p2:
+            st.markdown("**How much of the market is rising**")
+            st.markdown(gauge_html(up_pct), unsafe_allow_html=True)
+            st.caption("Share of easy-to-trade shares above their 20-day average and up over 20 days.")
+            heat = sector_heat_html(stats_p.get("sector_breadth", {}) or {})
+            if heat:
+                st.markdown("**Strongest sectors right now**")
+                st.markdown(heat, unsafe_allow_html=True)
+        if stats_p.get("leaders"):
+            st.markdown("**Beating the FTSE 100 most over 20 days** · for information, not buy tips")
+            st.markdown(leaders_html(stats_p["leaders"]), unsafe_allow_html=True)
+    df_fin = st.session_state.get("scan_results", pd.DataFrame())
+    if isinstance(df_fin, pd.DataFrame) and not df_fin.empty and "Rejection Reason" in df_fin.columns:
+        with st.expander(f"🔍 The {len(df_fin)} finalists — and why each did or didn't pass"):
+            diag = df_fin.rename(columns={"Ticker": "Stock", "Price (p)": "Price (p)", "AI Win Confidence": "AI confidence", "Rejection Reason": "Result"})
+            cols_ = ["Stock", "Sector", "Price (p)", "Expected Return", "Expected value", "AI confidence", "Vs FTSE (20d)", "Liquidity (£m/day)", "Qualified", "Result"]
+            st.dataframe(diag[[c for c in cols_ if c in diag.columns]], width="stretch", hide_index=True)
+            st.caption("“Expected value” = what a pick is worth on average after stamp duty, spread and fees, using the AI's chance of reaching the goal first.")
 
 # ==============================================================================
 # 13. OPTIONS (PRACTICE)
@@ -2652,15 +3989,6 @@ with tab_options:
                 st.info(f"Status: **{friendly_status(opt_signal['status'])}**")
     else:
         st.info(st.session_state.get("opt_note") or "No option idea today.")
-    with st.expander("How the options idea works"):
-        st.markdown(
-            "- Shell, BP, HSBC, AstraZeneca, GSK, Rio Tinto, Barclays, BAT, Unilever and Vodafone also trade in New York, where their options are real and well traded.\n"
-            "- The idea is a **call option** about 2% above the share price, expiring in roughly 4 weeks. It's only offered if the live quote is genuine: enough real trading, a tight buy/sell gap, and a cost under £500.\n"
-            "- You \"buy\" at the asking price and are valued at the selling price, so every trade starts slightly down — that's the real cost of trading.\n"
-            "- Goal is +60% and safety exit is -50%. They're checked each time the page updates while the US market is open (about 14:30–21:00 UK time), so quick spikes in between can be missed.\n"
-            "- After 7 days it closes anyway.\n"
-            "- ⚠️ Many UK brokers don't let UK retail investors trade US-listed options. Check yours before ever thinking about real money.")
-
 # ==============================================================================
 # DATA LOAD (after scanner/options so anything just bought is included)
 # ==============================================================================
@@ -2679,37 +4007,146 @@ with DB_LOCK:
 perf_eq_df = prep_perf_frame(df_eq, "capital_allocated")
 perf_opt_df = prep_perf_frame(df_opt, "total_capital", is_option=True)
 perf_eq = compute_performance(perf_eq_df)
+perf_opt = compute_performance(perf_opt_df)
+active_opt = df_opt[df_opt["status"].apply(classify_outcome) == "ACTIVE"].copy() if not df_opt.empty else pd.DataFrame()
+opt_open_unreal = float((pd.to_numeric(active_opt["total_capital"], errors="coerce").fillna(0) * pd.to_numeric(active_opt["pnl_pct"], errors="coerce").fillna(0) / 100.0).sum()) if not active_opt.empty else 0.0
+opt_learn = options_learning(df_opt)
 
-active_eq = df_eq[df_eq["status"].astype(str).str.upper() == "ACTIVE"].copy() if not df_eq.empty else pd.DataFrame()
+active_eq = df_eq[df_eq["status"].apply(classify_outcome) == "ACTIVE"].copy() if not df_eq.empty else pd.DataFrame()
 active_cap = float(active_eq["capital_allocated"].sum()) if not active_eq.empty else 0.0
 open_unreal = float((active_eq["capital_allocated"] * active_eq["pnl_pct"] / 100.0).sum()) if not active_eq.empty else 0.0
 be_prot = int(sum(is_stop_breakeven_protected(float(r["entry_price"]), float(r["stop_loss"])) for _, r in active_eq.iterrows())) if not active_eq.empty else 0
 open_ret = (open_unreal / active_cap * 100.0) if active_cap > 0 else 0.0
+open_unreal_all = open_unreal + opt_open_unreal
+n_open_all = len(active_eq) + len(active_opt)
+
+def open_split_text() -> str:
+    """'3 shares · 1 option' — the same wording wherever open trades are counted."""
+    parts = [f"{len(active_eq)} share{'s' if len(active_eq) != 1 else ''}"]
+    if len(active_opt):
+        parts.append(f"{len(active_opt)} option{'s' if len(active_opt) != 1 else ''}")
+    return " · ".join(parts)
+
 closed_all = load_closed_trades_df()
+
+
+# ==============================================================================
+# 13b. OPTIONS — SCOREBOARD, OPEN IDEAS, LEARNER, HISTORY (needs the data loaded above)
+# ==============================================================================
+with tab_options:
+    sec_title("📊", "Options scoreboard", "finished option ideas, kept apart from your share results")
+    if perf_opt["n"] == 0:
+        score_cards([("Options profit/loss", "£0.00", "no finished ideas yet", "", ""), ("Win rate", "–", "needs finished ideas", "", ""),
+                     ("Finished ideas", "0", "one idea a day at most", "", ""), ("Open right now", str(len(active_opt)), f"{gbp(opt_open_unreal, sign=True)} so far", "", "")])
+        callout("info", "⏳", "<b>No option idea has finished yet.</b> Each one closes at its goal, its safety exit, or after 7 days.")
+    else:
+        net_o = perf_opt["net_gbp"]
+        score_cards([
+            ("Options profit/loss", gbp(net_o, sign=True), f"{gbp(perf_opt['expectancy_gbp'], sign=True)} per idea on average", "good" if net_o > 0 else ("bad" if net_o < 0 else ""), "pos" if net_o > 0 else ("neg" if net_o < 0 else "")),
+            ("Win rate", f"{perf_opt['target_hit_rate']:.0f}%", f"{perf_opt['wins']} won · {perf_opt['losses']} lost · {perf_opt['expired']} timed out", "", ""),
+            ("Finished ideas", str(perf_opt["n"]), f"likely win rate {perf_opt['ci_low']:.0f}–{perf_opt['ci_high']:.0f}%", "", ""),
+            ("Open right now", str(len(active_opt)), f"{gbp(opt_open_unreal, sign=True)} so far", "good" if opt_open_unreal > 0 else ("bad" if opt_open_unreal < 0 else ""), ""),
+        ])
+        if perf_opt["n"] < 20:
+            callout("warn", "⏳", f"<b>Too early to judge.</b> Only {perf_opt['n']} option idea{'s have' if perf_opt['n'] != 1 else ' has'} finished. Options swing a lot, so early results are mostly luck.")
+        oc1, oc2 = st.columns([3, 2])
+        with oc1:
+            chart_cumulative_pnl(perf_opt_df, "Options running profit/loss (£)", key="cum_options")
+        with oc2:
+            chart_outcome_donut(perf_opt, title="How your option ideas ended", key="outcomes_options")
+        if opt_learn.get("old"):
+            rl, ol = opt_learn.get("real"), opt_learn.get("old")
+            q1, q2 = st.columns(2)
+            with q1:
+                stat_card("📡 Ideas with real US quotes", f"{rl['avg']:+.1f}% average" if rl else "none yet", f"{rl['n']} finished · {rl['win_rate']:.0f}% won" if rl else "")
+            with q2:
+                stat_card("🧮 Older practice-price ideas", f"{ol['avg']:+.1f}% average", f"{ol['n']} finished · estimates, not real quotes")
+
+    sec_title("🟢", "Open option ideas", f"{len(active_opt)} running")
+    if active_opt.empty:
+        st.caption("No option ideas are open right now.")
+    else:
+        oc = st.columns(min(3, len(active_opt)))
+        for i_, (_, o) in enumerate(active_opt.iterrows()):
+            with oc[i_ % len(oc)]:
+                st.markdown(option_mini_html(o), unsafe_allow_html=True)
+
+    sec_title("🧠", "What the options learner has learned", "separate from the share AI")
+    rn = int(opt_learn.get("recent_n", 0))
+    st.markdown(_collapse(
+        f'<div class="stat"><div class="l">Options experience</div><div class="v">{opt_learn["n"]} finished idea{"s" if opt_learn["n"] != 1 else ""}</div>'
+        f'<div class="meter"><div style="width:{min(100.0, rn / OPT_LEARN_MIN_TRADES * 100.0):.0f}%"></div></div>'
+        f'<div class="sub2">{min(rn, OPT_LEARN_MIN_TRADES)} of {OPT_LEARN_MIN_TRADES} recent ideas (last {OPT_LEARN_WINDOW_DAYS} days) needed before it may become pickier. '
+        f'Until then only the “rest a share after a loss” rule is used.</div></div>'), unsafe_allow_html=True)
+    rules = []
+    if opt_learn["rest"]:
+        rules.append("🚧 <b>Taking a break from:</b> " + ", ".join(f"{esc(k)} (~{v} day{'s' if v != 1 else ''} left)" for k, v in sorted(opt_learn["rest"].items(), key=lambda x: -x[1]))
+                     + " — their recent options lost money. The break fades by itself.")
+    if opt_learn["bar"] > OPT_BASE_TREND_BAR:
+        rise = trend_bar_to_rise(opt_learn["bar"])
+        rules.append(f"📈 <b>Pickier:</b> recent ideas lost <b>{opt_learn['wavg']:+.1f}%</b> on average, so it now needs trend strength {opt_learn['bar']:.0f}+"
+                     + (f" (a 5-day rise of about <b>{rise:+.1f}%</b>)" if rise > 0 else "") + " before it picks a share.")
+    elif opt_learn["ready"]:
+        rules.append(f"✅ <b>Normal pickiness:</b> recent ideas made <b>{opt_learn['wavg']:+.1f}%</b> on average, so it isn't adding extra filters.")
+    if rules:
+        for r_ in rules:
+            callout("info", "🧠", r_)
+    else:
+        callout("info", "🌱", "<b>No rules in force yet.</b> It hasn't seen enough finished option ideas to change anything.")
+    if opt_learn.get("by_share"):
+        bs = sorted(((k, v) for k, v in opt_learn["by_share"].items() if v), key=lambda x: -x[1]["avg"])
+        st.markdown(hbars_html([(k, float(v["avg"]), f"{v['avg']:+.1f}% · {v['n']} idea{'s' if v['n'] != 1 else ''}") for k, v in bs[:10]]), unsafe_allow_html=True)
+        st.caption("Average result of finished option ideas, per company.")
+
+    if not df_opt.empty:
+        sec_title("📜", "Every option idea")
+        od = df_opt.copy()
+        od["Price source"] = od["option_contract"].apply(lambda c: "Real US quote ($)" if is_real_option(c) else "Old practice price")
+        od["Contract"] = od["option_contract"].apply(option_short_name)
+        od["Result"] = od["status"].apply(friendly_status)
+        od = od.rename(columns={"date_key": "Date", "entry_premium": "Bought at", "current_option_price": "Price now", "target_premium": "Goal",
+                                "stop_loss_premium": "Safety exit", "pnl_pct": "Profit/Loss (%)", "ai_confidence": "Trend strength", "last_audited": "Last checked",
+                                "total_capital": "Cost (£)"})
+        ocols = ["Date", "Contract", "Price source", "Cost (£)", "Bought at", "Goal", "Safety exit", "Price now", "Profit/Loss (%)", "Trend strength", "Result", "Last checked"]
+        st.dataframe(style_ledger(od[[c for c in ocols if c in od.columns]]), width="stretch", hide_index=True)
+        st.caption("Option prices are per share, in US dollars for real quotes (older practice rows are in pence). Costs are in pounds for one contract.")
+
+with tab_options:
+    with st.expander("How the options idea works"):
+        st.markdown(
+            "- Shell, BP, HSBC, AstraZeneca, GSK, Rio Tinto, Barclays, BAT, Unilever and Vodafone also trade in New York, where their options are real and well traded.\n"
+            "- The idea is a **call option** about 2% above the share price, expiring in roughly 4 weeks. It's only offered if the live quote is genuine: enough real trading, a tight buy/sell gap, and a cost under £500.\n"
+            "- You \"buy\" at the asking price and are valued at the selling price, so every trade starts slightly down — that's the real cost of trading.\n"
+            "- Goal is +60% and safety exit is -50%. They're checked each time the page updates while the US market is open (about 14:30–21:00 UK time), so quick spikes in between can be missed.\n"
+            "- After 7 days it closes anyway.\n"
+            "- **The options learner** only learns from finished option ideas and only changes the options idea — never the share AI. It rests a share after a recent option loss, "
+            f"and gets pickier about the 5-day climb if recent ideas lose on average. That stricter rule only looks at the last {OPT_LEARN_WINDOW_DAYS} days, so it lifts by itself and gets re-tested.\n"
+            "- ⚠️ Many UK brokers don't let UK retail investors trade US-listed options. Check yours before ever thinking about real money.")
 
 # ==============================================================================
 # 14. OVERVIEW (SCOREBOARD)
 # ==============================================================================
-with tab_home:
+with tab_perf:
     n_ = perf_eq["n"]
     if n_ == 0:
-        sec_title("🏠", "Scoreboard")
+        sec_title("📈", "Scoreboard")
         score_cards([
-            ("Total profit/loss", "£0.00", "no finished trades yet", "", ""),
-            ("Win rate", "–", "needs finished trades", "", ""),
-            ("Finished trades", "0", "come back soon", "", ""),
-            ("Open right now", str(len(active_eq)), f"£{active_cap:,.0f} invested (pretend)", "", ""),
+            ("Share profit/loss", "£0.00", "no finished share trades yet", "", ""),
+            ("Win rate", "–", "needs finished share trades", "", ""),
+            ("Finished share trades", "0", (f"+ {len(perf_opt_df)} option idea{'s' if len(perf_opt_df) != 1 else ''} → 🎲 Options tab" if len(perf_opt_df) else "come back soon"), "", ""),
+            ("Open right now", str(n_open_all), f"{open_split_text()} · {gbp(open_unreal_all, sign=True)} so far", "good" if open_unreal_all > 0 else ("bad" if open_unreal_all < 0 else ""), ""),
         ])
-        callout("info", "⏳", "<b>Nothing has finished yet.</b> Once the first trades reach their goal or safety exit, your results and the AI's lessons will appear here.")
+        callout("info", "⏳", "<b>No share trade has finished yet.</b> Once the first ones reach their goal or safety exit, your results and the AI's lessons will appear here."
+                + (" Option results are on the 🎲 Options tab." if len(perf_opt_df) or len(active_opt) else ""))
     else:
         exp_ = perf_eq["expectancy_pct"]
         net = perf_eq["net_gbp"]
-        sec_title("🏠", "Scoreboard", "finished shares trades, after fees & tax")
+        sec_title("📈", "Scoreboard", "finished share trades, after fees & tax")
         score_cards([
-            ("Total profit/loss", f"£{net:+,.2f}", f"£{perf_eq['expectancy_gbp']:+.2f} per trade on average", "good" if net > 0 else ("bad" if net < 0 else ""), "pos" if net > 0 else ("neg" if net < 0 else "")),
+            ("Share profit/loss", gbp(net, sign=True), f"{gbp(perf_eq['expectancy_gbp'], sign=True)} per trade on average", "good" if net > 0 else ("bad" if net < 0 else ""), "pos" if net > 0 else ("neg" if net < 0 else "")),
             ("Win rate", f"{perf_eq['target_hit_rate']:.0f}%", f"{perf_eq['wins']} won · {perf_eq['losses']} lost · {perf_eq['be']} saved · {perf_eq['expired']} timed out", "", ""),
-            ("Finished trades", str(n_), f"likely win rate {perf_eq['ci_low']:.0f}–{perf_eq['ci_high']:.0f}%", "", ""),
-            ("Open right now", str(len(active_eq)), f"£{open_unreal:+,.2f} so far · 🛡️ {be_prot} can't lose", "good" if open_unreal > 0 else ("bad" if open_unreal < 0 else ""), ""),
+            ("Finished share trades", str(n_), f"likely win rate {perf_eq['ci_low']:.0f}–{perf_eq['ci_high']:.0f}%" + (f" · + {len(perf_opt_df)} option idea{'s' if len(perf_opt_df) != 1 else ''} → 🎲 Options" if len(perf_opt_df) else ""), "", ""),
+            ("Open right now", str(n_open_all), f"{open_split_text()} · {gbp(open_unreal_all, sign=True)} so far · 🛡️ {be_prot} can't lose", "good" if open_unreal_all > 0 else ("bad" if open_unreal_all < 0 else ""), ""),
         ])
         if n_ < 30:
             callout("warn", "⏳", f"<b>Too early to judge.</b> Only {n_} trades have finished. Results this early can be pure luck.")
@@ -2724,9 +4161,9 @@ with tab_home:
 
         ch1, ch2 = st.columns([3, 2])
         with ch1:
-            chart_cumulative_pnl(perf_eq_df, "Your running profit/loss (£) — going up is good")
+            chart_cumulative_pnl(perf_eq_df, "Your running profit/loss (£) — going up is good", key="cum_shares")
         with ch2:
-            chart_outcome_donut(perf_eq)
+            chart_outcome_donut(perf_eq, key="outcomes_shares")
 
         sec_title("✨", "Highlights")
         best_i = perf_eq_df["pnl_pct"].idxmax()
@@ -2752,54 +4189,115 @@ with tab_home:
             if fr_ is not None:
                 excess.append(float(rr["pnl_pct"]) - fr_)
         if ftse_since is not None:
-            beat = (f" On the same days, your trades beat the market by <b>{np.mean(excess):+.2f}%</b> per trade on average." if excess else "")
+            ex_ = float(np.mean(excess)) if excess else None
+            beat = ("" if ex_ is None else (f" On the same days, your trades <b>beat the market by {ex_:.2f}%</b> per trade on average." if ex_ >= 0
+                                            else f" On the same days, your trades <b>trailed the market by {abs(ex_):.2f}%</b> per trade on average."))
             callout("info", "🇬🇧", f"<b>Compared with the UK market:</b> the FTSE 100 moved <b>{ftse_since:+.2f}%</b> since your first trade.{beat}")
-
-    if not active_eq.empty:
-        sec_title("🟢", "Open right now", "dot = current price · green side = nearer the goal")
-        act = active_eq.sort_values("pnl_pct", ascending=False).head(12)
-        recs = list(act.iterrows())
-        for i in range(0, len(recs), 4):
-            cols = st.columns(4)
-            for j, (_, r) in enumerate(recs[i:i + 4]):
-                with cols[j]:
-                    st.markdown(mini_trade_html(
-                        r["ticker"], get_trade_sector(r["ticker"], r["features_json"]), float(r["entry_price"]), float(r["target_price"]),
-                        float(r["stop_loss"]), float(r["latest_price"]), float(r["pnl_pct"]),
-                        is_stop_breakeven_protected(float(r["entry_price"]), float(r["stop_loss"]))), unsafe_allow_html=True)
-        if len(active_eq) > 12:
-            st.caption(f"Showing 12 of {len(active_eq)} open trades. See all of them in My Trades.")
 
     if n_ > 0:
         with st.expander("🔍 More detail"):
             b1, b2, b3, b4 = st.columns(4)
-            b1.metric("Average winning trade", f"£{perf_eq['avg_win_gbp']:+.2f}")
-            b2.metric("Average losing trade", f"£{perf_eq['avg_loss_gbp']:+.2f}")
+            b1.metric("Average winning trade", gbp(perf_eq['avg_win_gbp'], sign=True))
+            b2.metric("Average losing trade", gbp(perf_eq['avg_loss_gbp'], sign=True))
             b3.metric("Money won ÷ money lost", f"{perf_eq['profit_factor']:.2f}" if perf_eq["profit_factor"] is not None else "no losses yet",
                       help="Above 1 means more money won than lost.")
-            b4.metric("Biggest drop from a peak", f"£{perf_eq['max_dd_gbp']:+.2f}", help="The worst losing streak, measured from the highest point your running total reached.")
+            b4.metric("Biggest drop from a peak", gbp(perf_eq['max_dd_gbp'], sign=True), help="The worst losing streak, measured from the highest point your running total reached.")
             chart_pnl_hist(perf_eq_df)
             sg = sector_stats(perf_eq_df)
             if not sg.empty:
                 tbl = sg.rename(columns={"n": "Trades", "avg": "Average %", "win_rate": "Win rate %"})[["Sector", "Trades", "Average %", "Win rate %"]].round(1)
                 st.markdown("**Results by sector**")
                 st.dataframe(tbl.sort_values("Average %", ascending=False), width="stretch", hide_index=True)
-        with st.expander("🎲 Options paper trades (separate from the results above)"):
-            perf_opt = compute_performance(perf_opt_df)
-            if perf_opt["n"] == 0:
-                st.write("No finished option trades yet.")
-            else:
-                o1, o2, o3 = st.columns(3)
-                o1.metric("Finished", perf_opt["n"])
-                o2.metric("Win rate", f"{perf_opt['target_hit_rate']:.0f}%")
-                o3.metric("Total profit/loss", f"£{perf_opt['net_gbp']:+,.2f}")
-                chart_cumulative_pnl(perf_opt_df, "Options paper trades — running profit/loss (£)")
+        if perf_opt["n"]:
+            st.caption(f"🎲 Options (kept separate): {perf_opt['n']} finished, {gbp(perf_opt['net_gbp'], sign=True)} — full scoreboard on the Options tab.")
+
 
 # ==============================================================================
-# 15. MY TRADES
+# 14b. TODAY — YOUR POSITIONS (left column) AND THE DAILY BRIEFING (top)
 # ==============================================================================
-with tab_journal:
-    sec_title("📖", "My Trades")
+with pos_box:
+    sec_title("🟢", "Your positions", open_split_text() if n_open_all else "nothing open")
+    hi_ = st.session_state.get("hydrate_info", {})
+    if supabase and (hi_.get("remote_active", 0) > len(active_eq) or hi_.get("bad_rows", 0)):
+        callout("warn", "☁️", f"<b>The online backup lists {hi_.get('remote_active', 0)} open share trade(s), but {len(active_eq)} show here.</b> "
+                              f"{hi_.get('bad_rows', 0)} backup row(s) were unreadable ({esc(hi_.get('first_error', '') or 'none')}). Press “Update now” on the Performance tab to retry. "
+                              "(Trades that already closed here legitimately differ from an older backup.)")
+    if n_open_all:
+        cards = [("eq", r) for _, r in active_eq.sort_values("pnl_pct", ascending=False).head(12).iterrows()] if not active_eq.empty else []
+        cards += [("opt", o) for _, o in active_opt.iterrows()] if not active_opt.empty else []
+        for i in range(0, len(cards), 2):
+            pc = st.columns(2)
+            for j, (kind, r) in enumerate(cards[i:i + 2]):
+                with pc[j]:
+                    if kind == "opt":
+                        st.markdown(option_mini_html(r), unsafe_allow_html=True)
+                    else:
+                        st.markdown(mini_trade_html(
+                            r["ticker"], get_trade_sector(r["ticker"], r["features_json"]), float(r["entry_price"]), float(r["target_price"]),
+                            float(r["stop_loss"]), float(r["latest_price"]), float(r["pnl_pct"]),
+                            is_stop_breakeven_protected(float(r["entry_price"]), float(r["stop_loss"]))), unsafe_allow_html=True)
+        st.caption("Dot = price now · tick = where it was bought · green side = nearer the goal · 🛡️ = can no longer lose")
+        if len(active_eq) > 12:
+            st.caption(f"Showing 12 of {len(active_eq)} open share trades. See all of them on the Performance tab.")
+        if len(active_opt):
+            st.caption("Options are paper-traded separately and are not counted in the share results — see the 🎲 Options tab.")
+        sec_exp = get_active_sector_exposure()
+        if sec_exp:
+            with st.expander("📊 Open trades by sector"):
+                chart_sector_exposure(sec_exp)
+    else:
+        callout("info", "🌙", "<b>Nothing open right now.</b> When a share passes every check during buying hours, it's bought (with pretend money) and appears here.")
+
+def build_briefing() -> str:
+    """A few plain-English sentences: the market, the mood, what the AI did today, your positions, your results."""
+    stt = st.session_state.get("scan_stats", {}) or {}
+    parts = []
+    if not mkt_state["trading_day"]:
+        parts.append(f"🏖️ The London market is <b>shut today</b> ({esc(mkt_state['reason'])}); it opens {esc(next_open_text())}.")
+    elif market_is_open:
+        parts.append(f"🟢 The London market is <b>open</b> until {mkt_state['close'].strftime('%H:%M')}" + (" — <b>a half day</b>." if mkt_state.get("half_day") else "."))
+    else:
+        parts.append(f"🌙 The London market is <b>closed</b>; it opens {esc(next_open_text())}.")
+    if stt.get("scanned"):
+        bp = float(stt.get("breadth_pct") or 0.0)
+        parts.append(f"Across <b>{stt['scanned']:,}</b> easy-to-trade UK shares, <b>{bp:.0f}%</b> are rising ({breadth_word(bp).lower()}), and the FTSE 100 is "
+                     f"<b>{float(stt.get('ftse_20d', 0.0)):+.1f}%</b> over 20 days.")
+    if is_market_stress(macro_bar):
+        parts.append("⛔ The market fell sharply this week, so <b>buying is paused</b> to protect you.")
+    t_df = get_todays_logged_equities()
+    names = ", ".join(str(t).replace(".L", "") for t in (t_df["ticker"].tolist() if not t_df.empty else []))
+    q_n = int(stt.get("qualified", 0) or 0)
+    parts.append(f"Today it has used <b>{len(t_df)} of {MAX_DAILY_EQUITY_TRADES}</b> picks" + (f" ({esc(names)})" if names else "")
+                 + (f", and <b>{q_n}</b> share{'s' if q_n != 1 else ''} currently pass every check." if stt else "."))
+    if n_open_all:
+        parts.append(f"You have <b>{n_open_all} trade{'s' if n_open_all != 1 else ''} open</b> ({esc(open_split_text())}), "
+                     f"<b class=\"{'pos' if open_unreal_all >= 0 else 'neg'}\">{gbp(open_unreal_all, sign=True)}</b> so far" + (f"; {be_prot} can no longer lose." if be_prot else "."))
+    if perf_eq["n"]:
+        parts.append(f"So far <b>{perf_eq['n']}</b> share trades have finished: {perf_eq['wins']} hit their goal, "
+                     f"<b class=\"{'pos' if perf_eq['net_gbp'] >= 0 else 'neg'}\">{gbp(perf_eq['net_gbp'], sign=True)}</b> after all costs"
+                     + (" — still too early to judge." if perf_eq["n"] < 30 else "."))
+    else:
+        parts.append("No share trade has finished yet, so there are no results to judge.")
+    return " ".join(parts)
+
+with brief_box:
+    st.markdown(_collapse(f'<div class="brief"><div class="bh">☀️ Your daily briefing · {esc(london_now().strftime("%A %d %B, %H:%M"))}</div>'
+                          f'<div class="bt">{build_briefing()}</div></div>'), unsafe_allow_html=True)
+    cap_now = get_portfolio_capacity()
+    todays_n = len(get_todays_logged_equities())
+    score_cards([
+        ("Open right now", str(n_open_all), f"{open_split_text()} · {gbp(open_unreal_all, sign=True)}", "good" if open_unreal_all > 0 else ("bad" if open_unreal_all < 0 else ""), ""),
+        ("Picks used today", f"{todays_n} of {MAX_DAILY_EQUITY_TRADES}", "stops over-trading", "warn" if todays_n >= MAX_DAILY_EQUITY_TRADES else "", ""),
+        ("Money at risk", gbp(cap_now["risk_gbp"], 0), f"if every open trade hit its safety exit (cap {gbp(MAX_OPEN_RISK_GBP, 0)})", "warn" if not cap_now["ok"] else "", ""),
+        ("Share profit/loss", gbp(perf_eq.get("net_gbp", 0.0), sign=True) if perf_eq["n"] else "£0.00", f"{perf_eq['n']} finished · after all costs" if perf_eq["n"] else "nothing finished yet",
+         ("good" if perf_eq.get("net_gbp", 0) > 0 else ("bad" if perf_eq.get("net_gbp", 0) < 0 else "")) if perf_eq["n"] else "", ("pos" if perf_eq.get("net_gbp", 0) > 0 else ("neg" if perf_eq.get("net_gbp", 0) < 0 else "")) if perf_eq["n"] else ""),
+    ])
+
+# ==============================================================================
+# 15. ALL TRADES (bottom of the Performance tab)
+# ==============================================================================
+with tab_perf:
+    sec_title("📖", "All trades", "shares and options")
     j1, j2 = st.columns([4, 1])
     with j1:
         st.caption("Share profit/loss figures are after fees and UK stamp duty. Share prices are in pence; option prices are in US dollars. Prices from Yahoo can be about 15 minutes behind.")
@@ -2811,22 +4309,6 @@ with tab_journal:
             st.toast("Trades updated with the latest prices.", icon="✅")
             st.rerun()
 
-    k1, k2, k3, k4 = st.columns(4)
-    if perf_eq["n"] > 0:
-        k1.metric("Win rate", f"{perf_eq['target_hit_rate']:.0f}%",
-                  f"{perf_eq['wins']} won · {perf_eq['losses']} lost · {perf_eq['be']} saved · {perf_eq['expired']} timed out", delta_color="off",
-                  help="Share of ALL finished trades that reached their goal.")
-        k4.metric("Profit/loss on finished trades", f"£{perf_eq['net_gbp']:+,.2f}", f"{perf_eq['n']} trades", delta_color="off")
-    else:
-        k1.metric("Win rate", "–", "no finished trades yet", delta_color="off")
-        k4.metric("Profit/loss on finished trades", "£+0.00", "0 trades", delta_color="off")
-    k2.metric("Money in open trades", f"£{active_cap:,.0f}", f"🛡️ {be_prot} can no longer lose", delta_color="off")
-    k3.metric("Profit/loss on open trades", f"£{open_unreal:+,.2f}", f"{open_ret:+.2f}%")
-
-    sec_exp = get_active_sector_exposure()
-    if sec_exp:
-        with st.expander("📊 Open trades by sector", expanded=False):
-            chart_sector_exposure(sec_exp)
 
     master_list = []
     if not df_eq.empty:
@@ -2838,7 +4320,7 @@ with tab_journal:
         master_list.append(d.rename(columns={"date_str": "Date", "ticker": "Stock", "entry_price": "Bought at (p)", "target_price": "Goal (p)",
                                              "stop_loss": "Safety exit (p)", "latest_price": "Price now (p)", "pnl_pct": "Profit/Loss (%)",
                                              "last_audited": "Last checked"}))
-    if show_sim_options and not df_opt.empty:
+    if not df_opt.empty:
         d = df_opt.copy()
         d["Type"] = d["option_contract"].apply(lambda c: "Option (real quote, $)" if is_real_option(c) else "Option (old practice)")
         d["Sector"] = d["share_name"].apply(lambda s: get_ticker_sector(ADR_TO_LSE.get(str(s), f"{s}.L"), resolve=False))
@@ -2853,7 +4335,6 @@ with tab_journal:
         master_df = pd.concat([m[[c for c in cols_keep if c in m.columns]] for m in master_list], ignore_index=True)
         master_df = master_df.sort_values("Date", ascending=False, kind="stable").reset_index(drop=True)
 
-        sec_title("🔎", "All trades")
         f1, f2, f3, f4 = st.columns(4)
         label_map = {"Open": "ACTIVE", "Won": "WIN", "Lost": "LOSS", "Saved (no loss)": "BE", "Closed after 7 days": "EXPIRED"}
         chosen_status = f1.multiselect("Result", list(label_map.keys()), default=list(label_map.keys()))
@@ -2967,6 +4448,37 @@ with tab_learn:
     else:
         st.info("This appears once at least 10 trades have clearly won or lost.")
 
+    sec_title("🔬", "What's been working", "the evidence learner — from your own finished trades")
+    ev_model = build_evidence_model(closed_all)
+    n_ctx = int(ev_model.get("n", 0))
+    st.markdown(_collapse(
+        f'<div class="stat"><div class="l">Evidence collected</div><div class="v">{n_ctx} clear win/loss trades with their market conditions</div>'
+        f'<div class="meter"><div style="width:{min(100.0, n_ctx / EVIDENCE_MIN_DECIDED * 100.0):.0f}%"></div></div>'
+        f'<div class="sub2">{min(n_ctx, EVIDENCE_MIN_DECIDED)} of {EVIDENCE_MIN_DECIDED} needed before it may change the AI\'s confidence. '
+        f'Past trades get their conditions rebuilt from price history automatically.</div></div>'), unsafe_allow_html=True)
+    if ev_model.get("p0") is not None and n_ctx >= 10:
+        p0 = ev_model["p0"] * 100.0
+        st.caption(f"Overall, {p0:.0f}% of these trades reached their goal. Bars show how each condition compares (green = better than usual).")
+        shown = 0
+        for key, title, bins in EVIDENCE_FACTORS:
+            groups = (ev_model.get("factors", {}).get(key, {}) or {}).get("groups", {})
+            rows_ = [(lbl, g) for lbl, g in groups.items() if g["n"] >= 3]
+            if len(rows_) < 2:
+                continue
+            shown += 1
+            st.markdown(f"**{title}**")
+            st.markdown(hbars_html([(lbl, float(g["raw_rate"] - p0), f"{g['raw_rate']:.0f}% won · {g['n']} trades" + ("" if g["active"] else " (too few to use)"))
+                                    for lbl, g in rows_]), unsafe_allow_html=True)
+        if not shown:
+            st.caption("Not enough trades in each group yet to compare conditions.")
+        callout("good" if ev_model.get("ready") else "info", "🔬",
+                ("<b>In use:</b> the AI's confidence is now nudged up or down (at most ±"
+                 f"{EVIDENCE_TOTAL_CAP} points) by what has really worked for you. Small groups are pulled toward your overall win rate so a lucky streak can't fool it."
+                 if ev_model.get("ready") else
+                 f"<b>Watching, not acting yet.</b> Once {EVIDENCE_MIN_DECIDED} trades have clearly won or lost, these patterns start nudging the AI's confidence."))
+    else:
+        st.info("This fills in as trades finish. It compares conditions like strength vs the FTSE 100, momentum, volume and how much of the market was rising.")
+
     sec_title("🔧", "The AI itself")
     state = _load_retrain_state()
     cal = st.session_state.get("cal_info")
@@ -2974,15 +4486,18 @@ with tab_learn:
         f"- **Version in use:** {st.session_state.get('ml_model_source', 'not loaded yet')}\n"
         f"- **Last upgrade:** {state.get('last_promoted', 'never — still the original')}\n"
         f"- **Upgrade rule:** only after {MIN_SETTLED_TO_RETRAIN}+ clear win/loss trades, and only if the new version tests better than the old one. Your original AI file is never overwritten."
-        + (f"\n- **Confidence tuning:** based on {cal['decided']} trades that clearly won or lost." if cal else ""))
+        + (f"\n- **Confidence tuning:** based on {cal['decided']} trades that clearly won or lost." if cal else "")
+        + f"\n- **Evidence learner:** {'in use' if ev_model.get('ready') else 'collecting evidence'} (see above)."
+        + "\n- **Options:** this AI learns from share trades only. Options have their own separate learner — see the 🎲 Options tab.")
 
     with st.expander("How the AI picks a share"):
         st.markdown(
-            "1. Looks at around 35 UK shares and skips tiny or hard-to-trade ones.\n"
-            "2. Scores each one on how likely it is to reach its goal before its safety exit.\n"
-            "3. Adjusts that score using lessons from past trades and the oil, copper and £ moves this week.\n"
+            "1. Downloads prices for **every FTSE 350 share plus liquid AIM shares**, skipping ones that are tiny, thinly traded, suspended or extremely jumpy.\n"
+            "2. Scores each one on how likely it is to reach its goal before its safety exit (completed days only, no peeking at today's unfinished bar).\n"
+            f"3. The best {MAX_DEEP_CHECKS} become finalists and get a **fresh price**, the news check, lessons from past trades, this week's oil/copper/£ moves, and the evidence learner.\n"
             "4. Blocks any share with bad news (share sales, profit warnings and similar).\n"
-            f"5. Only keeps shares with **{MIN_QUALIFY_CONFIDENCE}%+ confidence** and at least **{MIN_NET_RETURN_PCT:.0f}% possible profit after costs**.")
+            f"5. Only keeps shares with **{MIN_QUALIFY_CONFIDENCE}%+ confidence**, at least **{MIN_NET_RETURN_PCT:.0f}% possible profit after costs**, and a **positive expected value after all costs** "
+            "(chance of winning × what it would make, minus chance of losing × what it would lose).")
 
     if not closed_all.empty:
         with st.expander("Every finished trade and what was learned"):
