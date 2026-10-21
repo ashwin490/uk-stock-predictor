@@ -63,7 +63,7 @@ MAX_DAILY_EQUITY_TRADES = 5
 MAX_HOLD_CALENDAR_DAYS = 7        # 5 LSE trading days
 BREAKEVEN_TRIGGER_RATIO = 0.65    # Ratchet stop to friction-adjusted break-even at >= 65% of target distance
 MAX_ACTIVE_PER_SECTOR = 2         # max 2 active positions per sector
-MAX_OPEN_POSITIONS = 10           # total open-position cap (market-wide correlation guard)
+MAX_OPEN_POSITIONS = 20           # total open-position cap (market-wide correlation guard)
 MAX_OPEN_RISK_GBP = 250.0         # total open risk (entry->stop distance x size) cap
 MARKET_STRESS_FTSE_5D = -3.0      # pause new entries if FTSE 100 5-day change <= this
 COOLDOWN_CALENDAR_DAYS = 3        # anti-churn: no re-entry within 3 days of actual exit
