@@ -708,7 +708,7 @@ def wilson_interval(k: int, n: int, z: float = 1.96) -> tuple:
     return max(0.0, centre - half), min(1.0, centre + half)
 
 # ---------- sector resolution (no more random md5 sectors) ----------
-def get_ticker_sector(ticker: str, resolve: bool = True) -> str:
+def get_ticker_sector(ticker: str, resolve: bool = False) -> str:
     t = str(ticker).strip().upper()
     if t in SECTOR_MAP:
         return SECTOR_MAP[t]
@@ -957,7 +957,7 @@ def parse_constituents(page: str) -> dict:
 
 def _aim_pool() -> dict:
     pool = {}
-    for t in sorted(set(EXTRA_AIM_POOL) | set(AIM_EXEMPT_TICKERS) | set(SECTOR_MAP)):
+    for t in sorted(set(EXTRA_AIM_POOL) | set(AIM_EXEMPT_TICKERS)):        # NOT the whole sector map: it holds old names (e.g. AHT.L left London in 2026)
         if is_valid_lse_ticker(t):
             pool[t] = SECTOR_MAP.get(t, "Unclassified")
     return pool
@@ -1653,6 +1653,24 @@ if "hydrated_once" not in st.session_state:
     hydrate_duckdb_from_supabase()
     st.session_state["hydrated_once"] = True
 
+NO_DATA_GRACE_DAYS = 3
+
+def close_stale_trade(tr, now_str: str):
+    """A share with NO prices at all while the market feed works (it was delisted or suspended): after its 7-day hold
+    plus a few days' grace, close it at the last price we saw, clearly labelled, so it can't block a slot forever."""
+    last = _num(tr.get("latest_price"), _num(tr.get("entry_price")))
+    pnl = _num(tr.get("pnl_pct"))
+    status = "⏱️ EXPIRED (NO PRICE DATA)"
+    with DB_LOCK:
+        con = duckdb.connect(DB_PATH, read_only=False)
+        try:
+            con.execute("UPDATE trade_journal SET status = ?, exit_price = ?, exit_timestamp = ?, last_audited = ? WHERE trade_id = ?",
+                        [status, last, now_str, now_str, tr["trade_id"]])
+        finally:
+            con.close()
+    cloud_update("predictions", {"ticker": str(tr["ticker"]).strip(), "predicted_date": tr["date_str"]},
+                 {"status": status, "latest_price": last, "pnl_pct": pnl, "last_checked": now_str}, "Close Stale Trade")
+
 # ==============================================================================
 # 4. AUDIT & RECONCILIATION ENGINE (BAR-WALKING, GAP-AWARE, STOP-FIRST)
 # ==============================================================================
@@ -1675,6 +1693,7 @@ def audit_and_reconcile_all_trades():
             con.close()
 
     # ---------------- Equities ----------------
+    feed_ok = None
     if not active_trades.empty:
         for _, tr in active_trades.iterrows():
             tkr = str(tr["ticker"]).strip()
@@ -1683,7 +1702,13 @@ def audit_and_reconcile_all_trades():
             try:
                 h = fetch_cached_history(tkr, period="1mo")
                 if h.empty:
-                    st.session_state["price_feed_problem"] = True
+                    if feed_ok is None:
+                        feed_ok = not fetch_cached_history("^FTSE", period="5d").empty
+                    entry_dt0 = _to_date(tr["date_str"])
+                    if feed_ok and entry_dt0 and (today_date - entry_dt0).days >= MAX_HOLD_CALENDAR_DAYS + NO_DATA_GRACE_DAYS:
+                        close_stale_trade(tr, now_str)                 # share stopped trading (e.g. delisted): close at last known price
+                    else:
+                        st.session_state["price_feed_problem"] = True
                     continue                                       # do NOT pretend we checked
                 dates = _bar_dates(h)
 
@@ -2678,7 +2703,7 @@ def log_equity_signal_safely(sig: dict, enforce_sector_cap: bool = True) -> bool
     if not cap_state["ok"]:
         return fail(cap_state["reason"])
 
-    sector = str(sig.get('Sector') or get_ticker_sector(ticker))
+    sector = str(sig.get('Sector') or get_ticker_sector(ticker, resolve=False))
     if enforce_sector_cap:
         sec_counts = get_active_sector_exposure()
         if sec_counts.get(sector, 0) >= MAX_ACTIVE_PER_SECTOR:
@@ -2905,6 +2930,7 @@ def run_predictions():
         df = peek_history(ticker, "120d")
         if df.empty:
             stats["no_data"] += 1
+            quiet_seen[ticker] = time.time()              # no prices (e.g. delisted): don't hammer Yahoo for it
             continue
         stats["priced"] += 1
         try:
@@ -2914,8 +2940,8 @@ def run_predictions():
             continue
         if code != "ok":
             stats[code] += 1
-            if code == "illiquid":
-                quiet_seen[ticker] = time.time()
+            if code in ("illiquid", "no_data"):
+                quiet_seen[ticker] = time.time()           # re-checked every 6 h, not every few minutes
             continue
         quiet_seen.pop(ticker, None)
         stats["scanned"] += 1
@@ -2970,8 +2996,6 @@ def run_predictions():
             if breadth_pct is not None:
                 ctx["breadth"] = breadth_pct
             sector = SECTOR_MAP.get(ticker) or uni_sectors.get(ticker) or peek_sector(ticker) or "Unclassified"
-            if sector == "Unclassified":
-                sector = get_ticker_sector(ticker, resolve=True)
             if sector in saturated_sectors:
                 stats["sector_blocked"] += 1
                 continue
@@ -3238,6 +3262,8 @@ def friendly_status(status, be_locked: bool = False) -> str:
     o = classify_outcome(status)
     if o == "ACTIVE":
         return "🟢 Open (profit protected)" if be_locked else "🟢 Open"
+    if "NO PRICE" in str(status).upper():
+        return "⏱️ Closed — the share stopped trading (last known price)"
     return {"WIN": "✅ Won — hit the goal", "LOSS": "❌ Lost — safety exit hit",
             "BE": "🛡️ Saved — sold with no loss", "EXPIRED": "⏱️ Closed after 7 days"}.get(o, str(status))
 
