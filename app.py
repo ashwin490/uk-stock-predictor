@@ -3046,8 +3046,9 @@ def run_predictions():
             final_confidence = int(min(98, max(25, base_confidence + total_delta)))
             ev_pct = expected_value_pct(final_confidence / 100.0, live_price, target, stop, friction_pct)
 
+            live_price = round(live_price, 2)                      # the price the trade is recorded at
             shares = max(1, int((POSITION_SIZE_GBP * 100) / live_price))
-            capital = round(shares * live_price / 100.0, 2)            # what those shares really cost (£)
+            capital = round(shares * live_price / 100.0, 2)            # so shares x price always equals money in
             be_pct = breakeven_win_pct(live_price, target, stop, friction_pct)
             safe = (not blocked and net_return_pct >= MIN_NET_RETURN_PCT)
             is_qualified = safe and ev_pct > MIN_EV_PCT
@@ -3122,8 +3123,8 @@ def run_predictions():
         pool = df_out[(df_out["Safe"] == True) & (df_out["Qualified"] == False) & (df_out["Loggable"] == True)]
         pool = pool.sort_values(by=["Adjusted Score", "Expected value"], ascending=[False, False])
         for idx, sig in pool.iterrows():
-            if room <= 0 or len(get_todays_logged_equities()) >= MAX_DAILY_EQUITY_TRADES:
-                break
+            if room <= 0 or todays_learning_picks() >= LEARNING_PICKS_PER_DAY or len(get_todays_logged_equities()) >= MAX_DAILY_EQUITY_TRADES:
+                break                                       # re-checked right before buying, in case another open tab just bought one
             d = sig.to_dict()
             d["FeaturesDict"] = dict(d["FeaturesDict"], learning_pick=True)
             if log_equity_signal_safely(d, enforce_sector_cap=True):
@@ -3549,7 +3550,7 @@ def calibration_rows(closed_df: pd.DataFrame) -> list:
         if f.get("base_ml_conf") is None:
             continue
         try:
-            conf = float(f.get("base_ml_conf", 0)) + float(f.get("learner_delta", 0)) + float(f.get("macro_delta", 0))
+            conf = float(f.get("base_ml_conf", 0)) + float(f.get("learner_delta", 0)) + float(f.get("macro_delta", 0)) + float(f.get("evidence_delta", 0))
         except Exception:
             continue
         rows.append((conf, 1 if o == "WIN" else 0))
@@ -3855,7 +3856,7 @@ def render_cohort(todays_df: pd.DataFrame):
         tkr_sym = str(t_row["ticker"])
         f_meta = _parse_features(t_row.get("features_json"))
         base_c = int(f_meta.get("base_ml_conf", 75))
-        adj = int(f_meta.get("learner_delta", 0)) + int(f_meta.get("macro_delta", 0))
+        adj = int(f_meta.get("learner_delta", 0)) + int(f_meta.get("macro_delta", 0)) + int(f_meta.get("evidence_delta", 0))
         sec_name = get_trade_sector(tkr_sym, f_meta)
         tax_tag = f_meta.get("tax_regime") or ("AIM (0% SDRT)" if is_aim_exempt(tkr_sym) else "Main (0.5% SDRT)")
         be_active = is_stop_breakeven_protected(float(t_row["entry_price"]), float(t_row["stop_loss"]), tkr_sym)
@@ -3878,7 +3879,7 @@ with tab_home:
         quota_filled = len(todays_logged_df) >= MAX_DAILY_EQUITY_TRADES
 
         cap_state = get_portfolio_capacity()
-        sec_title("🎯", "Today's picks", f"{len(todays_logged_df)} of {MAX_DAILY_EQUITY_TRADES} used")
+        picks_title = st.container()                       # filled after the check, so the count includes anything just bought
         re_scan = st.button("🔄 Find new picks now", width="stretch", type="primary")
 
         if not mkt_state["trading_day"]:
@@ -3980,7 +3981,12 @@ with tab_home:
             else:
                 _ss = st.session_state.get("scan_stats", {}) or {}
                 _lp = next((r for _, r in df_all_res.iterrows() if bool(r.get("Learning"))), None) if (not df_all_res.empty and "Learning" in df_all_res.columns) else None
-                if _lp is not None:
+                _conf_bought = [t for t in (df_all_res[df_all_res["Qualified"] == True]["Ticker"].tolist() if (not df_all_res.empty and "Qualified" in df_all_res.columns) else [])
+                                if t in set(todays_logged_df["ticker"].tolist() if not todays_logged_df.empty else [])]
+                if _conf_bought:
+                    st.success(f"✅ **Bought today: {', '.join(t.replace('.L', '') for t in _conf_bought)}** — they passed every check and are in Your positions. "
+                               "No other share passes every check right now.")
+                elif _lp is not None:
                     st.info(f"🧪 **Today's learning pick: {_lp['Ticker']}.** Nothing is expected to make money after costs yet, so the AI bought its best-ranked safe share "
                             "with pretend money to keep learning. It's marked 🧪 everywhere and shown separately in Performance.")
                 elif _ss.get("learning_mode"):
@@ -3989,6 +3995,9 @@ with tab_home:
                 else:
                     st.warning("🛡️ **Nothing to buy right now.** No share passes every check (easy to trade, no bad news, room in its sector, "
                                "and expected to make money after all costs). Doing nothing is a valid choice.")
+
+        with picks_title:
+            sec_title("🎯", "Today's picks", f"{len(get_todays_logged_equities())} of {MAX_DAILY_EQUITY_TRADES} used")
 
     # ---------------- market pulse (the whole UK market, from the latest check) ----------------
     stats_p = st.session_state.get("scan_stats", {}) or {}
@@ -4011,8 +4020,8 @@ with tab_home:
                 ("Prices available", stats_p.get("priced", 0)),
                 ("Easy & safe to trade", n_sc),
                 ("Room to buy (not held, sector free)", max(0, n_sc - int(stats_p.get("held", 0)))),
-                ("Strong AI score", stats_p.get("candidates", 0)),
-                ("Finalists, fully checked", stats_p.get("deep", 0)),
+                ("Scored by the AI", stats_p.get("candidates", 0)),
+                ("Best scores, fully checked", stats_p.get("deep", 0)),
                 ("Passed every check", stats_p.get("qualified", 0)),
             ]), unsafe_allow_html=True)
             st.caption(f"{stats_p.get('held', 0)} shares were left out because you already own them, sold them in the last {COOLDOWN_CALENDAR_DAYS} days, or their sector is full.")
