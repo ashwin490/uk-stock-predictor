@@ -75,7 +75,7 @@ ENTRY_WINDOW_START = dtime(8, 30)   # skip the opening auction / first-30-min no
 ENTRY_WINDOW_END = dtime(16, 0)
 MIN_PRICE_P = 20.0                  # skip penny stocks (pence)
 MIN_AVG_TURNOVER_GBP = 1_000_000    # min 20d average daily traded value (GBP)
-MIN_QUALIFY_CONFIDENCE = 65
+MIN_QUALIFY_CONFIDENCE = 65         # (kept for older saved trades; picks are now chosen on expected value — see MIN_EV_PCT)
 MIN_NET_RETURN_PCT = 2.0
 BE_TOLERANCE_PCT = 0.5              # a protected stop only counts as "break-even" if net loss is within this
 
@@ -101,7 +101,9 @@ MAX_DEEP_CHECKS = 30                # finalists that get the full news / memory 
 DEEP_CHECK_MARGIN = 12              # finalists must be within this many points of the confidence bar
 MAX_ATR_PCT = 8.0                   # skip shares that swing more than this % on a normal day
 PULSE_REFRESH_SEC = 1800            # after today's picks are used up, still refresh the market pulse every 30 min
-MIN_EV_PCT = 0.0                    # a pick's expected value after ALL costs must be above this (in %)
+MIN_EV_PCT = 0.2                    # a pick must be expected to make at least this much after ALL costs (in % per trade)
+LEARNING_PICKS_PER_DAY = 1          # while still learning, at most this many clearly-marked 🧪 learning picks a day
+CAL_PRIOR_TRADES = 20               # the confidence correction starts near 50% and moves to your real win rate as results arrive
 
 # ---- Evidence learner: learns which market conditions really win, from YOUR finished trades ----
 EVIDENCE_MIN_DECIDED = 40           # clear win/loss trades needed before it changes any score
@@ -1431,7 +1433,7 @@ def option_bid_price(spot, strike, days, sigma, q):
     return max(round(calculate_black_scholes_call(spot, strike, days, 0.05, sigma, q) * (1.0 - OPTION_HALF_SPREAD_PCT / 100.0), 2), 0.01)
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_cached_history(ticker: str, period: str = "120d") -> pd.DataFrame:
+def fetch_cached_history(ticker: str, period: str = "6mo") -> pd.DataFrame:
     """Fault-tolerant history fetcher with retry and timeout guards."""
     if not is_valid_lse_ticker(ticker) and not str(ticker).startswith("^"):
         return pd.DataFrame()
@@ -1455,7 +1457,7 @@ def _download_history_raw(ticker: str, period: str) -> pd.DataFrame:
             time.sleep(0.4)
     return pd.DataFrame()
 
-def prefetch_histories(tickers: list, period: str = "120d", ttl=300, workers: int = 8, progress=None, time_budget: float = None) -> bool:
+def prefetch_histories(tickers: list, period: str = "6mo", ttl=300, workers: int = 8, progress=None, time_budget: float = None) -> bool:
     """Parallel download into a shared in-memory store (no Streamlit calls inside worker threads).
     ttl can be a number or a function(ticker)->seconds. Returns False if the time budget ran out first."""
     store = get_hist_store()
@@ -1493,7 +1495,7 @@ def prefetch_histories(tickers: list, period: str = "120d", ttl=300, workers: in
                 time.sleep(1.5)                                     # the price service looks busy: back off politely
     return complete
 
-def peek_history(ticker: str, period: str = "120d", max_age: float = None) -> pd.DataFrame:
+def peek_history(ticker: str, period: str = "6mo", max_age: float = None) -> pd.DataFrame:
     """Prices already downloaded by prefetch_histories (no network). With max_age, older copies count as missing."""
     store = get_hist_store()
     with store["lock"]:
@@ -1504,7 +1506,7 @@ def peek_history(ticker: str, period: str = "120d", max_age: float = None) -> pd
         return pd.DataFrame()
     return item[1].copy()
 
-def get_history_fast(ticker: str, period: str = "120d") -> pd.DataFrame:
+def get_history_fast(ticker: str, period: str = "6mo") -> pd.DataFrame:
     df = peek_history(ticker, period, max_age=SWEEP_TTL_SEC)
     if not df.empty:
         return df
@@ -1516,7 +1518,7 @@ def get_cross_asset_macro_regime() -> dict:
     symbols = {"brent_5d": "BZ=F", "copper_5d": "HG=F", "gbpusd_5d": "GBPUSD=X", "ftse_5d": "^FTSE"}
     for key, sym in symbols.items():
         try:
-            h = yf.Ticker(sym).history(period="10d", timeout=5)
+            h = yf.Ticker(sym).history(period="1mo", timeout=5)
             if h is not None and len(h) >= 5:
                 c_now = float(h["Close"].iloc[-1])
                 c_5d = float(h["Close"].iloc[-5])
@@ -2170,13 +2172,15 @@ def build_calibrator(closed_df: pd.DataFrame):
                 except Exception:
                     pass
     decided = wins + losses
-    prior = min(0.75, max(0.35, wins / decided)) if decided >= 10 else 0.5
+    prior = min(0.90, max(0.10, (wins + 0.5 * CAL_PRIOR_TRADES) / (decided + CAL_PRIOR_TRADES)))   # your real win rate, gently pulled to 50% while results are few
+    ref = float(np.mean(xs)) if len(xs) >= 10 else 0.5      # how the AI usually scored its past picks
 
     def shrink(p):
-        return prior + CONF_SHRINK * (float(p) - 0.5)
+        # A share scoring like the AI's past picks gets your real win rate; only a clearly higher score earns more.
+        return prior + CONF_SHRINK * (float(p) - ref)
 
     iso = None
-    mode = f"Shrinkage to base rate {prior:.0%} (n={decided})"
+    mode = f"Pulled toward your real win rate ({prior:.0%}, from {decided} clear results)"
     if len(xs) >= MIN_CALIBRATION_SAMPLES and len(set(ys)) == 2:
         try:
             from sklearn.isotonic import IsotonicRegression
@@ -2194,7 +2198,7 @@ def build_calibrator(closed_df: pd.DataFrame):
                 pass
         return min(0.95, max(0.05, base))
 
-    return calibrate, {"mode": mode, "prior": prior, "decided": decided, "iso_samples": len(xs)}
+    return calibrate, {"mode": mode, "prior": prior, "decided": decided, "iso_samples": len(xs), "ref_score": round(ref, 3)}
 
 def _load_retrain_state() -> dict:
     try:
@@ -2369,7 +2373,7 @@ def get_option_quote(sym: str, expiry_str: str, strike: float):
 def find_real_option_idea(sym: str, gbpusd: float):
     """One candidate per underlying: ~2% out-of-the-money call, ~4 weeks out, only if the REAL quote is good enough."""
     try:
-        h = _download_history_raw(sym, "30d")
+        h = _download_history_raw(sym, "1mo")
         if h.empty or len(h) < 15:
             return None
         spot = float(h["Close"].iloc[-1])
@@ -2814,8 +2818,10 @@ def analyse_share(ticker: str, df: pd.DataFrame, today_date, market_open: bool, 
     partial_bar = live_bar_today and market_open
     live_price = float(df["Close"].iloc[-1])
     df_model = df.iloc[:-1] if partial_bar else df          # model sees COMPLETED bars only (train/inference parity)
-    if len(df_model) < 55 or not math.isfinite(live_price) or live_price <= 0:
+    if not math.isfinite(live_price) or live_price <= 0:
         return "no_data", None
+    if len(df_model) < 55:
+        return "short", None                                  # history too short to score honestly
     recent = df_model.tail(20)
     avg_turnover = float((recent["Close"] * recent["Volume"]).mean() / 100.0)      # pence -> £
     if (not math.isfinite(avg_turnover)) or live_price < MIN_PRICE_P or avg_turnover < MIN_AVG_TURNOVER_GBP:
@@ -2853,13 +2859,28 @@ def expected_value_pct(p_win: float, entry: float, target: float, stop: float, f
     loss = (entry - stop) / entry * 100.0 + friction_pct
     return round(p_win * gain - (1.0 - p_win) * loss, 2)
 
+def breakeven_win_pct(entry: float, target: float, stop: float, friction_pct: float) -> float:
+    """How often a trade like this must reach its goal (before its safety exit) just to break even after costs."""
+    if entry <= 0:
+        return 100.0
+    gain = (target - entry) / entry * 100.0 - friction_pct
+    loss = (entry - stop) / entry * 100.0 + friction_pct
+    return round(loss / (gain + loss) * 100.0, 1) if gain > 0 and (gain + loss) > 0 else 100.0
+
+def todays_learning_picks() -> int:
+    t = get_todays_logged_equities()
+    return int(sum(bool(_parse_features(f).get("learning_pick")) for f in t["features_json"])) if not t.empty and "features_json" in t.columns else 0
+
+def is_learning_trade(f_json) -> bool:
+    return bool(_parse_features(f_json).get("learning_pick"))
+
 def run_predictions():
     """Looks at EVERY FTSE 350 share plus liquid AIM shares:
        1) download prices for all of them (in parallel; quiet shares are re-checked less often),
        2) cheap checks for everyone (easy to trade, not suspended, not wildly jumpy) + an AI score,
        3) the best finalists get a fresh price, the news check, past lessons, the market, and the evidence learner,
        4) only picks expected to make money AFTER all costs are kept."""
-    stats = {"listed": 0, "priced": 0, "no_data": 0, "illiquid": 0, "wild": 0, "scanned": 0, "uptrend": 0, "held": 0,
+    stats = {"listed": 0, "priced": 0, "no_data": 0, "short": 0, "illiquid": 0, "wild": 0, "scanned": 0, "uptrend": 0, "held": 0,
              "model_errors": 0, "low_score": 0, "candidates": 0, "deep": 0, "rns_blocked": 0, "sector_blocked": 0,
              "qualified": 0, "stale": 0, "logged": 0, "paused": False, "capacity": {}, "window_open": False, "source": "",
              "partial": False, "sector_breadth": {}, "leaders": [], "ftse_20d": 0.0, "breadth_pct": None, "seconds": 0.0,
@@ -2916,7 +2937,7 @@ def run_predictions():
             prog.progress(min(1.0, done / max(1, total)), text=f"Downloading prices: {done:,} of {total:,} still needed")
         except Exception:
             pass
-    complete = prefetch_histories(universe, "120d", ttl=ttl_for, workers=SCAN_WORKERS, progress=_tick, time_budget=SCAN_TIME_BUDGET_SEC)
+    complete = prefetch_histories(universe, "6mo", ttl=ttl_for, workers=SCAN_WORKERS, progress=_tick, time_budget=SCAN_TIME_BUDGET_SEC)
     stats["partial"] = not complete
 
     ftse_series = get_ftse_close_series()
@@ -2927,7 +2948,7 @@ def run_predictions():
 
     breadth, leaders, candidates = {}, [], []
     for ticker in universe:
-        df = peek_history(ticker, "120d")
+        df = peek_history(ticker, "6mo")
         if df.empty:
             stats["no_data"] += 1
             quiet_seen[ticker] = time.time()              # no prices (e.g. delisted): don't hammer Yahoo for it
@@ -2962,9 +2983,6 @@ def run_predictions():
             stats["model_errors"] += 1
             continue
         base_conf = int(min(95, max(25, round(calibrate(max(0.01, min(0.99, p_raw))) * 100.0))))
-        if base_conf < MIN_QUALIFY_CONFIDENCE - DEEP_CHECK_MARGIN:
-            stats["low_score"] += 1
-            continue
         candidates.append((base_conf, ticker))
     breadth_pct = round(stats["uptrend"] / stats["scanned"] * 100.0, 1) if stats["scanned"] else None
     stats["breadth_pct"] = breadth_pct
@@ -2977,12 +2995,12 @@ def run_predictions():
     stats["low_score"] += max(0, len(candidates) - len(finalists))
     if finalists:
         prog.progress(1.0, text=f"Double-checking the best {len(finalists)} shares with fresh prices...")
-        prefetch_histories(finalists, "120d", ttl=FRESH_PRICE_TTL_SEC, workers=6)
+        prefetch_histories(finalists, "6mo", ttl=FRESH_PRICE_TTL_SEC, workers=6)
 
     results = []
     for ticker in finalists:
         try:
-            df = peek_history(ticker, "120d", max_age=FRESH_PRICE_MAX_AGE_SEC)
+            df = peek_history(ticker, "6mo", max_age=FRESH_PRICE_MAX_AGE_SEC)
             if df.empty:
                 stats["stale"] += 1                          # no fresh price -> never buy on an old one
                 continue
@@ -3030,23 +3048,23 @@ def run_predictions():
 
             shares = max(1, int((POSITION_SIZE_GBP * 100) / live_price))
             capital = round(shares * live_price / 100.0, 2)            # what those shares really cost (£)
-            is_qualified = (not blocked and final_confidence >= MIN_QUALIFY_CONFIDENCE and net_return_pct >= MIN_NET_RETURN_PCT and ev_pct > MIN_EV_PCT)
+            be_pct = breakeven_win_pct(live_price, target, stop, friction_pct)
+            safe = (not blocked and net_return_pct >= MIN_NET_RETURN_PCT)
+            is_qualified = safe and ev_pct > MIN_EV_PCT
             if blocked:
                 reason = f"Bad news: {rns_data['nlp_tags']}"
-            elif final_confidence < MIN_QUALIFY_CONFIDENCE:
-                reason = f"AI confidence {final_confidence}% is below the {MIN_QUALIFY_CONFIDENCE}% needed"
             elif net_return_pct < MIN_NET_RETURN_PCT:
                 reason = f"Possible profit after costs is only {net_return_pct:+.1f}% (needs {MIN_NET_RETURN_PCT:.0f}%+)"
             elif ev_pct <= MIN_EV_PCT:
-                reason = f"Expected to lose {ev_pct:+.2f}% on average once costs are counted"
+                reason = f"Not worth it after costs: needs a {be_pct:.0f}% chance of reaching the goal, the AI estimates {final_confidence}% (worth {ev_pct:+.2f}% on average)"
             else:
-                reason = "Passed every check"
+                reason = f"Passed every check (needs {be_pct:.0f}%, AI estimates {final_confidence}%)"
 
             raw_feature_map = {c: float(latest[c].values[0]) for c in feature_cols if c in latest.columns}
             feature_snapshot = {
                 "raw_features": raw_feature_map, "atr_pct": atr_pct, "raw_prob": round(blended, 4),
                 "base_ml_conf": base_confidence, "learner_delta": learner["delta"], "macro_delta": macro_delta,
-                "evidence_delta": ev_delta, "ev_pct": ev_pct, "ctx": ctx, "sector": sector, "spread_pct": spread_pct,
+                "evidence_delta": ev_delta, "ev_pct": ev_pct, "breakeven_pct": be_pct, "ctx": ctx, "sector": sector, "spread_pct": spread_pct,
                 "commission_gbp": commission, "friction_pct": round(get_sdrt_pct(ticker) + spread_pct, 3),
                 "avg_turnover_gbp": round(avg_turnover, 0), "tax_regime": tax_regime, "nlp_tags": rns_data["nlp_tags"],
                 "entry_bar": str(df_model.index[-1].date()) if hasattr(df_model.index[-1], "date") else str(dates[-1]),
@@ -3069,6 +3087,7 @@ def run_predictions():
                 "RNS": rns_data['status'], "RNSHeadline": rns_data['headline'],
                 "Liquidity (£m/day)": round(avg_turnover / 1e6, 1),
                 "Loggable": bool(info["live_bar_today"] and window_open),
+                "Needs to win (%)": be_pct, "Safe": safe, "Learning": False,
                 "FeaturesDict": feature_snapshot, "Qualified": is_qualified, "Rejection Reason": reason,
             })
         except Exception:
@@ -3092,6 +3111,27 @@ def run_predictions():
                 break
             if log_equity_signal_safely(sig.to_dict(), enforce_sector_cap=True):
                 stats["logged"] += 1
+
+    decided_n = int((cal_info or {}).get("decided", 0))
+    stats["learning_mode"] = decided_n < MIN_CALIBRATION_SAMPLES
+    stats["decided"] = decided_n
+    stats["learning_logged"] = 0
+    loggable_confident = not qualified_only.empty and bool(qualified_only["Loggable"].any())
+    if stats["learning_mode"] and not entries_paused and not loggable_confident:
+        room = LEARNING_PICKS_PER_DAY - todays_learning_picks()
+        pool = df_out[(df_out["Safe"] == True) & (df_out["Qualified"] == False) & (df_out["Loggable"] == True)]
+        pool = pool.sort_values(by=["Adjusted Score", "Expected value"], ascending=[False, False])
+        for idx, sig in pool.iterrows():
+            if room <= 0 or len(get_todays_logged_equities()) >= MAX_DAILY_EQUITY_TRADES:
+                break
+            d = sig.to_dict()
+            d["FeaturesDict"] = dict(d["FeaturesDict"], learning_pick=True)
+            if log_equity_signal_safely(d, enforce_sector_cap=True):
+                df_out.at[idx, "Learning"] = True
+                df_out.at[idx, "Rejection Reason"] = "🧪 Bought as today's learning pick (paper money, so the AI keeps learning)"
+                stats["learning_logged"] += 1
+                stats["logged"] += 1
+                room -= 1
 
     st.session_state["scan_stats"] = stats
     return df_out, not qualified_only.empty
@@ -3382,10 +3422,12 @@ def price_bar_html(entry: float, target: float, stop: float, live: float, compac
     return _collapse(bar + f'<div class="rlab"><span>🛑 Exit if it falls to {stop:.2f}p</span><span>Bought at {entry:.2f}p</span><span>🎯 Goal {target:.2f}p</span></div>')
 
 def trade_card_html(slot, ticker, sector, status, entry, target, stop, live, pnl_pct, shares, capital,
-                    conf, base_c, adj, tax_tag, friction, audited, be_locked) -> str:
+                    conf, base_c, adj, tax_tag, friction, audited, be_locked, learning: bool = False) -> str:
     s_text, s_kind = outcome_style(status)
     cls = "pos" if pnl_pct >= 0 else "neg"
     lock_tag = '<span class="tag warn">🛡️ Profit protected</span>' if be_locked and classify_outcome(status) == "ACTIVE" else ""
+    if learning:
+        lock_tag += '<span class="tag info">🧪 Learning pick</span>'
     return _collapse(f"""
     <div class="tcard">
       <div class="tcard-top"><span class="tag info">Pick {esc(slot)}</span><span class="tag">{esc(sector)}</span><span class="tag {s_kind}">{esc(s_text)}</span>{lock_tag}</div>
@@ -3400,14 +3442,14 @@ def trade_card_html(slot, ticker, sector, status, entry, target, stop, live, pnl
     </div>
     """)
 
-def mini_trade_html(ticker, sector, entry, target, stop, live, pnl_pct, locked) -> str:
+def mini_trade_html(ticker, sector, entry, target, stop, live, pnl_pct, locked, learning: bool = False) -> str:
     cls = "pos" if pnl_pct >= 0 else "neg"
-    lock = " 🛡️" if locked else ""
+    lock = (" 🛡️" if locked else "") + (" 🧪" if learning else "")
     return _collapse(f"""
     <div class="mini">
       <div class="row"><span class="mtk">{esc(ticker)}{lock}</span><span class="mp {cls}">{pnl_pct:+.2f}%</span></div>
       {price_bar_html(entry, target, stop, live, compact=True)}
-      <div class="sub2">{esc(sector)} · now {live:.2f}p</div>
+      <div class="sub2">{esc(sector)} · now {live:.2f}p{' · learning pick' if learning else ''}</div>
     </div>
     """)
 
@@ -3692,6 +3734,7 @@ with st.sidebar.expander("🛡️ Built-in safety rules"):
         f"- Buying only **{ENTRY_WINDOW_START.strftime('%H:%M')}–{ENTRY_WINDOW_END.strftime('%H:%M')}** London time, using real prices\n"
         f"- Skips shares under {MIN_PRICE_P:.0f}p, trading under £{MIN_AVG_TURNOVER_GBP / 1e6:.0f}m a day, suspended, or swinging more than {MAX_ATR_PCT:.0f}% on a normal day\n"
         f"- Only buys when a pick is **expected to make money after all costs**\n"
+        f"- While still learning (under {MIN_CALIBRATION_SAMPLES} clear results), at most **{LEARNING_PICKS_PER_DAY} 🧪 learning pick a day** if nothing else qualifies\n"
         f"- Buying pauses if the UK market falls sharply in a week\n"
         f"- Shut at weekends and on UK bank holidays; closes at 12:30 on Christmas Eve and New Year's Eve\n"
         f"- Every result includes UK stamp duty, spread and your broker fee"
@@ -3821,7 +3864,7 @@ def render_cohort(todays_df: pd.DataFrame):
                 pos_i + 1, tkr_sym, sec_name, t_row["status"], float(t_row["entry_price"]), float(t_row["target_price"]),
                 float(t_row["stop_loss"]), float(t_row["latest_price"]), float(t_row["pnl_pct"]), int(t_row["shares"]),
                 float(t_row["capital_allocated"]), base_c + adj, base_c, adj, tax_tag,
-                get_trade_friction_pct(tkr_sym, f_meta), t_row["last_audited"], be_active), unsafe_allow_html=True)
+                get_trade_friction_pct(tkr_sym, f_meta), t_row["last_audited"], be_active, bool(f_meta.get("learning_pick"))), unsafe_allow_html=True)
 
 with tab_home:
     brief_box = st.container()
@@ -3888,6 +3931,13 @@ with tab_home:
                     f"Last check {st.session_state.get('scan_ts', '-')} (took {stats.get('seconds', 0):.0f}s): {stats.get('scanned', 0):,} tradable shares checked out of "
                     f"{stats.get('listed', 0):,} · {stats.get('deep', 0)} finalists · {stats.get('rns_blocked', 0)} blocked by bad news · "
                     f"bought {stats.get('logged', 0)} automatically · {len(todays_logged_df)} of {MAX_DAILY_EQUITY_TRADES} picks used today")
+                if stats.get("priced", 0) and not stats.get("scanned", 0):
+                    st.warning(f"🔎 **None of the {stats.get('priced', 0):,} shares with prices could be checked.** Why: {stats.get('short', 0):,} had too little price history · "
+                               f"{stats.get('illiquid', 0):,} too thinly traded or under {MIN_PRICE_P:.0f}p · {stats.get('wild', 0):,} suspended or too jumpy · "
+                               f"{stats.get('no_data', 0):,} without usable prices · {stats.get('model_errors', 0):,} errors. Nothing is guessed.")
+                if stats.get("priced", 0) >= 20 and stats.get("short", 0) > stats["priced"] * 0.5:
+                    st.warning(f"📏 Price history came back too short for {stats['short']:,} of {stats['priced']:,} shares (the AI needs about 3 months of daily prices). "
+                               "This usually means the price service changed how it answers. Nothing is guessed: those shares are skipped.")
                 if stats.get("listed", 0) >= 50 and stats.get("priced", 0) < stats["listed"] * 0.5:
                     st.warning(f"📡 Prices arrived for only {stats.get('priced', 0):,} of {stats['listed']:,} shares. The price service may be busy. "
                                "Nothing is guessed: shares without prices are simply skipped, and the next check tries again.")
@@ -3928,8 +3978,17 @@ with tab_home:
                     show_cols = ["Stock", "Sector", "Buy at (p)", "Goal (p)", "Safety exit (p)", "Possible profit", "Expected value", "AI confidence", "Shares", "News check", "Ready to buy"]
                     st.dataframe(table[[c for c in show_cols if c in table.columns]], width="stretch", hide_index=True)
             else:
-                st.warning("🛡️ **Nothing to buy right now.** No share passes every check (easy to trade, no bad news, room in its sector, enough AI confidence, "
-                           "and expected to make money after all costs). Doing nothing is a valid choice.")
+                _ss = st.session_state.get("scan_stats", {}) or {}
+                _lp = next((r for _, r in df_all_res.iterrows() if bool(r.get("Learning"))), None) if (not df_all_res.empty and "Learning" in df_all_res.columns) else None
+                if _lp is not None:
+                    st.info(f"🧪 **Today's learning pick: {_lp['Ticker']}.** Nothing is expected to make money after costs yet, so the AI bought its best-ranked safe share "
+                            "with pretend money to keep learning. It's marked 🧪 everywhere and shown separately in Performance.")
+                elif _ss.get("learning_mode"):
+                    st.warning(f"🛡️ **Nothing is expected to make money after costs right now.** While the AI is still learning ({_ss.get('decided', 0)} of "
+                               f"{MIN_CALIBRATION_SAMPLES} clear results), it buys at most {LEARNING_PICKS_PER_DAY} 🧪 learning pick a day during buying hours so it keeps improving.")
+                else:
+                    st.warning("🛡️ **Nothing to buy right now.** No share passes every check (easy to trade, no bad news, room in its sector, "
+                               "and expected to make money after all costs). Doing nothing is a valid choice.")
 
     # ---------------- market pulse (the whole UK market, from the latest check) ----------------
     stats_p = st.session_state.get("scan_stats", {}) or {}
@@ -4174,6 +4233,13 @@ with tab_perf:
             ("Finished share trades", str(n_), f"likely win rate {perf_eq['ci_low']:.0f}–{perf_eq['ci_high']:.0f}%" + (f" · + {len(perf_opt_df)} option idea{'s' if len(perf_opt_df) != 1 else ''} → 🎲 Options" if len(perf_opt_df) else ""), "", ""),
             ("Open right now", str(n_open_all), f"{open_split_text()} · {gbp(open_unreal_all, sign=True)} so far · 🛡️ {be_prot} can't lose", "good" if open_unreal_all > 0 else ("bad" if open_unreal_all < 0 else ""), ""),
         ])
+        _lp = perf_eq_df["features_json"].apply(is_learning_trade) if "features_json" in perf_eq_df.columns else pd.Series(False, index=perf_eq_df.index)
+        if _lp.any():
+            _l, _c = perf_eq_df[_lp], perf_eq_df[~_lp]
+            callout("info", "🧪", f"<b>Learning picks vs confident picks.</b> {len(_l)} learning pick{'s' if len(_l) != 1 else ''} finished: average <b>{_l['pnl_pct'].mean():+.2f}%</b>, "
+                                  f"{int((_l['outcome'] == 'WIN').sum())} hit the goal. " + (f"{len(_c)} confident pick{'s' if len(_c) != 1 else ''}: average <b>{_c['pnl_pct'].mean():+.2f}%</b>, "
+                                  f"{int((_c['outcome'] == 'WIN').sum())} hit the goal." if len(_c) else "No confident picks have finished yet.")
+                                  + " Learning picks exist so the AI keeps learning; judge the app mainly on confident picks.")
         if n_ < 30:
             callout("warn", "⏳", f"<b>Too early to judge.</b> Only {n_} trades have finished. Results this early can be pure luck.")
         elif exp_ > 0.3:
@@ -4261,8 +4327,8 @@ with pos_box:
                         st.markdown(mini_trade_html(
                             r["ticker"], get_trade_sector(r["ticker"], r["features_json"]), float(r["entry_price"]), float(r["target_price"]),
                             float(r["stop_loss"]), float(r["latest_price"]), float(r["pnl_pct"]),
-                            is_stop_breakeven_protected(float(r["entry_price"]), float(r["stop_loss"]))), unsafe_allow_html=True)
-        st.caption("Dot = price now · tick = where it was bought · green side = nearer the goal · 🛡️ = can no longer lose")
+                            is_stop_breakeven_protected(float(r["entry_price"]), float(r["stop_loss"])), is_learning_trade(r["features_json"])), unsafe_allow_html=True)
+        st.caption("Dot = price now · tick = where it was bought · green side = nearer the goal · 🛡️ = can no longer lose · 🧪 = learning pick")
         if len(active_eq) > 12:
             st.caption(f"Showing 12 of {len(active_eq)} open share trades. See all of them on the Performance tab.")
         if len(active_opt):
@@ -4340,7 +4406,7 @@ with tab_perf:
     if not df_eq.empty:
         d = df_eq.copy()
         d["Sector"] = d.apply(lambda x: get_trade_sector(x["ticker"], x["features_json"]), axis=1)
-        d["Type"] = "Share"
+        d["Type"] = d["features_json"].apply(lambda f: "Share (🧪 learning pick)" if is_learning_trade(f) else "Share")
         d["_o"] = d["status"].apply(classify_outcome)
         d["Result"] = d.apply(lambda x: friendly_status(x["status"], is_stop_breakeven_protected(float(x["entry_price"]), float(x["stop_loss"]))), axis=1)
         master_list.append(d.rename(columns={"date_str": "Date", "ticker": "Stock", "entry_price": "Bought at (p)", "target_price": "Goal (p)",
@@ -4522,8 +4588,10 @@ with tab_learn:
             "2. Scores each one on how likely it is to reach its goal before its safety exit (completed days only, no peeking at today's unfinished bar).\n"
             f"3. The best {MAX_DEEP_CHECKS} become finalists and get a **fresh price**, the news check, lessons from past trades, this week's oil/copper/£ moves, and the evidence learner.\n"
             "4. Blocks any share with bad news (share sales, profit warnings and similar).\n"
-            f"5. Only keeps shares with **{MIN_QUALIFY_CONFIDENCE}%+ confidence**, at least **{MIN_NET_RETURN_PCT:.0f}% possible profit after costs**, and a **positive expected value after all costs** "
-            "(chance of winning × what it would make, minus chance of losing × what it would lose).")
+            f"5. Only buys shares with at least **{MIN_NET_RETURN_PCT:.0f}% possible profit after costs** that are **expected to make money after all costs**: "
+            "the chance of reaching the goal (corrected using your real results, and compared with how its past picks scored) must beat the break-even chance for that trade.\n"
+            f"6. While it has fewer than {MIN_CALIBRATION_SAMPLES} clear results, if nothing qualifies it takes at most **{LEARNING_PICKS_PER_DAY} 🧪 learning pick a day** "
+            "(its best-ranked safe share), so it can't get stuck learning nothing. Learning picks are marked everywhere and shown separately in Performance.")
 
     if not closed_all.empty:
         with st.expander("Every finished trade and what was learned"):
