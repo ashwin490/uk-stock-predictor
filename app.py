@@ -60,7 +60,19 @@ ROOT_DIR = Path(__file__).resolve().parent
 # Existing installations without ALPHA_DATA_DIR continue using their current database and models.
 DATA_DIR = Path(os.environ.get("ALPHA_DATA_DIR", str(ROOT_DIR))).expanduser().resolve()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-STORAGE_MODE = os.environ.get("ALPHA_STORAGE_MODE", "local").strip().lower()
+# Environment variables are best for a laptop/VPS. Streamlit Secrets can also
+# select cloud mode on Community Cloud, where local disks are not persistent.
+# A locally running app continues to default to its persistent local DuckDB.
+def _configured_storage_mode() -> str:
+    env_value = os.environ.get("ALPHA_STORAGE_MODE", "").strip()
+    if env_value:
+        return env_value.lower()
+    try:
+        return str(st.secrets.get("ALPHA_STORAGE_MODE", "local")).strip().lower()
+    except Exception:
+        return "local"
+
+STORAGE_MODE = _configured_storage_mode()
 if STORAGE_MODE not in ("local", "cloud"):
     raise RuntimeError("ALPHA_STORAGE_MODE must be local or cloud")
 SETTINGS_PATH = DATA_DIR / "alpha_settings.json"
@@ -80,7 +92,10 @@ MAX_PORTFOLIO_RISK_FRACTION = 0.05  # combined estimated stop risk <= 5% of pape
 MAX_SINGLE_TRADE_RISK_FRACTION = 0.01  # one trade risks <= 1% of paper capital
 MAX_SINGLE_POSITION_FRACTION = 0.25  # diversify; not an absolute pound or share-count ceiling
 MAX_SECTOR_FRACTION = 0.35  # paper exposure in a sector <= 35% of equity
-DEFAULT_PAPER_STARTING_GBP = 10_000.0  # not a maximum; edit in the interface
+DEFAULT_PAPER_STARTING_GBP = 50_000.0  # requested starting paper portfolio; NOT a hard limit
+LEGACY_DEFAULT_PAPER_GBP = 10_000.0
+# A falling FTSE is a warning, not a categorical reason to discard a sound signal.
+DEFAULT_MARKET_STRESS_POLICY = "qualified"  # qualified / pause
 MARKET_STRESS_FTSE_5D = -3.0      # pause new entries if FTSE 100 5-day change <= this
 COOLDOWN_CALENDAR_DAYS = 3        # anti-churn: no re-entry within 3 days of actual exit
 HALF_LIFE_DAYS = 30.0             # exponential decay half-life for historical penalties
@@ -88,7 +103,7 @@ POSITION_SIZE_GBP = 500.0   # backward compatibility when reading old trades
 MIN_POSITION_SIZE_GBP = 1.0
 REQUIRE_DURABLE_CLOUD = (STORAGE_MODE == "cloud")  # cloud mode requires Supabase; local uses persistent DuckDB
 DATA_FRESHNESS_HOURS = 30               # non-trading-day data can be older; new entries still need today's bar
-APP_VERSION = "2026.11.20-local-first"
+APP_VERSION = "2026.11.20-qualified-dip-50k"
 
 def load_paper_settings() -> dict:
     """Persist virtual-account configuration independent of browser sessions."""
@@ -100,11 +115,43 @@ def load_paper_settings() -> dict:
 
 
 def get_starting_paper_cash() -> float:
+    """Use £50k for new setups and upgrade the original untouched £10k default.
+
+    Preserves all other previously chosen virtual balances. The portfolio is a
+    paper simulation; this does not change recorded trade P/L or model labels.
+    """
     try:
-        value = float(load_paper_settings().get("starting_cash_gbp", os.getenv("ALPHA_PAPER_CASH_GBP", DEFAULT_PAPER_STARTING_GBP)))
+        settings = load_paper_settings()
+        value = float(settings.get("starting_cash_gbp", os.getenv("ALPHA_PAPER_CASH_GBP", DEFAULT_PAPER_STARTING_GBP)))
+        if (value == LEGACY_DEFAULT_PAPER_GBP
+                and "starting_cash_gbp" in settings
+                and not settings.get("starting_cash_customised", False)):
+            return DEFAULT_PAPER_STARTING_GBP
         return value if math.isfinite(value) and value >= MIN_POSITION_SIZE_GBP else DEFAULT_PAPER_STARTING_GBP
     except (ValueError, TypeError):
         return DEFAULT_PAPER_STARTING_GBP
+
+
+def get_market_stress_policy() -> str:
+    """When markets fall, either buy fully qualified paper picks or pause all."""
+    policy = str(load_paper_settings().get("market_stress_policy", DEFAULT_MARKET_STRESS_POLICY))
+    return policy if policy in ("qualified", "pause") else DEFAULT_MARKET_STRESS_POLICY
+
+
+def set_market_stress_policy(policy: str) -> None:
+    if policy not in ("qualified", "pause"):
+        raise ValueError("Unknown market-stress policy")
+    settings = load_paper_settings()
+    settings["market_stress_policy"] = policy
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp = SETTINGS_PATH.with_suffix(".json.tmp")
+    temp.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    os.replace(temp, SETTINGS_PATH)
+
+
+def market_stress_blocks_entries(macro: dict) -> bool:
+    """The UK index selloff warning should not block qualifying predictions."""
+    return is_market_stress(macro) and get_market_stress_policy() == "pause"
 
 
 def save_starting_paper_cash(amount: float) -> None:
@@ -114,6 +161,7 @@ def save_starting_paper_cash(amount: float) -> None:
         raise ValueError("Paper capital must be positive")
     obj = load_paper_settings()
     obj["starting_cash_gbp"] = value
+    obj["starting_cash_customised"] = True
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = SETTINGS_PATH.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(obj, indent=2), encoding="utf-8")
@@ -1325,8 +1373,11 @@ except ImportError:
 def get_supabase_client():
     if create_client is None:
         return None
-    url = st.secrets.get("SUPABASE_URL") if hasattr(st, "secrets") else None
-    key = st.secrets.get("SUPABASE_KEY") if hasattr(st, "secrets") else None
+    try:
+        url = st.secrets.get("SUPABASE_URL")
+        key = st.secrets.get("SUPABASE_KEY")
+    except Exception:
+        return None
     if not url or not key:
         return None
     try:
@@ -1520,6 +1571,56 @@ def hydrate_duckdb_from_supabase():
         record_db_error("Restore from cloud", Exception(f"{info['bad_rows']} backup row(s) were unreadable and skipped ({info['first_error']})"))
     elif "db_error" in st.session_state and "Restore" in str(st.session_state.get("db_error")):
         del st.session_state["db_error"]
+
+def restore_legacy_history_if_empty() -> None:
+    """Read old Supabase paper history once when the local journal is empty.
+
+    This imports only when it cannot overwrite any preexisting local trades;
+    the selected STORAGE_MODE remains unchanged after the read. A failed import
+    is visible rather than silently reporting that every historic number is zero.
+    """
+    global supabase
+    if STORAGE_MODE != "local" or st.session_state.get("legacy_history_checked"):
+        return
+    st.session_state["legacy_history_checked"] = True
+    counts = journal_counts()
+    if counts["total"] or counts["opt_total"]:
+        return
+    remote = get_supabase_client()
+    if remote is None:
+        st.session_state["history_notice"] = (
+            "This database has no saved trades. If your old history is on Supabase, "
+            "enter SUPABASE_URL and SUPABASE_KEY in Secrets and click Import existing Supabase paper history. "
+            "If you previously used a different local database, restore your learning backup."
+        )
+        return
+    old = supabase
+    try:
+        supabase = remote
+        hydrate_duckdb_from_supabase()
+        counts = journal_counts()
+        info = st.session_state.get("hydrate_info", {})
+        if counts["total"] or counts["opt_total"]:
+            st.session_state["history_notice"] = (
+                f"Recovered {counts['total']} old paper share trades and "
+                f"{counts['opt_total']} option journal entries from Supabase into this local journal."
+            )
+        elif st.session_state.get("cloud_read_error") or info.get("bad_rows"):
+            st.session_state["history_notice"] = (
+                "Supabase history recovery was incomplete. Check System health and "
+                "do not reset the old cloud tables."
+            )
+        else:
+            st.session_state["history_notice"] = (
+                "The connected Supabase tables returned no historical records. "
+                "Verify the project, table names, and read permissions before assuming your old data is gone."
+            )
+    except Exception as exc:
+        record_db_error("Legacy history import", exc)
+        st.session_state["history_notice"] = "Could not read the old Supabase journal; old tables have not been modified."
+    finally:
+        supabase = old
+
 
 # ==============================================================================
 # 2. TIMEZONE, MARKET CLOCK, MACRO FEED & PARALLEL DATA CACHING
@@ -1843,6 +1944,7 @@ supabase = get_supabase_client() if STORAGE_MODE == "cloud" else None
 
 if "hydrated_once" not in st.session_state:
     hydrate_duckdb_from_supabase()
+    restore_legacy_history_if_empty()
     st.session_state["hydrated_once"] = True
 
 # Once per UK calendar day, keep a rolling set of local integrity-checked learning backups.
@@ -2953,8 +3055,16 @@ def log_equity_signal_safely(sig: dict, enforce_sector_cap: bool = True) -> bool
         return fail("Outside LSE entry hours or not a trading day")
     if not sig.get("Loggable", False):
         return fail("A same-day quotation was not verified")
-    if is_market_stress(get_cross_asset_macro_regime()):
-        return fail("New entries are paused by the market-stress rule")
+    metadata = sig.get("FeaturesDict")
+    is_learning = isinstance(metadata, dict) and metadata.get("learning_pick") is True
+    if not sig.get("Qualified", False) and not is_learning:
+        return fail("Only predictions that passed all checks or explicitly marked learning picks can be logged")
+    macro_now = get_cross_asset_macro_regime()
+    if is_market_stress(macro_now):
+        if market_stress_blocks_entries(macro_now):
+            return fail("Market-stress safeguard is set to pause all new paper trades")
+        if not sig.get("Qualified", False):
+            return fail("During a UK market selloff, only fully qualified paper predictions can be bought")
     if REQUIRE_DURABLE_CLOUD and not supabase:
         return fail("Supabase backup is not configured/connected — no trades recorded on ephemeral storage")
     if STORAGE_MODE == "cloud" and (st.session_state.get("cloud_read_error") or (st.session_state.get("hydrate_info") or {}).get("bad_rows")):
@@ -3184,8 +3294,9 @@ def run_predictions():
     saturated_sectors = {sec for sec, cnt in active_sectors.items() if cnt >= MAX_ACTIVE_PER_SECTOR}
     cooldown_tickers = get_recent_cooldown_tickers()
     macro_regime = get_cross_asset_macro_regime()
-    entries_paused = is_market_stress(macro_regime)
+    entries_paused = market_stress_blocks_entries(macro_regime)
     stats["paused"] = entries_paused
+    stats["market_stress"] = is_market_stress(macro_regime)
     stats["capacity"] = get_portfolio_capacity()
 
     universe, uni_sectors, source = get_uk_universe()
@@ -3393,7 +3504,9 @@ def run_predictions():
     stats["decided"] = decided_n
     stats["learning_logged"] = 0
     loggable_confident = not qualified_only.empty and bool(qualified_only["Loggable"].any())
-    if stats["learning_mode"] and not entries_paused and not loggable_confident:
+    # Do not make experimental low-confidence learning purchases during selloffs,
+    # even if the operator permits fully qualified ideas to go through.
+    if stats["learning_mode"] and not is_market_stress(macro_regime) and not entries_paused and not loggable_confident:
         room = LEARNING_PICKS_PER_DAY - todays_learning_picks()
         pool = df_out[(df_out["Safe"] == True) & (df_out["Qualified"] == False) & (df_out["Loggable"] == True)]
         pool = pool.sort_values(by=["Adjusted Score", "Expected value"], ascending=[False, False])
@@ -3995,7 +4108,18 @@ st.sidebar.number_input("Virtual account balance (£)", min_value=MIN_POSITION_S
 if st.sidebar.button("Save virtual account balance", width="stretch"):
     save_starting_paper_cash(st.session_state["paper_starting_cash_input"])
     st.sidebar.success("Saved on this laptop.")
-st.sidebar.caption("Each trade is sized automatically using its stop-loss distance and the account's available cash.")
+st.sidebar.caption("Starts with £50,000 in virtual cash. This is not a maximum; each trade is sized using available cash and stop-loss risk.")
+_stress_policies = {"qualified": "Buy qualified picks (recommended)", "pause": "Pause all new buys"}
+_selected_stress = st.sidebar.selectbox(
+    "During a sharp UK market fall",
+    options=["qualified", "pause"],
+    index=0 if get_market_stress_policy() == "qualified" else 1,
+    format_func=lambda p: _stress_policies[p],
+    help="The drop is always reported. With the recommended setting, only fully qualified simulated trades can be bought; experimental learning picks are held back."
+)
+if _selected_stress != get_market_stress_policy():
+    set_market_stress_policy(_selected_stress)
+    st.sidebar.caption("Saved market-fall policy.")
 st.sidebar.number_input("Broker fee per trade (£)", min_value=0.0, max_value=25.0, value=DEFAULT_COMMISSION_GBP, step=0.5, key="commission_gbp",
                         help="Charged when you buy and again when you sell. Included in every profit/loss number you see. Many UK apps charge £0 — "
                              "set yours, because on a £500 trade a £3 fee each way costs 1.2%, which decides which picks are worth it.")
@@ -4018,7 +4142,7 @@ with st.sidebar.expander("🛡️ Built-in safety rules"):
         f"- No minimum share price; still skips shares trading under £{MIN_AVG_TURNOVER_GBP / 1e6:.0f}m a day, suspended, or swinging more than {MAX_ATR_PCT:.0f}% on a normal day\n"
         f"- Only buys when a pick is **expected to make money after all costs**\n"
         f"- While still learning (under {MIN_CALIBRATION_SAMPLES} clear results), at most **{LEARNING_PICKS_PER_DAY} 🧪 learning pick a day** if nothing else qualifies\n"
-        f"- Buying pauses if the UK market falls sharply in a week\n"
+        f"- If the UK market falls sharply, **only qualifying predictions** can be bought by default; you can switch to pausing everything\n"
         f"- Shut at weekends and on UK bank holidays; closes at 12:30 on Christmas Eve and New Year's Eve\n"
         f"- Returns include estimated UK transaction tax, bid/ask spread and your broker fee (real execution can differ)"
     )
@@ -4085,6 +4209,9 @@ with st.sidebar.expander("🩺 System health"):
         prices_ok = False
     st.write(f"{'🟢' if prices_ok else '🔴'} Share prices {'arriving' if prices_ok else 'not arriving (Yahoo may be down)'}")
     st.write(f"{'🟢 Local disk' if STORAGE_MODE == 'local' else ('🟢 Cloud' if supabase else '🔴 Cloud missing')} journal mode")
+    st.caption(f"Selected data directory: {DATA_DIR.name} · Storage mode: {STORAGE_MODE}")
+    if STORAGE_MODE == "local":
+        st.caption("Local-only mode does not write new paper trades to Supabase. On Streamlit Community Cloud, set ALPHA_STORAGE_MODE = 'cloud' in Secrets to use your previous Supabase journal and preserve new trades.")
     if st.session_state.get("unpriced_open_tickers"):
         st.error("Prices missing for open: " + ", ".join(sorted(st.session_state["unpriced_open_tickers"])) + ". Left OPEN for manual review.")
     if st.session_state.get("corporate_action_review"):
@@ -4122,12 +4249,23 @@ if st.sidebar.button("🚪 Log Out", width="stretch"):
 
 macro_bar = get_cross_asset_macro_regime()
 
+# Never silently present an empty new journal as a confirmed loss of old history.
+_counts_on_device = journal_counts()
+if _counts_on_device["total"] == 0 and _counts_on_device["opt_total"] == 0:
+    st.warning(st.session_state.get("history_notice") or
+               "No trades are stored in the selected database yet. If you expected previous results, check the Storage mode and use Import existing Supabase paper history in the sidebar.")
+elif st.session_state.get("history_notice", "").startswith("Recovered "):
+    st.success(st.session_state["history_notice"])
+
 def macro_chip(label, v):
     cls = "up" if v >= 0 else "down"
     arrow = "▲" if v >= 0 else "▼"
     return f'<span class="chip {cls}">{esc(label)} {arrow} {v:+.1f}%</span>'
 
-stress_chip = '<span class="chip down">⛔ Buying paused — UK market fell sharply this week</span>' if is_market_stress(macro_bar) else ""
+stress_chip = ('<span class="chip down">⛔ Market fell — buying paused by your setting</span>'
+               if market_stress_blocks_entries(macro_bar) else
+               ('<span class="chip">⚠️ Market fell — qualified picks still allowed</span>'
+                if is_market_stress(macro_bar) else ""))
 if not mkt_state["trading_day"]:
     mkt_chip = f'<span class="chip down">🏖️ {esc(mkt_state["reason"])} · opens {esc(next_open_text())}</span>'
 elif market_is_open:
@@ -4211,8 +4349,10 @@ with tab_home:
 
         if not mkt_state["trading_day"]:
             st.warning(f"🏖️ **The London market is shut today ({mkt_state['reason']}).** Nothing will be bought, and open trades keep the last trading day's prices. Opens {next_open_text()}.")
+        elif market_stress_blocks_entries(macro_bar):
+            st.warning("⚠️ The UK market has fallen sharply. Your settings currently pause all new paper trades.")
         elif is_market_stress(macro_bar):
-            st.error("⛔ The UK market has fallen sharply this week, so buying is paused to protect you. Picks are shown for information only.")
+            st.info("⚠️ The UK market has fallen sharply, but fully qualified paper predictions can still be bought. Experimental learning picks are paused; normal risk, cash, price and market-hours checks still apply.")
         elif not cap_state["ok"]:
             st.warning(f"🧯 {cap_state['reason']}. New buying resumes when some trades close.")
         elif not is_entry_window_open():
@@ -4287,8 +4427,10 @@ with tab_home:
                         st.markdown(signal_card_html(idx + 1, row, bool(row.get("Loggable", False))), unsafe_allow_html=True)
                         idem_token = hashlib.sha256(f"{row['Ticker']}_{today_key}_{broker_mode}".encode()).hexdigest()[:12]
                         already_sent = idem_token in st.session_state["dispatched_orders"]
-                        btn_label = "✅ Already bought" if already_sent else f"🚀 Buy now ({broker_mode})"
-                        if st.button(btn_label, key=f"exec_{idem_token}", width="stretch", disabled=already_sent):
+                        is_qualified_for_manual = bool(row.get("Qualified", False)) and bool(row.get("Loggable", False))
+                        btn_label = ("✅ Already bought" if already_sent else
+                                     (f"🚀 Buy now ({broker_mode})" if is_qualified_for_manual else "🔎 Watch only — not qualified"))
+                        if st.button(btn_label, key=f"exec_{idem_token}", width="stretch", disabled=already_sent or not is_qualified_for_manual):
                             ok = log_equity_signal_safely(row.to_dict(), enforce_sector_cap=True)
                             if ok:
                                 st.session_state["dispatched_orders"].add(idem_token)
@@ -4681,8 +4823,10 @@ def build_briefing() -> str:
         bp = float(stt.get("breadth_pct") or 0.0)
         parts.append(f"Across <b>{stt['scanned']:,}</b> easy-to-trade UK shares, <b>{bp:.0f}%</b> are rising ({breadth_word(bp).lower()}), and the FTSE 100 is "
                      f"<b>{float(stt.get('ftse_20d', 0.0)):+.1f}%</b> over 20 days.")
-    if is_market_stress(macro_bar):
-        parts.append("⛔ The market fell sharply this week, so <b>buying is paused</b> to protect you.")
+    if market_stress_blocks_entries(macro_bar):
+        parts.append("⚠️ The UK market fell sharply; your current setting pauses paper purchases.")
+    elif is_market_stress(macro_bar):
+        parts.append("⚠️ The UK market fell sharply; <b>qualified paper ideas may still be bought</b>, subject to normal risk checks.")
     t_df = get_todays_logged_equities()
     names = ", ".join(str(t).replace(".L", "") for t in (t_df["ticker"].tolist() if not t_df.empty else []))
     q_n = int(stt.get("qualified", 0) or 0)

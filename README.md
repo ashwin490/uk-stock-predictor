@@ -20,7 +20,7 @@ Run from your **Windows laptop first**, saving the paper trade database, learnin
 3. Copy `feature_engine.py`, `rns_scraper.py` and `models/ensemble_ranker.joblib` from your existing project into this folder. The `models` directory may need to be created.
 4. Double-click `setup_windows.bat`. It creates the virtual environment, installs dependencies and prompts for **your own login credentials** if `.streamlit/secrets.toml` does not exist. The password is not preset; it requires a unique password of at least 16 characters. You can also reuse your old Streamlit secrets securely by copying them to the local `.streamlit/secrets.toml` (never upload to GitHub).
 5. Double-click `start_local.bat`. Visit `http://127.0.0.1:8501`. Log in using the username and password you configured. Keep the terminal running.
-6. Under **Settings → Virtual account balance**, use any positive amount of pretend money you want; the starting value is £10,000 and **there is no hard GBP upper limit**. Click **Save virtual account balance** so it persists.
+6. Under **Settings → Virtual account balance**, use any positive amount of pretend money you want; the starting value is £50,000 and **there is no hard GBP upper limit**. Click **Save virtual account balance** so it persists.
 
 Running locally is also possible manually:
 
@@ -32,7 +32,7 @@ $env:ALPHA_STORAGE_MODE = "local"
 ## What was changed
 
 - **Local-first persistence**: without Supabase, new paper trades and updates are stored in durable **local DuckDB**; cloud storage is not required.
-- **No arbitrary £10k maximum**: set the size of the **virtual account**, not a fixed position budget; quantities are whole shares, allocated according to stop distance, virtual cash and diversification, with no hard share-count or five-trade-per-day cap.
+- **£50,000 starting virtual account (not a maximum)**: set the size of the **virtual account**; quantities are whole shares, allocated according to stop distance, virtual cash and diversification, with no hard share-count or five-trade-per-day cap.
 - **Risk controls** that grow with the virtual account: at most 1% account equity estimated to the initial stop on one new trade; max 5% combined estimated risk; max 25% equity in any one position and 35% in one sector. These are simulation rules, **not** a worst-case-loss guarantee. Stops can gap.
 - **Closed trade P/L changes available paper cash**. The account does not create unlimited fictitious money.
 - **Prevents duplicate paper trades**, validates the share price (pence/pounds), validates quantities against capital and rechecks sector/portfolio budget inside the journal lock.
@@ -92,3 +92,12 @@ The alternative `ALPHA_STORAGE_MODE=cloud` is for Supabase-backed persistence an
 Offline tests: `python -m pytest -q tests/test_local_first.py`. The tests validate risk-based sizing, no hard monetary ceiling, break-even stop handling, realised losses, six local trades in a day without Supabase, duplicate checks, quote units, safe backups/restore, and corrupt archives. There is also `python -m py_compile app.py alpha_backup.py`.
 
 **Not tested here:** real Streamlit UI interaction, actual Yahoo data, DuckDB file-level checkpoint/backup compatibility, your separate trained model and feature engine, real Supabase import, or predictive accuracy. These require acceptance checks on your actual laptop. Do not assume passing mocked tests means the app can safely trade real money.
+
+## November 2026 revision: UK selloffs, £50,000 and older data
+
+- The default **starting virtual account is £50,000**, not a £50k purchase for each company. Saved custom account balances remain unchanged. An untouched legacy £10k default is upgraded when reading settings.
+- The UK market selloff is a **warning, not a universal pause**. Fully qualified paper-trade predictions may still be logged during a selloff after the same price, market-hours, cash, stop-risk, diversification, and news checks. Experimental learning picks are not allowed during selloffs. The sidebar setting **During a sharp UK market fall** can restore the full pause if you want.
+- **Missing earlier results:** When local storage has zero entries and Supabase credentials are configured, the app attempts a read-only copy of existing trade history into its local database. It does not delete or overwrite the old cloud history. If no records load, an on-screen warning explains what to check. The manual import button remains in Settings → Save and move your AI's learning.
+- **If you are running the app on Streamlit Community Cloud**, put `ALPHA_STORAGE_MODE = "cloud"` into that app's Streamlit Secrets alongside `AUTH_USER`, `AUTH_PASS_HASH`, `SUPABASE_URL`, and `SUPABASE_KEY`. Cloud mode uses the previous Supabase records and records new paper trades there, instead of relying on an ephemeral local database. Your laptop's `start_local.bat` explicitly selects local mode. Do **not** commit Streamlit Secrets to GitHub. Verify the old records exist before starting new simulated trades. Cloud mode also requires durable model storage for ongoing retraining.
+- The £50k is **virtual cash for the entire account**, not a guaranteed investment amount per idea. With 25% single-position allocation, the initial cap for one trade is usually £12,500 before risk and stop-distance adjustments. This keeps the account from investing every pound in one idea.
+- **Data safety:** Back up both your old cloud database and the current project before replacing the deployed code. Cloud transactions and historical restoration have not been tested against your personal Supabase schema or market-data feed in this environment.

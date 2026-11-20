@@ -129,7 +129,7 @@ def signal(symbol='AAA.L',price=100,capital=2000):
     n=int(capital*100/price)
     return dict(Ticker=symbol, **{'Price (p)':price,'Stop Loss (p)':price*.98,
         'Target (p)':price*1.10,'Recommended Shares':f'{n} shares','Capital':capital,
-        'Loggable':True,'Sector':'Tech','FeaturesDict':{'price_currency':'GBp'},
+        'Loggable':True,'Qualified':True,'Sector':'Tech','FeaturesDict':{'price_currency':'GBp'},
         'ReturnNum':5.0,'AI Win Confidence':'80%'})
 
 def test_local_mode_records_without_supabase_and_prevents_duplicate():
