@@ -3,6 +3,7 @@ streamlit>=1.45,<2
 pandas>=2.1,<3
 numpy>=1.26,<3
 joblib>=1.3,<2
+argon2-cffi>=23.1,<26
 requests>=2.31,<3
 pytz>=2024.1
 yfinance>=0.2.60,<1

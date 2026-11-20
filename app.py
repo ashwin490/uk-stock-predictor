@@ -26,13 +26,6 @@ import pytz
 import duckdb
 
 try:
-    import plotly.graph_objects as go
-    PLOTLY_OK = True
-except ImportError:
-    go = None
-    PLOTLY_OK = False
-
-try:
     from streamlit_autorefresh import st_autorefresh
 except ImportError:
     st_autorefresh = None
@@ -103,7 +96,7 @@ POSITION_SIZE_GBP = 500.0   # backward compatibility when reading old trades
 MIN_POSITION_SIZE_GBP = 1.0
 REQUIRE_DURABLE_CLOUD = (STORAGE_MODE == "cloud")  # cloud mode requires Supabase; local uses persistent DuckDB
 DATA_FRESHNESS_HOURS = 30               # non-trading-day data can be older; new entries still need today's bar
-APP_VERSION = "2026.11.20-qualified-dip-50k"
+APP_VERSION = "2026.11.20-final-reliability-v4"
 
 def load_paper_settings() -> dict:
     """Persist virtual-account configuration independent of browser sessions."""
@@ -1412,8 +1405,8 @@ def cloud_update(table: str, match: dict, payload: dict, label: str) -> bool:
         # Supabase Python's update() normally returns the modified row(s).
         # An empty result means the remote row was not found; don't advance
         # the local audit and risk losing the close at the next restart.
-        if getattr(response, "data", None) == []:
-            raise RuntimeError("No remote row matched the update filters")
+        if not getattr(response, "data", None):
+            raise RuntimeError("No remote row acknowledgement for the update filters")
         return True
     except Exception as e:
         record_db_error(label, e)
@@ -1433,8 +1426,8 @@ def flush_pending_cloud_sync():
             for k, v in match.items():
                 q = q.eq(k, v)
             response = q.execute()
-            if getattr(response, "data", None) == []:
-                raise RuntimeError("Remote row still missing")
+            if not getattr(response, "data", None):
+                raise RuntimeError("Remote row still missing or unacknowledged")
             del pend[key]
         except Exception as e:
             record_db_error("Retry Cloud Sync", e)
@@ -1683,8 +1676,16 @@ def normalize_lse_history_prices(df: pd.DataFrame, currency: str) -> pd.DataFram
         result[col] = pd.to_numeric(result[col], errors="coerce") * factor
     if "Dividends" in result.columns:
         result["Dividends"] = pd.to_numeric(result["Dividends"], errors="coerce") * factor
-    result = result.replace([np.inf, -np.inf], np.nan).dropna(subset=["Close"])
-    result = result[result["Close"] > 0]
+    result = result.replace([np.inf, -np.inf], np.nan).dropna(subset=list(required))
+    # A corrupt high/low (or zero opening price) can fabricate a target or stop.
+    # Reject the row, rather than silently learning from a nonsensical candle.
+    valid = (result["Low"] > 0) & (result["Open"] > 0) & (result["Close"] > 0)
+    valid &= result["High"] >= result[["Open", "Low", "Close"]].max(axis=1) - 1e-7
+    valid &= result["Low"] <= result[["Open", "High", "Close"]].min(axis=1) + 1e-7
+    rejected = int((~valid).sum())
+    if rejected:
+        LOGGER.warning("Discarded %d invalid LSE price bars", rejected)
+    result = result.loc[valid].copy()
     result.attrs["quote_currency_original"] = currency
     result.attrs["price_currency"] = "GBp"
     return result
@@ -1882,8 +1883,26 @@ def compute_macro_lead_lag_adjustment(ticker: str, sector: str, macro: dict) -> 
     return delta, (" | ".join(notes) if notes else "Neutral Macro Regime")
 
 # ==============================================================================
-# 3. HARDENED ZERO-TRUST AUTHENTICATION (UNCHANGED)
+# 3. PASSWORD AUTHENTICATION (ARGON2ID; LEGACY SHA256 FOR EXISTING DEPLOYMENTS)
 # ==============================================================================
+def verify_login_password(candidate: str, argon2id_hash: str = "", legacy_sha256_hash: str = "") -> bool:
+    """Prefer password-hardening with Argon2id; keep old cloud secrets working.
+
+    If Argon2id is configured but invalid/unavailable, fail closed. Never
+    downgrade to SHA256 when a configured Argon2id hash fails verification.
+    """
+    if argon2id_hash:
+        if not argon2id_hash.startswith("$argon2id$"):
+            return False
+        try:
+            from argon2 import PasswordHasher
+            return bool(PasswordHasher().verify(argon2id_hash, candidate))
+        except Exception:
+            return False
+    if not re.fullmatch(r"[a-f0-9]{64}", legacy_sha256_hash):
+        return False
+    return hmac.compare_digest(hashlib.sha256(candidate.encode("utf-8")).hexdigest(), legacy_sha256_hash)
+
 def check_password() -> bool:
     if st.session_state.get("password_correct", False):
         login_ts = float(st.session_state.get("auth_login_ts", 0) or 0)
@@ -1903,10 +1922,11 @@ def check_password() -> bool:
     try:
         expected_user = str(st.secrets.get("AUTH_USER", "")).strip()
         expected_hash = str(st.secrets.get("AUTH_PASS_HASH", "")).strip().lower()
+        expected_argon = str(st.secrets.get("AUTH_PASS_ARGON2ID", "")).strip()
     except Exception:
-        expected_user, expected_hash = "", ""
-    if not expected_user or not re.fullmatch(r"[a-f0-9]{64}", expected_hash):
-        st.error("Authentication is not configured. Set AUTH_USER and AUTH_PASS_HASH in Streamlit secrets.")
+        expected_user, expected_hash, expected_argon = "", "", ""
+    if not expected_user or not (expected_argon.startswith("$argon2id$") or re.fullmatch(r"[a-f0-9]{64}", expected_hash)):
+        st.error("Authentication is not configured. Set AUTH_USER and AUTH_PASS_ARGON2ID (preferred) or AUTH_PASS_HASH in Streamlit secrets.")
         return False
 
     st.subheader("🔐 ALPHA-LSE Quant Terminal — Restricted Institutional Access")
@@ -1916,9 +1936,8 @@ def check_password() -> bool:
         submitted = st.form_submit_button("Authenticate Session", width="stretch", type="primary")
 
         if submitted:
-            input_hash = hashlib.sha256(pass_in.encode("utf-8")).hexdigest()
-            user_ok = hmac.compare_digest(user_in.strip(), str(expected_user).strip())
-            pass_ok = hmac.compare_digest(input_hash, str(expected_hash).strip().lower())
+            user_ok = hmac.compare_digest(user_in.strip(), expected_user)
+            pass_ok = verify_login_password(pass_in, expected_argon, expected_hash)
 
             if user_ok and pass_ok:
                 st.session_state["password_correct"] = True
@@ -1967,6 +1986,93 @@ if STORAGE_MODE == "local":
 # ==============================================================================
 # 4. AUDIT & RECONCILIATION ENGINE (BAR-WALKING, GAP-AWARE, STOP-FIRST)
 # ==============================================================================
+def needs_completed_bar_replay(bar_day, entry_day, last_audit, today_day) -> bool:
+    """A partial bar audited during the trading day must be replayed when it closes.
+
+    Excludes pre-entry days, entry day (handled using close ONLY), and the live day.
+    Audit timestamps are stored in Europe/London local time by this app.
+    """
+    if not (entry_day < bar_day < today_day):
+        return False
+    if not last_audit:
+        return True
+    try:
+        audit_time = datetime.strptime(str(last_audit)[:19], "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return True     # unknown audit time: conservatively replay for safety
+    if bar_day > audit_time.date():
+        return True
+    if bar_day < audit_time.date():
+        return False
+    # Previous day's intraday audit only saw the partial candle. During a half day,
+    # prices are final at 12:30 rather than 16:30.
+    closing = dtime(12, 30) if (bar_day.month, bar_day.day) in ((12, 24), (12, 31)) else dtime(16, 30)
+    return audit_time.time() < closing
+
+
+def evaluate_live_equity_bar(entry: float, target: float, stop: float,
+                             current: float, high: float, low: float,
+                             be_floor: float, be_trigger: float, friction: float,
+                             entry_day: bool, bar_complete: bool = False,
+                             opening: float = None) -> tuple:
+    """Return (status, fill, stop_for_next_day).
+
+    We never use today's whole-bar high/low for an entry made today: those prices
+    might have happened BEFORE the simulated buy. A new break-even stop is only
+    saved after the daily bar is complete, preventing prior lows from retrospectively
+    triggering a newly raised stop on later refreshes of the SAME day's bar.
+    """
+    if not all(math.isfinite(float(v)) for v in (entry, target, stop, current, high, low, be_floor, be_trigger, friction)):
+        raise ValueError("Invalid intraday price values")
+    if entry_day:
+        stop_hit, target_hit = current <= stop, current >= target
+    else:
+        stop_hit, target_hit = low <= stop or current <= stop, high >= target or current >= target
+    if stop_hit:
+        # A bar opening under the stop is a gap, not a fill magically at stop price.
+        fill = min(stop, current) if current <= stop else stop
+        if not entry_day and opening is not None and math.isfinite(float(opening)) and opening <= stop:
+            fill = min(fill, float(opening))
+        return classify_stop_exit(entry, stop, fill, friction), fill, stop
+    if target_hit:
+        # Do not assume a favourable fill above the target without a verified quote.
+        return "🎯 WIN (TARGET HIT)", target, stop
+    new_stop = stop
+    if bar_complete and target > entry and stop < be_floor and high >= be_trigger and current > be_floor:
+        new_stop = be_floor
+    return "ACTIVE", 0.0, new_stop
+
+
+def entry_day_close_needs_replay(entry_day, last_audited, today_day) -> bool:
+    """Check the entry-day close once, before later stop adjustments can distort it."""
+    if entry_day is None or entry_day >= today_day:
+        return False
+    last_day = _to_date(last_audited)
+    return last_day is None or last_day <= entry_day
+
+
+def history_period_for_open_trade(entry_date, today_date) -> str:
+    """Fetch enough candles to reconcile after a prolonged laptop shutdown."""
+    if entry_date is None:
+        return "1mo"
+    age_days = max(0, (today_date - entry_date).days)
+    if age_days <= 25:
+        return "1mo"
+    if age_days <= 150:
+        return "6mo"
+    if age_days <= 650:
+        return "2y"
+    return "max"
+
+
+def sufficient_audit_history(entry_date, last_audited, first_bar_date) -> bool:
+    """Never pretend to know price movements missing from the downloaded series."""
+    if entry_date is None or first_bar_date is None:
+        return False
+    last_day = _to_date(last_audited) or entry_date
+    return max(last_day, entry_date) >= first_bar_date
+
+
 def audit_and_reconcile_all_trades():
     now_lon = london_now()
     now_str = now_lon.strftime('%Y-%m-%d %H:%M:%S')
@@ -1976,6 +2082,7 @@ def audit_and_reconcile_all_trades():
     st.session_state["price_feed_problem"] = False
     st.session_state["unpriced_open_tickers"] = set()
     st.session_state["corporate_action_review"] = set()
+    st.session_state["incomplete_audit_history"] = set()
 
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=False)
@@ -1995,7 +2102,8 @@ def audit_and_reconcile_all_trades():
             if not is_valid_lse_ticker(tkr):
                 continue
             try:
-                h = fetch_cached_history(tkr, period="1mo")
+                trade_start = _to_date(tr.get("date_str"))
+                h = fetch_cached_history(tkr, period=history_period_for_open_trade(trade_start, today_date))
                 if h.empty:
                     if feed_ok is None:
                         feed_ok = not fetch_cached_history("^FTSE", period="5d").empty
@@ -2017,6 +2125,11 @@ def audit_and_reconcile_all_trades():
                 entry_dt = _to_date(tr["date_str"])
                 if entry_dt is None:
                     continue
+                if not sufficient_audit_history(entry_dt, tr.get("last_audited"), dates[0] if dates else None):
+                    st.session_state["price_feed_problem"] = True
+                    st.session_state["incomplete_audit_history"].add(tkr)
+                    LOGGER.warning("Cannot audit %s: downloaded history does not cover the last completed audit", tkr)
+                    continue  # keep open; no invented win, loss, or expiry
                 if "Stock Splits" in h.columns:
                     splits = pd.to_numeric(h["Stock Splits"], errors="coerce").fillna(0.0)
                     changed = any(d >= entry_dt and v != 0 for d, v in zip(dates, splits))
@@ -2024,22 +2137,32 @@ def audit_and_reconcile_all_trades():
                         st.session_state.setdefault("corporate_action_review", set()).add(tkr)
                         LOGGER.warning("Stock split detected while %s was held; keeping trade open for review", tkr)
                         continue
-                last_aud_dt = _to_date(tr.get("last_audited")) or entry_dt
-                start_after = max(entry_dt, last_aud_dt)
-
+                last_audited = _first_valid(tr.get("last_audited"))
                 new_status = "ACTIVE"
                 exit_price = 0.0
                 exit_ts = None
                 curr = float(h["Close"].iloc[-1])
 
-                # 1) COMPLETED bars since the last audit (catches days the app was asleep)
+                # 1) Completed bars since the last audit (including an earlier partial audit).
                 for i, d in enumerate(dates):
-                    if d <= start_after or d >= today_date:
+                    if d == entry_dt and entry_day_close_needs_replay(entry_dt, last_audited, today_date):
+                        # We cannot know which intraday high/low occurred before entry.
+                        # Only the close is guaranteed to be AFTER an entry made by 16:00.
+                        c = float(h.iloc[i]["Close"])
+                        if c <= stop:
+                            new_status, exit_price = classify_stop_exit(entry, stop, c, friction), c
+                        elif c >= target:
+                            new_status, exit_price = "🎯 WIN (TARGET HIT)", target
+                        else:
+                            curr = c
+                        if new_status != "ACTIVE":
+                            exit_ts = f"{d} 16:30:00"
+                            break
+                        continue
+                    if not needs_completed_bar_replay(d, entry_dt, last_audited, today_date):
                         continue
                     row = h.iloc[i]
                     o, hi, lo, c = float(row["Open"]), float(row["High"]), float(row["Low"]), float(row["Close"])
-                    if not all(math.isfinite(v) for v in (o, hi, lo, c)):
-                        continue
                     outcome, fill, new_stop = evaluate_completed_bar(o, hi, lo, c, entry, target, stop, be_floor, be_trigger)
                     if outcome == "WIN":
                         new_status, exit_price = "🎯 WIN (TARGET HIT)", fill
@@ -2053,34 +2176,27 @@ def audit_and_reconcile_all_trades():
                         exit_ts = f"{d} 16:30:00"
                         break
 
-                # 2) LIVE bar (today) — original entry-day guard preserved
-                if new_status == "ACTIVE":
-                    have_live = bool(dates) and dates[-1] == today_date
-                    if have_live:
-                        last = h.iloc[-1]
-                        curr = float(last["Close"])
-                        day_high = float(last["High"]) if "High" in h.columns else curr
-                        day_low = float(last["Low"]) if "Low" in h.columns else curr
-                        same_day = (entry_dt == today_date)
+                # 2) Today's bar: no retroactive new stop during partial bars.
+                have_live = bool(dates) and dates[-1] == today_date
+                if new_status == "ACTIVE" and have_live:
+                    last = h.iloc[-1]
+                    curr = float(last["Close"])
+                    day_high, day_low = float(last["High"]), float(last["Low"])
+                    market_close = get_market_state()["close"]
+                    status, fill, updated_stop = evaluate_live_equity_bar(
+                        entry, target, stop, curr, day_high, day_low, be_floor, be_trigger,
+                        friction, entry_dt == today_date, bar_complete=now_lon.time() >= market_close,
+                        opening=float(last["Open"]))
+                    if status != "ACTIVE":
+                        new_status, exit_price = status, fill
+                    else:
+                        stop = updated_stop
 
-                        if target_dist > 0 and stop < be_floor:
-                            ratchet_hit = (curr >= be_trigger) if same_day else (curr >= be_trigger or day_high >= be_trigger)
-                            if ratchet_hit and curr > be_floor:
-                                stop = be_floor
-                        is_be = is_stop_breakeven_protected(entry, stop)
-
-                        hit_target = (curr >= target) if same_day else (curr >= target or day_high >= target)
-                        hit_stop = (curr <= stop) if (same_day or is_be) else (curr <= stop or day_low <= stop)
-
-                        if hit_stop:      # stop wins ties (conservative)
-                            fill = curr if curr <= stop else stop
-                            new_status = classify_stop_exit(entry, stop, fill, friction)
-                            exit_price = fill
-                        elif hit_target:
-                            new_status, exit_price = "🎯 WIN (TARGET HIT)", target
-
-                # 3) Time exit
-                if new_status == "ACTIVE" and (today_date - entry_dt).days >= MAX_HOLD_CALENDAR_DAYS:
+                # 3) An expiry is an actual simulated sale, not a fabricated sale
+                # on a weekend or with yesterday's stale quote.
+                today_is_trading = get_market_state()["trading_day"]
+                if (new_status == "ACTIVE" and (today_date - entry_dt).days >= MAX_HOLD_CALENDAR_DAYS
+                        and have_live and today_is_trading and now_lon.time() >= dtime(8, 0)):
                     new_status = "⏱️ EXPIRED (TIME EXIT)"
                     exit_price = curr
 
@@ -2522,10 +2638,33 @@ def _save_retrain_state(state: dict):
     except Exception:
         pass
 
+def make_time_purged_train_test(records: list, hold_days: int = 7,
+                                min_train: int = 80, min_test: int = 25,
+                                min_test_days: int = 5):
+    """Select training/validation by entry date with an embargo around the split.
+
+    Returns (training_records, validation_records, first_validation_date) or None.
+    Does not permit same-day or overlapping holding-period trade information
+    to bleed across the model promotion decision.
+    """
+    ordered = sorted(records, key=lambda r: r[0])
+    unique_dates = sorted({r[0] for r in ordered})
+    if len(unique_dates) < 15:
+        return None
+    split_day = unique_dates[int(len(unique_dates) * 0.7)]
+    cutoff_train = (datetime.strptime(split_day, "%Y-%m-%d") - timedelta(days=hold_days)).strftime("%Y-%m-%d")
+    training = [r for r in ordered if r[0] < cutoff_train]
+    validation = [r for r in ordered if r[0] >= split_day]
+    if len(training) < min_train or len(validation) < min_test or len({r[0] for r in validation}) < min_test_days:
+        return None
+    return training, validation, split_day
+
+
 def check_and_auto_retrain_model(feature_cols: list, closed_df: pd.DataFrame):
-    """Champion/challenger: a challenger is trained on live trades, validated walk-forward on the most recent
-    30% of trades, and only PROMOTED (to a separate file) if it beats the current champion. The original
-    ensemble_ranker.joblib is never overwritten."""
+    """Champion/challenger: train on earlier entry dates; validate on later dates
+    after a holding-period embargo. Promote only if two metrics improve.
+    The original ensemble_ranker.joblib is never overwritten. This retrospective
+    test is a safety gate, NOT proof of future accuracy or profitability."""
     if closed_df is None or closed_df.empty:
         return
     # Locally persisted model artefacts permit opt-in-free, evidence-gated learning.
@@ -2546,9 +2685,13 @@ def check_and_auto_retrain_model(feature_cols: list, closed_df: pd.DataFrame):
             continue
         try:
             vec = [float(raw[c]) for c in feature_cols]
+            date_str = str(r.get("date_str") or "")[:10]
+            datetime.strptime(date_str, "%Y-%m-%d")
+            if not all(math.isfinite(v) for v in vec):
+                continue
         except Exception:
             continue
-        records.append((str(r.get("date_str") or ""), vec, y))
+        records.append((date_str, vec, y))
 
     n = len(records)
     if n < MIN_SETTLED_TO_RETRAIN:
@@ -2560,12 +2703,19 @@ def check_and_auto_retrain_model(feature_cols: list, closed_df: pd.DataFrame):
     if n - int(state.get("last_labeled_count", 0)) < RETRAIN_STEP_INTERVAL:
         return
 
-    records.sort(key=lambda x: x[0])
+    windows = make_time_purged_train_test(records, hold_days=MAX_HOLD_CALENDAR_DAYS)
+    if windows is None:
+        return  # Not enough independent historical observations to justify promotion.
+    training, validation, split_day = windows
+    X_tr = pd.DataFrame([r[1] for r in training], columns=feature_cols)
+    y_tr = np.array([r[2] for r in training])
+    X_te = pd.DataFrame([r[1] for r in validation], columns=feature_cols)
+    y_te = np.array([r[2] for r in validation])
     X_all = pd.DataFrame([r[1] for r in records], columns=feature_cols)
     y_all = np.array([r[2] for r in records])
-    split = int(n * 0.7)
-    X_tr, X_te, y_tr, y_te = X_all.iloc[:split], X_all.iloc[split:], y_all[:split], y_all[split:]
-    state.update({"last_attempt_date": today_s, "last_labeled_count": n})
+    state.update({"last_attempt_date": today_s, "last_labeled_count": n,
+                  "validation_start_date": split_day, "validation_n": len(validation),
+                  "training_n": len(training), "purge_days": MAX_HOLD_CALENDAR_DAYS})
 
     if len(np.unique(y_tr)) < 2 or len(np.unique(y_te)) < 2:
         _save_retrain_state(state)
@@ -3132,7 +3282,7 @@ def log_equity_signal_safely(sig: dict, enforce_sector_cap: bool = True) -> bool
                     remote_held = supabase.table("predictions").select("ticker,status").eq("ticker", ticker).execute()
                     if any(_norm_status(r.get("status")) == "ACTIVE" for r in (remote_held.data or [])):
                         return fail("Cloud records show this stock already open")
-                    supabase.table("predictions").insert({
+                    remote_result = supabase.table("predictions").insert({
                         "predicted_date": today_str, "ticker": ticker, "company_name": f"{ticker} ({sector})",
                         "entry_price": price, "target_price": target, "stop_loss": stop,
                         "position_gbp": capital, "shares_qty": shares,
@@ -3143,6 +3293,8 @@ def log_equity_signal_safely(sig: dict, enforce_sector_cap: bool = True) -> bool
                         "rns_headline": str(sig.get("RNSHeadline", ""))[:120],
                         "features_json": f_dict, "last_checked": now_str
                     }).execute()
+                    if not getattr(remote_result, "data", None):
+                        raise RuntimeError("Cloud insert not confirmed; check journal before retrying")
                 except Exception as exc:
                     record_db_error("Create durable paper trade", exc)
                     return fail("Cloud journal write failed; no new trade was recorded")
@@ -3863,68 +4015,11 @@ def signal_card_html(rank, row, loggable) -> str:
     """)
 
 # ---------- charts ----------
-def show_fig(fig, key=None):
-    if not PLOTLY_OK or fig is None:
-        return
-    try:
-        st.plotly_chart(fig, width="stretch", key=key)
-    except TypeError:
-        st.plotly_chart(fig, use_container_width=True, key=key)
 
-def _base_layout(fig, height=320, title=None):
-    fig.update_layout(height=height, margin=dict(l=10, r=10, t=44 if title else 16, b=10), title=title,
-                      legend=dict(orientation="h", y=1.14), hovermode="x unified")
-    return fig
 
-def chart_cumulative_pnl(perf_df: pd.DataFrame, title: str, key: str = None):
-    if perf_df.empty:
-        return
-    x = [str(d) for d in perf_df["exit_date"]]
-    cum = perf_df["pnl_gbp"].cumsum()
-    if not PLOTLY_OK:
-        st.line_chart(pd.DataFrame({"Running profit/loss (£)": cum.values}, index=x))
-        return
-    colour = "#16a34a" if cum.iloc[-1] >= 0 else "#dc2626"
-    fig = go.Figure(go.Scatter(x=x, y=cum, mode="lines+markers", line=dict(color=colour, width=3, shape="hv"),
-                               fill="tozeroy", name="Running profit/loss (£)",
-                               hovertemplate="%{x}<br>£%{y:,.2f}<extra></extra>"))
-    show_fig(_base_layout(fig, 320, title), key=key)
 
-def chart_outcome_donut(perf: dict, title: str = "How your trades ended", key: str = None):
-    labels = ["Hit the goal", "Safety exit", "Sold with no loss", "Time ran out"]
-    vals = [perf["wins"], perf["losses"], perf["be"], perf["expired"]]
-    if not PLOTLY_OK:
-        st.bar_chart(pd.DataFrame({title: vals}, index=labels))
-        return
-    fig = go.Figure(go.Pie(labels=labels, values=vals, hole=0.62, sort=False,
-                           marker=dict(colors=["#16a34a", "#dc2626", "#d97706", "#64748b"]), textinfo="label+percent"))
-    fig.update_layout(height=320, margin=dict(l=10, r=10, t=44, b=10), title=title, showlegend=False)
-    show_fig(fig, key=key)
 
-def chart_pnl_hist(perf_df: pd.DataFrame):
-    if perf_df.empty:
-        return
-    if not PLOTLY_OK:
-        st.bar_chart(perf_df["pnl_pct"].round(1).value_counts().sort_index())
-        return
-    fig = go.Figure(go.Histogram(x=perf_df["pnl_pct"], nbinsx=24, marker=dict(color="#6366f1"), hovertemplate="%{x:.1f}% : %{y} trades<extra></extra>"))
-    fig.add_vline(x=0, line_dash="dash", line_color="gray")
-    fig.update_layout(height=320, margin=dict(l=10, r=10, t=44, b=10), title="How much each trade made or lost (%) — right of the dashed line = profit", bargap=0.05)
-    show_fig(fig)
 
-def chart_sector_exposure(exp: dict):
-    if not exp:
-        return
-    items = sorted(exp.items(), key=lambda x: x[1])
-    if not PLOTLY_OK:
-        st.bar_chart(pd.DataFrame({"open trades": [v for _, v in items]}, index=[k for k, _ in items]))
-        return
-    fig = go.Figure(go.Bar(x=[v for _, v in items], y=[k for k, _ in items], orientation="h",
-                           marker=dict(color=["#dc2626" if v >= MAX_ACTIVE_PER_SECTOR else "#6366f1" for _, v in items]),
-                           hovertemplate="%{y}: %{x} open<extra></extra>"))
-    fig.add_vline(x=MAX_ACTIVE_PER_SECTOR, line_dash="dot", line_color="#d97706", annotation_text=f"max {MAX_ACTIVE_PER_SECTOR}")
-    fig.update_layout(height=max(220, 38 * len(items) + 60), margin=dict(l=10, r=10, t=40, b=10), title="Open trades per sector (red = full)", xaxis=dict(dtick=1))
-    show_fig(fig)
 
 def calibration_rows(closed_df: pd.DataFrame) -> list:
     rows = []
@@ -3944,38 +4039,7 @@ def calibration_rows(closed_df: pd.DataFrame) -> list:
         rows.append((conf, 1 if o == "WIN" else 0))
     return rows
 
-def chart_calibration(rows: list):
-    d = pd.DataFrame(rows, columns=["conf", "hit"])
-    d["bucket"] = pd.cut(d["conf"], bins=[0, 60, 70, 80, 101], labels=["Under 60%", "60–70%", "70–80%", "80%+"])
-    g = d.groupby("bucket", observed=True).agg(stated=("conf", "mean"), realised=("hit", lambda s: s.mean() * 100.0), n=("hit", "size")).reset_index()
-    if not PLOTLY_OK:
-        st.dataframe(g.rename(columns={"bucket": "AI confidence", "stated": "AI said (%)", "realised": "Actually won (%)", "n": "Trades"}), hide_index=True)
-        return
-    fig = go.Figure()
-    fig.add_bar(x=g["bucket"].astype(str), y=g["stated"], name="What the AI said", marker_color="#6366f1")
-    fig.add_bar(x=g["bucket"].astype(str), y=g["realised"], name="How often it actually won", marker_color="#16a34a",
-                customdata=g["n"], hovertemplate="%{y:.0f}% won (from %{customdata} trades)<extra></extra>")
-    fig.update_layout(barmode="group", height=320, margin=dict(l=10, r=10, t=44, b=10), title="When the AI says “X% sure”, how often is it right?",
-                      yaxis=dict(range=[0, 100], title="%"), legend=dict(orientation="h", y=1.14))
-    show_fig(fig)
 
-def chart_rolling(perf_df: pd.DataFrame, window: int = 10):
-    n = len(perf_df)
-    if n < window + 5:
-        st.info(f"This chart appears once {window + 5} trades have finished (so far: {n}).")
-        return
-    wins = (perf_df["outcome"] == "WIN").astype(float)
-    roll = (wins.rolling(window).mean() * 100.0).tolist()
-    overall = float(wins.mean() * 100.0)
-    x = list(range(1, n + 1))
-    if not PLOTLY_OK:
-        st.line_chart(pd.DataFrame({f"Win rate of last {window} trades (%)": roll}, index=x))
-        return
-    fig = go.Figure(go.Scatter(x=x, y=roll, mode="lines", line=dict(color="#6366f1", width=3), name=f"Last {window} trades",
-                               hovertemplate="After trade %{x}: %{y:.0f}% won<extra></extra>"))
-    fig.add_hline(y=overall, line_dash="dash", line_color="gray", annotation_text=f"overall {overall:.0f}%", annotation_position="top left")
-    fig.update_layout(height=300, margin=dict(l=10, r=10, t=30, b=10), yaxis=dict(range=[0, 100], title="% won"), xaxis_title="Finished trade number", showlegend=False)
-    show_fig(fig)
 
 def style_ledger(df: pd.DataFrame):
     """Colourised, sortable table; falls back to the plain table if styling is unavailable."""
@@ -4216,6 +4280,8 @@ with st.sidebar.expander("🩺 System health"):
         st.error("Prices missing for open: " + ", ".join(sorted(st.session_state["unpriced_open_tickers"])) + ". Left OPEN for manual review.")
     if st.session_state.get("corporate_action_review"):
         st.error("Stock split while held: " + ", ".join(sorted(st.session_state["corporate_action_review"])) + ". Check quantity, cost and target manually; trade left OPEN.")
+    if st.session_state.get("incomplete_audit_history"):
+        st.error("Not enough historical prices to audit: " + ", ".join(sorted(st.session_state["incomplete_audit_history"])) + ". Trades remain OPEN; restore a complete price feed before relying on performance numbers.")
     cap_state = get_portfolio_capacity()
     st.write(f"💼 Used: {gbp(cap_state.get('invested_gbp', 0))} · Available: {gbp(cap_state.get('cash_gbp', 0))} · Risk: {gbp(cap_state.get('risk_gbp', 0))}")
     st.caption(f"Build {APP_VERSION}; local files persist on this laptop, but need independent backups.")
@@ -4482,25 +4548,22 @@ with tab_home:
         ])
         p1, p2 = st.columns([1.1, 1])
         with p1:
-            st.markdown("**How today's picks were found**")
-            st.markdown(funnel_html([
-                ("Shares looked at", stats_p.get("listed", 0)),
-                ("Prices available", stats_p.get("priced", 0)),
-                ("Easy & safe to trade", n_sc),
-                ("Room to buy (not held, sector free)", max(0, n_sc - int(stats_p.get("held", 0)))),
-                ("Scored by the AI", stats_p.get("candidates", 0)),
-                ("Best scores, fully checked", stats_p.get("deep", 0)),
-                ("Passed every check", stats_p.get("qualified", 0)),
-            ]), unsafe_allow_html=True)
-            st.caption(f"{stats_p.get('held', 0)} shares were left out because you already own them, sold them in the last {COOLDOWN_CALENDAR_DAYS} days, or their sector is full.")
+            st.markdown("**How today's picks were selected**")
+            st.write(f"Checked **{stats_p.get('listed', 0):,}** stock symbols; prices were available for **{stats_p.get('priced', 0):,}**.")
+            st.write(f"**{n_sc:,}** met the liquidity and volatility checks; **{stats_p.get('candidates', 0):,}** were eligible to be scored.")
+            st.write(f"**{stats_p.get('deep', 0):,}** finalists received additional checks; **{stats_p.get('qualified', 0):,}** passed all checks.")
+            st.caption(f"{stats_p.get('held', 0)} were excluded because they were already held, recently sold, or exceeded a concentration rule. A recommendation is not a guaranteed profit.")
         with p2:
-            st.markdown("**How much of the market is rising**")
-            st.markdown(gauge_html(up_pct), unsafe_allow_html=True)
-            st.caption("Share of easy-to-trade shares above their 20-day average and up over 20 days.")
-            heat = sector_heat_html(stats_p.get("sector_breadth", {}) or {})
-            if heat:
-                st.markdown("**Strongest sectors right now**")
-                st.markdown(heat, unsafe_allow_html=True)
+            st.markdown("**Market conditions in plain English**")
+            st.write(f"**{breadth_word(up_pct)}:** about {up_pct:.0f}% of the eligible shares are rising by the scanner's trend rule.")
+            sectors = stats_p.get("sector_breadth", {}) or {}
+            ranked = sorted(((100 * good / count, sec, count) for sec, (good, count) in sectors.items() if count >= 5), reverse=True)[:4]
+            if ranked:
+                st.markdown("**Sectors with the strongest current trend**")
+                for pct, sec, n_securities in ranked:
+                    st.write(f"{sec}: {pct:.0f}% trending upward ({n_securities} shares checked)")
+            else:
+                st.caption("Not enough shares have passed the screening checks for a sector comparison.")
         if stats_p.get("leaders"):
             st.markdown("**Beating the FTSE 100 most over 20 days** · for information, not buy tips")
             st.markdown(leaders_html(stats_p["leaders"]), unsafe_allow_html=True)
@@ -4977,7 +5040,7 @@ with tab_learn:
         sec_title("🧠", "Is it getting better?", "Results from the latest ten finished trades")
         last10 = perf_eq_df.tail(10)
         st.write(f"Last {len(last10)}: {int((last10['pnl_pct'] > 0).sum())} profitable · average return {float(last10['pnl_pct'].mean()):+.2f}% after estimated costs.")
-        st.caption("A short winning streak does not prove predictive accuracy; the model upgrades only on held-out tests.")
+        st.caption("A short winning streak does not prove predictive accuracy; the model upgrades only after date-separated historical validation; forward performance still needs watching.")
 
         sec_title("🧷", "Stocks it remembers", "lessons fade by half every 30 days")
         careful, liked = compute_memory(closed_all)
@@ -5049,9 +5112,10 @@ with tab_learn:
     st.markdown(
         f"- **Version in use:** {st.session_state.get('ml_model_source', 'not loaded yet')}\n"
         f"- **Last upgrade:** {state.get('last_promoted', 'never — still the original')}\n"
-        f"- **Upgrade rule:** on this laptop, retraining runs after {MIN_SETTLED_TO_RETRAIN}+ labelled trades and saves only a challenger that beats the existing model on later held-out trades. Cloud retraining remains off until model storage is persistent."
+        f"- **Upgrade rule:** on this laptop, retraining runs after {MIN_SETTLED_TO_RETRAIN}+ labelled trades and saves a challenger only if it beats the current model in a date-separated validation with a 7-day gap. This is still a paper-trading estimate, not guaranteed real-world accuracy. Cloud retraining remains off until model storage is persistent."
         + (f"\n- **Confidence tuning:** based on {cal['decided']} trades that clearly won or lost." if cal else "")
         + f"\n- **Evidence learner:** {'in use' if ev_model.get('ready') else 'collecting evidence'} (see above)."
+        + (f"\n- **Latest AI validation:** {state['validation_n']} later paper trades from {state['validation_start_date']}, excluding {state['purge_days']} days around the training boundary." if state.get('validation_n') else "\n- **Latest AI validation:** waiting for enough independent closed paper trades.")
         + "\n- **Options:** this AI learns from share trades only. Options have their own separate learner — see the 🎲 Options tab.")
 
     with st.expander("How the AI picks a share"):

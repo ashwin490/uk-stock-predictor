@@ -1,3 +1,7 @@
+> **Final reviewed package:** See [FINAL_RELEASE_NOTES.md](FINAL_RELEASE_NOTES.md) for the replacement steps, password compatibility, and validation limits.
+
+> **New reliability build:** replace `app.py` only after backing up your trade database and model. Review [CHANGELOG.md](CHANGELOG.md); 43 offline tests passed.
+
 # ALPHA-LSE — November 2026 update
 
 ## What is new?
@@ -37,7 +41,7 @@
 
 ## Testing and safety
 
-- `python -m pytest -q tests` — 25 offline tests passed in the supplied build environment.
+- `python -m pytest -q tests` — 43 offline tests passed in the supplied build environment.
 - `python -m py_compile app.py alpha_backup.py setup_auth.py` — syntax passed.
 - I did **not** validate live quotes, your actual Supabase project, your trained model, or end-to-end Streamlit deployment. Trading forecasts are not guaranteed to be accurate.
 - This application records **simulated paper trades**, not actual brokerage orders.

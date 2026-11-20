@@ -14,6 +14,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import tempfile
 import zipfile
 from datetime import datetime, timezone
@@ -68,11 +69,21 @@ def create_backup(data_dir: str | Path, backup_dir: str | Path | None = None) ->
                 file = data_dir / relative
                 if not file.is_file() or file.is_symlink():
                     continue
-                raw = file.read_bytes()
-                if len(raw) > MAX_MEMBER_BYTES:
+                # Stream large archives: ten years of trades must not require
+                # enough RAM to hold the whole DuckDB file at once.
+                size = file.stat().st_size
+                if size > MAX_MEMBER_BYTES:
                     raise ValueError(f"File too large for a single backup: {relative}")
-                archive.writestr(relative, raw)
-                contents[relative] = {"sha256": _sha256(raw), "size": len(raw)}
+                digest = hashlib.sha256()
+                copied = 0
+                with file.open("rb") as src, archive.open(relative, "w", force_zip64=True) as dest:
+                    while chunk := src.read(1024 * 1024):
+                        copied += len(chunk)
+                        if copied > MAX_MEMBER_BYTES:
+                            raise ValueError(f"File grew beyond the backup size limit: {relative}")
+                        digest.update(chunk)
+                        dest.write(chunk)
+                contents[relative] = {"sha256": digest.hexdigest(), "size": copied}
             archive.writestr(MANIFEST, json.dumps({
                 "format": "alpha-lse-learning-backup-v1",
                 "created_utc": now.isoformat(), "files": contents,
@@ -104,7 +115,15 @@ def verify_backup(archive_path: str | Path) -> dict:
             info = archive.getinfo(rel)
             if info.file_size > MAX_MEMBER_BYTES or info.file_size != meta.get("size"):
                 raise ValueError(f"Invalid size for {rel}")
-            if _sha256(archive.read(rel)) != meta.get("sha256"):
+            digest = hashlib.sha256()
+            total = 0
+            with archive.open(rel, "r") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > MAX_MEMBER_BYTES:
+                        raise ValueError(f"Oversized backup member: {rel}")
+                    digest.update(chunk)
+            if total != meta["size"] or digest.hexdigest() != meta.get("sha256"):
                 raise ValueError(f"Checksum mismatch for {rel}")
         return manifest
 
@@ -123,17 +142,32 @@ def restore_backup(archive_path: str | Path, data_dir: str | Path, *, force: boo
             for rel in paths:
                 target = tmp_path / rel
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(archive.read(rel))
+                with archive.open(rel, "r") as source, target.open("wb") as output:
+                    shutil.copyfileobj(source, output, length=1024 * 1024)
             # Existing files are kept in a timestamped rollback folder.
+            # On a failure midway through the restore, restore the originals.
             rollback = data_dir / "pre_restore" / datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
-            for rel in paths:
-                destination = data_dir / rel
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                if destination.exists():
+            replaced = []
+            moved = []
+            try:
+                for rel in paths:
+                    destination = data_dir / rel
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    if destination.exists():
+                        old = rollback / rel
+                        old.parent.mkdir(parents=True, exist_ok=True)
+                        os.replace(destination, old)
+                        moved.append(rel)
+                    os.replace(tmp_path / rel, destination)
+                    replaced.append(rel)
+            except Exception:
+                for rel in reversed(replaced):
+                    (data_dir / rel).unlink(missing_ok=True)
+                for rel in reversed(moved):
                     old = rollback / rel
-                    old.parent.mkdir(parents=True, exist_ok=True)
-                    os.replace(destination, old)
-                os.replace(tmp_path / rel, destination)
+                    if old.exists():
+                        os.replace(old, data_dir / rel)
+                raise
     return paths
 
 

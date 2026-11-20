@@ -1,3 +1,7 @@
+> **Final reviewed build (20 Nov 2026):** See [FINAL_RELEASE_NOTES.md](FINAL_RELEASE_NOTES.md). The last offline run passed 43 regression tests. This is still a paper simulator, not a tested investment strategy or a zero-maintenance ten-year guarantee.
+
+> **Latest update:** See [CHANGELOG.md](CHANGELOG.md) for the November 20 reliability audit, migration steps and testing limitations.
+
 # ALPHA-LSE — local-first simple investing lab (20 Nov 2026)
 
 **Paper trading only:** nothing in this project connects to a real broker or buys live shares. It uses unofficial Yahoo Finance data, your previously trained ML model and trade-history evidence to produce estimates—not reliable predictions or a guarantee of profit. The full app has **not** been live-integrated with your existing `feature_engine.py`, model file, market-data feed, or Supabase account in this review.
