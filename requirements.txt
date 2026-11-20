@@ -14,7 +14,7 @@ streamlit-autorefresh>=1.0,<2
 lightgbm>=4,<5
 catboost>=1.2,<2
 scikit-learn==1.7.2
-exchange-calendars>=4.5,<5
+exchange-calendars>=4.13.3,<5
 pyarrow>=18,<25
 # Only needed when using Supabase-backed cloud storage:
 supabase>=2,<3
