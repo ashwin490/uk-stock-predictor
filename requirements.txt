@@ -1,4 +1,6 @@
-# Runtime dependencies. Install with Python 3.11 and preserve a working requirements lock for deployment.
+# ALPHA-LSE: stable dependency policy for the model saved using sklearn 1.7.2.
+# Prefer Python 3.11 on your laptop. Streamlit Cloud Python is selected at deployment.
+# After changing versions, test your app and keep a snapshot of the exact working environment.
 streamlit>=1.45,<2
 pandas>=2.1,<3
 numpy>=1.26,<3
@@ -6,12 +8,13 @@ joblib>=1.3,<2
 argon2-cffi>=23.1,<26
 requests>=2.31,<3
 pytz>=2024.1
-yfinance>=0.2.60,<1
+yfinance==1.8.0
 duckdb>=1.1,<2
 streamlit-autorefresh>=1.0,<2
 lightgbm>=4,<5
 catboost>=1.2,<2
-scikit-learn>=1.4,<2
+scikit-learn==1.7.2
 exchange-calendars>=4.5,<5
-# Optional only for future Supabase cloud mode:
+pyarrow>=18,<25
+# Only needed when using Supabase-backed cloud storage:
 supabase>=2,<3
