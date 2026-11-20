@@ -1,0 +1,21 @@
+# NEVER commit authentication or cloud API keys
+.streamlit/secrets.toml
+.env
+.env.*
+# Local financial learning data and model archives
+lse_market_data.duckdb*
+models/*.joblib
+models/*.json
+backups/
+pre_restore/
+alpha_settings.json
+uk_universe.json
+aim_tickers.json
+extra_lse_tickers.json
+alpha_data/
+# local Python runtime
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.log

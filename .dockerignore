@@ -1,0 +1,11 @@
+.venv
+.git
+.streamlit
+backups
+pre_restore
+alpha_data
+lse_market_data.duckdb*
+models/*.joblib
+models/*.json
+*.log
+__pycache__

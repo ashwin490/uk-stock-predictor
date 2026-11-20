@@ -1,0 +1,12 @@
+services:
+  alpha-lse:
+    build: .
+    restart: unless-stopped
+    environment:
+      ALPHA_STORAGE_MODE: local
+      ALPHA_DATA_DIR: /app/data
+    volumes:
+      - ./alpha_data:/app/data
+      - ./.streamlit/secrets.toml:/app/.streamlit/secrets.toml:ro
+    ports:
+      - '127.0.0.1:8501:8501'

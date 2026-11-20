@@ -14,6 +14,8 @@ from pathlib import Path
 from datetime import datetime, time as dtime, timedelta
 import random
 import requests
+import logging
+from alpha_backup import create_backup
 
 import streamlit as st
 import pandas as pd
@@ -35,7 +37,9 @@ try:
 except ImportError:
     st_autorefresh = None
 
-warnings.filterwarnings("ignore")
+# Avoid hiding actionable warnings that indicate provider/API incompatibility.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+LOGGER = logging.getLogger("alpha_lse")
 
 try:
     from feature_engine import engineer_features
@@ -52,28 +56,105 @@ except ImportError:
 st.set_page_config(page_title="ALPHA-LSE Quant Terminal", page_icon="⚡", layout="wide", initial_sidebar_state="collapsed")
 
 ROOT_DIR = Path(__file__).resolve().parent
-DB_PATH = os.path.join(ROOT_DIR, "lse_market_data.duckdb")
-MODEL_PATH = os.path.join(ROOT_DIR, "models", "ensemble_ranker.joblib")          # original champion: NEVER overwritten
-LIVE_MODEL_PATH = os.path.join(ROOT_DIR, "models", "ensemble_live.joblib")        # promoted challenger (only if it beats champion)
-RETRAIN_STATE_PATH = os.path.join(ROOT_DIR, "models", "retrain_state.json")
-AIM_OVERRIDE_PATH = os.path.join(ROOT_DIR, "aim_tickers.json")                    # optional: JSON list of AIM tickers
+# Default local-first storage. Point ALPHA_DATA_DIR at a persistent mounted folder on a future cloud server.
+# Existing installations without ALPHA_DATA_DIR continue using their current database and models.
+DATA_DIR = Path(os.environ.get("ALPHA_DATA_DIR", str(ROOT_DIR))).expanduser().resolve()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+STORAGE_MODE = os.environ.get("ALPHA_STORAGE_MODE", "local").strip().lower()
+if STORAGE_MODE not in ("local", "cloud"):
+    raise RuntimeError("ALPHA_STORAGE_MODE must be local or cloud")
+SETTINGS_PATH = DATA_DIR / "alpha_settings.json"
+DB_PATH = str(DATA_DIR / "lse_market_data.duckdb")
+MODEL_PATH = str(DATA_DIR / "models" / "ensemble_ranker.joblib")          # original champion: NEVER overwritten
+LIVE_MODEL_PATH = str(DATA_DIR / "models" / "ensemble_live.joblib")        # promoted challenger (only if it beats champion)
+RETRAIN_STATE_PATH = str(DATA_DIR / "models" / "retrain_state.json")
+AIM_OVERRIDE_PATH = str(DATA_DIR / "aim_tickers.json")                    # optional: JSON list of AIM tickers
 
 # ---- Portfolio / risk guardrails ----
-MAX_DAILY_EQUITY_TRADES = 5
+MAX_DAILY_EQUITY_TRADES = float("inf")  # no arbitrary daily pick count
 MAX_HOLD_CALENDAR_DAYS = 7        # 5 LSE trading days
 BREAKEVEN_TRIGGER_RATIO = 0.65    # Ratchet stop to friction-adjusted break-even at >= 65% of target distance
-MAX_ACTIVE_PER_SECTOR = 2         # max 2 active positions per sector
-MAX_OPEN_POSITIONS = 20           # total open-position cap (market-wide correlation guard)
-MAX_OPEN_RISK_GBP = 250.0         # total open risk (entry->stop distance x size) cap
+MAX_ACTIVE_PER_SECTOR = float("inf")  # cap sector by invested capital instead, not ticker count
+MAX_OPEN_POSITIONS = float("inf")  # no arbitrary count cap
+MAX_PORTFOLIO_RISK_FRACTION = 0.05  # combined estimated stop risk <= 5% of paper capital
+MAX_SINGLE_TRADE_RISK_FRACTION = 0.01  # one trade risks <= 1% of paper capital
+MAX_SINGLE_POSITION_FRACTION = 0.25  # diversify; not an absolute pound or share-count ceiling
+MAX_SECTOR_FRACTION = 0.35  # paper exposure in a sector <= 35% of equity
+DEFAULT_PAPER_STARTING_GBP = 10_000.0  # not a maximum; edit in the interface
 MARKET_STRESS_FTSE_5D = -3.0      # pause new entries if FTSE 100 5-day change <= this
 COOLDOWN_CALENDAR_DAYS = 3        # anti-churn: no re-entry within 3 days of actual exit
 HALF_LIFE_DAYS = 30.0             # exponential decay half-life for historical penalties
-POSITION_SIZE_GBP = 500.0
+POSITION_SIZE_GBP = 500.0   # backward compatibility when reading old trades
+MIN_POSITION_SIZE_GBP = 1.0
+REQUIRE_DURABLE_CLOUD = (STORAGE_MODE == "cloud")  # cloud mode requires Supabase; local uses persistent DuckDB
+DATA_FRESHNESS_HOURS = 30               # non-trading-day data can be older; new entries still need today's bar
+APP_VERSION = "2026.11.20-local-first"
+
+def load_paper_settings() -> dict:
+    """Persist virtual-account configuration independent of browser sessions."""
+    try:
+        obj = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def get_starting_paper_cash() -> float:
+    try:
+        value = float(load_paper_settings().get("starting_cash_gbp", os.getenv("ALPHA_PAPER_CASH_GBP", DEFAULT_PAPER_STARTING_GBP)))
+        return value if math.isfinite(value) and value >= MIN_POSITION_SIZE_GBP else DEFAULT_PAPER_STARTING_GBP
+    except (ValueError, TypeError):
+        return DEFAULT_PAPER_STARTING_GBP
+
+
+def save_starting_paper_cash(amount: float) -> None:
+    """Changing this is a virtual deposit/resizing, not performance or model learning."""
+    value = float(amount)
+    if not math.isfinite(value) or value < MIN_POSITION_SIZE_GBP:
+        raise ValueError("Paper capital must be positive")
+    obj = load_paper_settings()
+    obj["starting_cash_gbp"] = value
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SETTINGS_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+    os.replace(tmp, SETTINGS_PATH)
+
+
+def get_position_size_gbp(price_p: float = None, stop_p: float = None, sector: str = None) -> float:
+    """Risk-based paper allocation without a fixed GBP cap or share-count ceiling.
+
+    Whole-share rounding happens at signal creation. A position is limited by
+    available pretend cash, concentration and the distance to its safety exit.
+    These limits scale with the configured virtual account balance.
+    """
+    cap = get_portfolio_capacity()
+    if not cap["ok"]:
+        return 0.0
+    equity = cap["equity_gbp"]
+    desired = min(cap["cash_gbp"], equity * MAX_SINGLE_POSITION_FRACTION)
+    if sector:
+        positions = get_active_positions_df()
+        sec_used = 0.0
+        if not positions.empty:
+            for _, r in positions.iterrows():
+                if get_trade_sector(r["ticker"], r.get("features_json")) == sector:
+                    sec_used += float(r["capital_allocated"])
+        desired = min(desired, max(0.0, equity * MAX_SECTOR_FRACTION - sec_used))
+    if price_p is not None and stop_p is not None:
+        p, s = float(price_p), float(stop_p)
+        if not (math.isfinite(p) and math.isfinite(s) and 0 < s < p):
+            return 0.0
+        risk_fraction = (p - s) / p
+        desired = min(desired, equity * MAX_SINGLE_TRADE_RISK_FRACTION / risk_fraction,
+                      max(0.0, cap["risk_budget_gbp"] - cap["risk_gbp"]) / risk_fraction)
+    # Reserve 1% for estimated fees, taxes and fill uncertainty.
+    return max(0.0, min(desired, cap["cash_gbp"] * 0.99))
+
 
 # ---- Entry realism / liquidity ----
 ENTRY_WINDOW_START = dtime(8, 30)   # skip the opening auction / first-30-min noise
 ENTRY_WINDOW_END = dtime(16, 0)
-MIN_PRICE_P = 20.0                  # skip penny stocks (pence)
+MIN_PRICE_P = 0.0                   # no penny-stock price exclusion; liquidity checks still apply
 MIN_AVG_TURNOVER_GBP = 1_000_000    # min 20d average daily traded value (GBP)
 MIN_QUALIFY_CONFIDENCE = 65         # (kept for older saved trades; picks are now chosen on expected value — see MIN_EV_PCT)
 MIN_NET_RETURN_PCT = 2.0
@@ -591,7 +672,8 @@ RNS_BEARISH_LEXICON = {
 
 @st.cache_resource
 def get_db_lock():
-    return threading.Lock()
+    # Re-entrant for atomic risk check + insertion (no parallel session bypass).
+    return threading.RLock()
 
 DB_LOCK = get_db_lock()
 
@@ -763,8 +845,11 @@ def get_commission_gbp() -> float:
     except Exception:
         return DEFAULT_COMMISSION_GBP
 
-def commission_round_trip_pct(commission_gbp: float) -> float:
-    return round(2.0 * float(commission_gbp) / POSITION_SIZE_GBP * 100.0, 3)
+def commission_round_trip_pct(commission_gbp: float, capital_gbp=None) -> float:
+    capital = get_position_size_gbp() if capital_gbp is None else float(capital_gbp)
+    if not (math.isfinite(capital) and capital > 0 and math.isfinite(float(commission_gbp)) and float(commission_gbp) >= 0):
+        return float("inf")  # fail closed: never pretend unknown costs are free
+    return round(200.0 * float(commission_gbp) / capital, 6)
 
 def get_sdrt_pct(ticker: str) -> float:
     return 0.0 if is_aim_exempt(ticker) else SDRT_PCT
@@ -793,9 +878,9 @@ def estimate_spread_pct(ticker: str, avg_turnover_gbp) -> float:
 def compute_friction_pct(ticker: str, spread_pct=None, commission_gbp=None) -> float:
     spread = default_spread_pct(ticker) if spread_pct is None else float(spread_pct)
     comm = get_commission_gbp() if commission_gbp is None else float(commission_gbp)
-    return round(get_sdrt_pct(ticker) + spread + commission_round_trip_pct(comm), 3)
+    return round(get_sdrt_pct(ticker) + spread + commission_round_trip_pct(comm), 6)
 
-def get_trade_friction_pct(ticker: str, f_json) -> float:
+def get_trade_friction_pct(ticker: str, f_json, capital_gbp=None) -> float:
     """Friction for a stored trade. Old rows (no commission/spread fields) keep their original assumptions."""
     f = _parse_features(f_json)
     sdrt = get_sdrt_pct(ticker)
@@ -815,16 +900,17 @@ def get_trade_friction_pct(ticker: str, f_json) -> float:
         commission = float(f.get("commission_gbp", 0.0))
     except Exception:
         commission = 0.0
-    return round(sdrt + spread + commission_round_trip_pct(commission), 3)
+    capital = f.get("capital_gbp", capital_gbp if capital_gbp is not None else POSITION_SIZE_GBP)
+    return round(sdrt + spread + commission_round_trip_pct(commission, capital), 6)
 
 def get_breakeven_exit_price(entry_price: float, friction_pct: float) -> float:
-    return round(float(entry_price) * (1.0 + (float(friction_pct) / 100.0)), 2)
+    return round(float(entry_price) * (1.0 + (float(friction_pct) / 100.0)), 4)
 
 def calc_net_equity_pnl_pct(entry_price: float, current_price: float, friction_pct: float) -> float:
     if entry_price <= 0:
         return 0.0
     gross_pct = ((float(current_price) - float(entry_price)) / float(entry_price)) * 100.0
-    return round(gross_pct - float(friction_pct), 2)
+    return round(gross_pct - float(friction_pct), 4)
 
 def is_stop_breakeven_protected(entry_price: float, stop_loss: float, ticker: str = "") -> bool:
     return float(stop_loss) >= float(entry_price) - 1e-4
@@ -897,7 +983,7 @@ def evaluate_rns_nlp_sentiment(ticker: str) -> dict:
 # ==============================================================================
 # 0b. THE MARKET: WHICH SHARES (FTSE 350 + LIQUID AIM) AND WHICH DAYS (UK BANK HOLIDAYS, HALF DAYS)
 # ==============================================================================
-UNIVERSE_SAVE_PATH = os.path.join(ROOT_DIR, "uk_universe.json")
+UNIVERSE_SAVE_PATH = str(DATA_DIR / "uk_universe.json")
 FTSE_LIST_PAGES = [("https://en.wikipedia.org/wiki/FTSE_100_Index", 80), ("https://en.wikipedia.org/wiki/FTSE_250_Index", 200)]
 GOV_UK_HOLIDAYS_URL = "https://www.gov.uk/bank-holidays.json"
 EXTRA_AIM_POOL = ["PTAL.L", "RKH.L", "ITM.L", "LTHM.L", "CMCL.L", "CAML.L", "SAV.L", "KP2.L", "BUR.L", "FEVR.L", "JET2.L", "NFG.L",
@@ -999,6 +1085,13 @@ def get_uk_universe() -> tuple:
         sectors.update({k: v for k, v in live.items()})
     for t, sec in _aim_pool().items():
         sectors.setdefault(t, sec)
+    # Optional additional LSE securities: a JSON array of Yahoo Finance .L tickers.
+    custom = _load_json(os.path.join(ROOT_DIR, "extra_lse_tickers.json"))
+    if isinstance(custom, list):
+        for raw in custom[:5000]:
+            ticker = str(raw).strip().upper()
+            if is_valid_lse_ticker(ticker):
+                sectors.setdefault(ticker, "Unclassified")
     for t, sec in SECTOR_MAP.items():
         if t in sectors:
             sectors[t] = sec
@@ -1089,9 +1182,24 @@ def get_uk_holidays() -> dict:
     return out
 
 def get_market_state() -> dict:
-    """Is the LSE trading today, and when does it close? Weekends, bank holidays and the 12:30 half days on
-    Christmas Eve and New Year's Eve are all handled."""
+    """Prefer the versioned XLON exchange calendar, with a cautious UK-holiday fallback.
+
+    Calendar packages and schedules must be updated periodically; there is no
+    static market-hours rule guaranteed correct for the next decade.
+    """
     now = london_now()
+    try:
+        import exchange_calendars as xcals
+        calendar = xcals.get_calendar("XLON")
+        session = pd.Timestamp(now.date())
+        if calendar.first_session <= session <= calendar.last_session:
+            if not calendar.is_session(session):
+                return {"trading_day": False, "reason": "XLON calendar: market closed", "close": dtime(16,30), "half_day": False}
+            close_at = calendar.session_close(session).tz_convert("Europe/London").time().replace(tzinfo=None)
+            return {"trading_day": True, "reason": "XLON scheduled early close" if close_at < dtime(16,30) else "",
+                    "close": close_at, "half_day": close_at < dtime(16,30)}
+    except Exception as exc:
+        LOGGER.info("XLON calendar unavailable; using public-holiday fallback: %s", exc)
     today = now.date()
     if now.weekday() > 4:
         return {"trading_day": False, "reason": "Weekend", "close": dtime(16, 30), "half_day": False}
@@ -1139,7 +1247,7 @@ def init_duckdb_storage():
                     entry_price DOUBLE,
                     target_price DOUBLE,
                     stop_loss DOUBLE,
-                    shares INTEGER,
+                    shares BIGINT,
                     capital_allocated DOUBLE,
                     status VARCHAR DEFAULT 'ACTIVE',
                     latest_price DOUBLE,
@@ -1150,6 +1258,10 @@ def init_duckdb_storage():
                     features_json VARCHAR DEFAULT '{}'
                 )
             """)
+            try:
+                con.execute("ALTER TABLE trade_journal ALTER COLUMN shares SET DATA TYPE BIGINT")
+            except Exception:
+                pass
             try:
                 con.execute("ALTER TABLE trade_journal ADD COLUMN features_json VARCHAR DEFAULT '{}'")
             except Exception:
@@ -1185,7 +1297,7 @@ def init_duckdb_storage():
         finally:
             con.close()
 
-init_duckdb_storage()
+# Initialization happens only after the operator is authenticated.
 
 def journal_counts() -> dict:
     out = {"total": 0, "open": 0, "closed": 0, "opt_total": 0, "opt_open": 0}
@@ -1224,22 +1336,33 @@ def get_supabase_client():
         st.session_state["db_error"] = "Supabase connection failed (Check secrets configuration)."
         return None
 
-supabase = get_supabase_client()
+# The remote connection is also opened only after a successful login.
+supabase = None
 
 def record_db_error(context: str, err: Exception):
-    raw_msg = str(err)
-    sanitized = re.sub(r"https?://[^\s'\"]+", "[REDACTED_URL]", raw_msg)
-    st.session_state["db_error"] = f"[{context}] {sanitized[:140]}"
+    # Exception messages from API clients can include credentials or raw URLs.
+    # Surface only a non-sensitive error class. Keep credentials out of the UI.
+    error_name = type(err).__name__
+    LOGGER.warning("%s: %s", context, error_name)
+    st.session_state["db_error"] = f"[{context}] {error_name}; inspect provider connection and application logs"
 
 def cloud_update(table: str, match: dict, payload: dict, label: str) -> bool:
-    """Supabase update with a retry queue so a failed sync is re-pushed instead of being reverted by hydrate."""
-    if not supabase:
+    """Local mode commits to DuckDB; cloud mode requires successful remote update first."""
+    if STORAGE_MODE == "local":
         return True
+    if not supabase:
+        st.session_state["db_error"] = f"Cloud backup unavailable for {label}; local update may not survive restart"
+        return False
     try:
         q = supabase.table(table).update(payload)
         for k, v in match.items():
             q = q.eq(k, v)
-        q.execute()
+        response = q.execute()
+        # Supabase Python's update() normally returns the modified row(s).
+        # An empty result means the remote row was not found; don't advance
+        # the local audit and risk losing the close at the next restart.
+        if getattr(response, "data", None) == []:
+            raise RuntimeError("No remote row matched the update filters")
         return True
     except Exception as e:
         record_db_error(label, e)
@@ -1258,7 +1381,9 @@ def flush_pending_cloud_sync():
             q = supabase.table(table).update(payload)
             for k, v in match.items():
                 q = q.eq(k, v)
-            q.execute()
+            response = q.execute()
+            if getattr(response, "data", None) == []:
+                raise RuntimeError("Remote row still missing")
             del pend[key]
         except Exception as e:
             record_db_error("Retry Cloud Sync", e)
@@ -1282,6 +1407,7 @@ def fetch_all_supabase_rows(table_name: str) -> list:
             start += chunk_size
         except Exception as e:
             record_db_error(f"Paginate {table_name}", e)
+            st.session_state["cloud_read_error"] = True
             break
     return all_rows
 
@@ -1291,6 +1417,7 @@ def hydrate_duckdb_from_supabase():
     closed here never re-opens."""
     info = {"remote": 0, "remote_active": 0, "restored": 0, "kept_local": 0, "bad_rows": 0, "first_error": ""}
     st.session_state["hydrate_info"] = info
+    st.session_state["cloud_read_error"] = False
     if not supabase:
         return
     eq_data = fetch_all_supabase_rows("predictions")      # network I/O outside the DB lock
@@ -1432,6 +1559,54 @@ def option_ask_price(spot, strike, days, sigma, q):
 def option_bid_price(spot, strike, days, sigma, q):
     return max(round(calculate_black_scholes_call(spot, strike, days, 0.05, sigma, q) * (1.0 - OPTION_HALF_SPREAD_PCT / 100.0), 2), 0.01)
 
+def normalize_lse_history_prices(df: pd.DataFrame, currency: str) -> pd.DataFrame:
+    """Price convention inside this app: *all* .L OHLC are pence (GBp).
+
+    Yahoo may supply 'GBp'/'GBX' in pence or 'GBP' in pounds. Missing/other
+    currency is rejected, not guessed, because getting it wrong is a 100x error.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if currency in ("GBp", "GBX"):
+        factor = 1.0
+    elif currency == "GBP":
+        factor = 100.0
+    else:
+        LOGGER.warning("Skipping LSE price feed with unknown/unexpected currency: %s", currency)
+        return pd.DataFrame()
+    required = ("Open", "High", "Low", "Close")
+    if any(col not in df.columns for col in required):
+        return pd.DataFrame()
+    result = df.copy()
+    for col in required:
+        result[col] = pd.to_numeric(result[col], errors="coerce") * factor
+    if "Dividends" in result.columns:
+        result["Dividends"] = pd.to_numeric(result["Dividends"], errors="coerce") * factor
+    result = result.replace([np.inf, -np.inf], np.nan).dropna(subset=["Close"])
+    result = result[result["Close"] > 0]
+    result.attrs["quote_currency_original"] = currency
+    result.attrs["price_currency"] = "GBp"
+    return result
+
+
+def _verified_history(ticker: str, period: str) -> pd.DataFrame:
+    """Download once, inspect Yahoo's quote metadata, and normalise LSE units."""
+    stock = yf.Ticker(ticker)
+    df = stock.history(period=period, auto_adjust=False, repair=False, timeout=6)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if not is_valid_lse_ticker(ticker):
+        return df  # e.g. ^FTSE or futures; do not convert non-LSE currencies
+    meta = getattr(stock, "history_metadata", None)
+    cur = meta.get("currency") if isinstance(meta, dict) else None
+    if not cur:
+        try:
+            cur = stock.fast_info.get("currency")
+        except Exception:
+            pass
+    return normalize_lse_history_prices(df, cur)
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_cached_history(ticker: str, period: str = "6mo") -> pd.DataFrame:
     """Fault-tolerant history fetcher with retry and timeout guards."""
@@ -1439,7 +1614,7 @@ def fetch_cached_history(ticker: str, period: str = "6mo") -> pd.DataFrame:
         return pd.DataFrame()
     for attempt in range(2):
         try:
-            df = yf.Ticker(ticker).history(period=period, auto_adjust=False, timeout=6)
+            df = _verified_history(ticker, period)
             if df is not None and not df.empty:
                 return df
         except Exception:
@@ -1450,7 +1625,7 @@ def fetch_cached_history(ticker: str, period: str = "6mo") -> pd.DataFrame:
 def _download_history_raw(ticker: str, period: str) -> pd.DataFrame:
     for attempt in range(2):
         try:
-            df = yf.Ticker(ticker).history(period=period, auto_adjust=False, timeout=6)
+            df = _verified_history(ticker, period)
             if df is not None and not df.empty:
                 return df
         except Exception:
@@ -1610,7 +1785,11 @@ def compute_macro_lead_lag_adjustment(ticker: str, sector: str, macro: dict) -> 
 # ==============================================================================
 def check_password() -> bool:
     if st.session_state.get("password_correct", False):
-        return True
+        login_ts = float(st.session_state.get("auth_login_ts", 0) or 0)
+        if login_ts and time.time() - login_ts < 12 * 3600:
+            return True
+        st.session_state["password_correct"] = False
+        st.session_state.pop("auth_login_ts", None)
 
     now_ts = time.time()
     lockout_until = st.session_state.get("auth_lockout_until", 0.0)
@@ -1619,9 +1798,15 @@ def check_password() -> bool:
         st.error(f"🔒 Terminal Locked due to repeated failed attempts. Try again in {rem_min} minute(s).")
         return False
 
-    expected_user = st.secrets.get("AUTH_USER", "admin") if hasattr(st, "secrets") else "admin"
-    default_hash = hashlib.sha256("AlphaLSE2026!".encode("utf-8")).hexdigest()
-    expected_hash = st.secrets.get("AUTH_PASS_HASH", default_hash) if hasattr(st, "secrets") else default_hash
+    # Fail closed: no hardcoded password or username fallback.
+    try:
+        expected_user = str(st.secrets.get("AUTH_USER", "")).strip()
+        expected_hash = str(st.secrets.get("AUTH_PASS_HASH", "")).strip().lower()
+    except Exception:
+        expected_user, expected_hash = "", ""
+    if not expected_user or not re.fullmatch(r"[a-f0-9]{64}", expected_hash):
+        st.error("Authentication is not configured. Set AUTH_USER and AUTH_PASS_HASH in Streamlit secrets.")
+        return False
 
     st.subheader("🔐 ALPHA-LSE Quant Terminal — Restricted Institutional Access")
     with st.form("cia_secure_login_form", clear_on_submit=True):
@@ -1636,6 +1821,7 @@ def check_password() -> bool:
 
             if user_ok and pass_ok:
                 st.session_state["password_correct"] = True
+                st.session_state["auth_login_ts"] = time.time()
                 st.session_state["failed_auth_attempts"] = 0
                 st.rerun()
             else:
@@ -1651,27 +1837,30 @@ def check_password() -> bool:
 if not check_password():
     st.stop()
 
+# Authenticated startup: no database or cloud operations before login.
+init_duckdb_storage()
+supabase = get_supabase_client() if STORAGE_MODE == "cloud" else None
+
 if "hydrated_once" not in st.session_state:
     hydrate_duckdb_from_supabase()
     st.session_state["hydrated_once"] = True
 
-NO_DATA_GRACE_DAYS = 3
-
-def close_stale_trade(tr, now_str: str):
-    """A share with NO prices at all while the market feed works (it was delisted or suspended): after its 7-day hold
-    plus a few days' grace, close it at the last price we saw, clearly labelled, so it can't block a slot forever."""
-    last = _num(tr.get("latest_price"), _num(tr.get("entry_price")))
-    pnl = _num(tr.get("pnl_pct"))
-    status = "⏱️ EXPIRED (NO PRICE DATA)"
-    with DB_LOCK:
-        con = duckdb.connect(DB_PATH, read_only=False)
+# Once per UK calendar day, keep a rolling set of local integrity-checked learning backups.
+# For an off-device backup, use the sidebar download or copy ZIPs to encrypted USB/storage.
+if STORAGE_MODE == "local":
+    _archive_dir = DATA_DIR / "backups"
+    _today_tag = london_now().strftime("%Y%m%d")
+    _archive_dir.mkdir(parents=True, exist_ok=True)
+    if not list(_archive_dir.glob(f"alpha_backup_{_today_tag}_*.zip")):
         try:
-            con.execute("UPDATE trade_journal SET status = ?, exit_price = ?, exit_timestamp = ?, last_audited = ? WHERE trade_id = ?",
-                        [status, last, now_str, now_str, tr["trade_id"]])
-        finally:
-            con.close()
-    cloud_update("predictions", {"ticker": str(tr["ticker"]).strip(), "predicted_date": tr["date_str"]},
-                 {"status": status, "latest_price": last, "pnl_pct": pnl, "last_checked": now_str}, "Close Stale Trade")
+            with DB_LOCK:
+                create_backup(DATA_DIR, _archive_dir)
+            _old = sorted(_archive_dir.glob("alpha_backup_*.zip"), key=lambda p: p.stat().st_mtime)
+            for _older in _old[:-7]:
+                _older.unlink(missing_ok=True)
+        except Exception as _backup_exc:
+            LOGGER.warning("Automatic local backup unavailable: %s", type(_backup_exc).__name__)
+            st.session_state["backup_warning"] = "Daily backup failed; create an external backup manually."
 
 # ==============================================================================
 # 4. AUDIT & RECONCILIATION ENGINE (BAR-WALKING, GAP-AWARE, STOP-FIRST)
@@ -1683,6 +1872,8 @@ def audit_and_reconcile_all_trades():
 
     flush_pending_cloud_sync()
     st.session_state["price_feed_problem"] = False
+    st.session_state["unpriced_open_tickers"] = set()
+    st.session_state["corporate_action_review"] = set()
 
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=False)
@@ -1707,17 +1898,16 @@ def audit_and_reconcile_all_trades():
                     if feed_ok is None:
                         feed_ok = not fetch_cached_history("^FTSE", period="5d").empty
                     entry_dt0 = _to_date(tr["date_str"])
-                    if feed_ok and entry_dt0 and (today_date - entry_dt0).days >= MAX_HOLD_CALENDAR_DAYS + NO_DATA_GRACE_DAYS:
-                        close_stale_trade(tr, now_str)                 # share stopped trading (e.g. delisted): close at last known price
-                    else:
-                        st.session_state["price_feed_problem"] = True
-                    continue                                       # do NOT pretend we checked
+                    st.session_state["price_feed_problem"] = True
+                    st.session_state.setdefault("unpriced_open_tickers", set()).add(tkr)
+                    LOGGER.warning("Cannot price open trade %s; keeping ACTIVE pending a valid quote", tkr)
+                    continue                                       # never fabricate a profitable or losing exit
                 dates = _bar_dates(h)
 
                 entry = float(tr["entry_price"])
                 target = float(tr["target_price"])
                 stop = float(tr["stop_loss"])
-                friction = get_trade_friction_pct(tkr, tr.get("features_json"))
+                friction = get_trade_friction_pct(tkr, tr.get("features_json"), tr.get("capital_allocated"))
                 be_floor = get_breakeven_exit_price(entry, friction)
                 target_dist = target - entry
                 be_trigger = entry + BREAKEVEN_TRIGGER_RATIO * target_dist
@@ -1725,6 +1915,13 @@ def audit_and_reconcile_all_trades():
                 entry_dt = _to_date(tr["date_str"])
                 if entry_dt is None:
                     continue
+                if "Stock Splits" in h.columns:
+                    splits = pd.to_numeric(h["Stock Splits"], errors="coerce").fillna(0.0)
+                    changed = any(d >= entry_dt and v != 0 for d, v in zip(dates, splits))
+                    if changed:
+                        st.session_state.setdefault("corporate_action_review", set()).add(tkr)
+                        LOGGER.warning("Stock split detected while %s was held; keeping trade open for review", tkr)
+                        continue
                 last_aud_dt = _to_date(tr.get("last_audited")) or entry_dt
                 start_after = max(entry_dt, last_aud_dt)
 
@@ -1789,6 +1986,13 @@ def audit_and_reconcile_all_trades():
                 pnl = calc_net_equity_pnl_pct(entry, mark, friction)
                 ts_for_exit = exit_ts or now_str
 
+                # Persist the new status remotely BEFORE advancing local last_audited.
+                # If cloud is down, leave the trade open for a deterministic retry.
+                if not cloud_update("predictions", {"ticker": tkr, "predicted_date": tr["date_str"]},
+                                    {"status": new_status, "stop_loss": stop, "latest_price": mark,
+                                     "pnl_pct": pnl, "last_checked": now_str}, "Audit Equity Sync"):
+                    st.session_state["db_error"] = "Trade audit sync deferred; cloud update must succeed before local trade advances"
+                    continue
                 with DB_LOCK:
                     con = duckdb.connect(DB_PATH, read_only=False)
                     try:
@@ -1801,11 +2005,9 @@ def audit_and_reconcile_all_trades():
                         """, [mark, stop, pnl, new_status, exit_price, new_status, ts_for_exit, now_str, tr["trade_id"]])
                     finally:
                         con.close()
-
-                cloud_update("predictions", {"ticker": tkr, "predicted_date": tr["date_str"]},
-                             {"status": new_status, "stop_loss": stop, "latest_price": mark, "pnl_pct": pnl, "last_checked": now_str},
-                             "Audit Equity Sync")
-            except Exception:
+            except Exception as exc:
+                LOGGER.exception("Trade audit failed for %s: %s", tkr, exc)
+                st.session_state["price_feed_problem"] = True
                 continue
 
     # ---------------- Options (real quotes for new ones; old practice rows keep their formula) ----------------
@@ -1864,6 +2066,11 @@ def audit_and_reconcile_all_trades():
 
                 pnl_pct = round(((live_prem - entry_prem) / entry_prem) * 100.0, 2) if entry_prem > 0 else 0.0
 
+                if not cloud_update("options_journal", {"date_key": opt["date_key"]},
+                                    {"status": opt_status, "current_option_price": live_prem,
+                                     "pnl_pct": pnl_pct, "last_audited": now_str}, "Audit Option Sync"):
+                    st.session_state["db_error"] = "Options sync deferred; the remote journal must accept the update first"
+                    continue
                 with DB_LOCK:
                     con = duckdb.connect(DB_PATH, read_only=False)
                     try:
@@ -1874,10 +2081,6 @@ def audit_and_reconcile_all_trades():
                         """, [live_prem, pnl_pct, opt_status, now_str, opt["date_key"]])
                     finally:
                         con.close()
-
-                cloud_update("options_journal", {"date_key": opt["date_key"]},
-                             {"status": opt_status, "current_option_price": live_prem, "pnl_pct": pnl_pct, "last_audited": now_str},
-                             "Audit Option Sync")
             except Exception:
                 continue
 
@@ -2223,6 +2426,10 @@ def check_and_auto_retrain_model(feature_cols: list, closed_df: pd.DataFrame):
     ensemble_ranker.joblib is never overwritten."""
     if closed_df is None or closed_df.empty:
         return
+    # Locally persisted model artefacts permit opt-in-free, evidence-gated learning.
+    # On a disposable cloud instance this is disabled unless persistent storage is configured.
+    if STORAGE_MODE == "cloud" and os.getenv("ALPHA_PERSISTENT_MODEL_STORAGE", "0") != "1":
+        return
     records = []
     for _, r in closed_df.iterrows():
         s = str(r["status"]).upper()
@@ -2294,8 +2501,14 @@ def check_and_auto_retrain_model(feature_cols: list, closed_df: pd.DataFrame):
                           "meta": {"trained_on": n, "promoted_at": london_now().strftime("%Y-%m-%d %H:%M:%S"),
                                    "holdout_logloss": ll_ch, "champion_logloss": ll_cm}}
             os.makedirs(os.path.dirname(LIVE_MODEL_PATH), exist_ok=True)
-            joblib.dump(new_bundle, LIVE_MODEL_PATH)
-            st.session_state["ml_model_bundle"] = new_bundle
+            tmp_model = LIVE_MODEL_PATH + ".tmp"
+            joblib.dump(new_bundle, tmp_model)
+            # Confirm the serialised model can be reloaded before promotion.
+            restored = joblib.load(tmp_model)  # created by this process only
+            if not all(key in restored for key in ("lgb", "catboost", "feature_cols")):
+                raise ValueError("Incomplete saved challenger model")
+            os.replace(tmp_model, LIVE_MODEL_PATH)
+            st.session_state["ml_model_bundle"] = restored
             state["last_promoted"] = london_now().strftime("%Y-%m-%d %H:%M:%S")
             st.session_state["retrain_notice"] = "🧠 The AI updated itself: the new version tested better than the old one."
         else:
@@ -2476,6 +2689,9 @@ def trend_bar_to_rise(bar: float) -> float:
     return (float(bar) - 78.0) / 1.5
 
 def generate_daily_options_alpha() -> dict:
+    if REQUIRE_DURABLE_CLOUD and not supabase:
+        st.session_state["opt_note"] = "Online journal unavailable; new simulated options are paused to avoid losing them on restart."
+        return {}
     now_lon = london_now()
     today_str = now_lon.strftime('%Y-%m-%d')
     now_str = now_lon.strftime('%Y-%m-%d %H:%M:%S')
@@ -2530,24 +2746,29 @@ def generate_daily_options_alpha() -> dict:
         "status": "ACTIVE", "pnl_pct": round((bid - ask) / ask * 100.0, 2), "last_audited": now_str
     }
 
+    # Cloud-first creation: on Streamlit Cloud, local files can vanish after a restart.
+    if REQUIRE_DURABLE_CLOUD:
+        try:
+            existing = supabase.table("options_journal").select("date_key").eq("date_key", today_str).execute()
+            if existing.data:
+                st.session_state["opt_note"] = "Today's option idea is already saved in the cloud; refreshing local journal."
+                hydrate_duckdb_from_supabase()
+                return {}
+            supabase.table("options_journal").insert(sig).execute()
+        except Exception as exc:
+            record_db_error("Save option remotely", exc)
+            st.session_state["opt_note"] = "Cannot save option to online journal. No new option idea recorded."
+            return {}
+
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=False)
         try:
             con.execute("""
-                INSERT OR REPLACE INTO daily_options_journal 
+                INSERT OR REPLACE INTO daily_options_journal
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)
             """, [sig[k] for k in ["date_key", "timestamp", "share_name", "option_contract", "strike_price", "expiry_days", "underlying_spot", "lot_size", "entry_premium", "current_option_price", "target_premium", "stop_loss_premium", "total_capital", "ai_confidence", "implied_vol", "pnl_pct", "last_audited"]])
         finally:
             con.close()
-
-    if supabase:
-        try:
-            c_check = supabase.table("options_journal").select("date_key").eq("date_key", today_str).execute()
-            if not c_check.data:
-                supabase.table("options_journal").insert(sig).execute()
-        except Exception as e:
-            record_db_error("Insert Option", e)
-
     return sig
 
 def audit_real_option(opt, now_str: str, today_date):
@@ -2577,17 +2798,21 @@ def audit_real_option(opt, now_str: str, today_date):
         elif bid <= stop_prem:
             status = "🛑 LOSS (STOPPED OUT)"
     if status == "ACTIVE" and today_date >= expiry_dt:
+        # Without a verified quote/settlement, do not fabricate an expiry fill.
+        if bid is None:
+            st.session_state["db_error"] = f"Expiry quote missing for {share}: option left open for review"
+            return
         status = "⏱️ EXPIRED (TIME EXIT)"
-        try:
-            hh = _download_history_raw(share, "5d")
-            if not hh.empty:
-                live = max(0.0, float(hh["Close"].iloc[-1]) - strike)     # value at expiry = intrinsic value
-        except Exception:
-            pass
     elif status == "ACTIVE" and elapsed >= MAX_HOLD_CALENDAR_DAYS:
+        if bid is None:
+            return  # cannot claim the option exited at an unobserved price
         status = "⏱️ EXPIRED (TIME EXIT)"
 
     pnl_pct = round(((live - entry_prem) / entry_prem) * 100.0, 2) if entry_prem > 0 else 0.0
+    if not cloud_update("options_journal", {"date_key": opt["date_key"]},
+                        {"status": status, "current_option_price": live, "pnl_pct": pnl_pct,
+                         "last_audited": now_str}, "Audit Option Sync"):
+        return
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=False)
         try:
@@ -2598,8 +2823,6 @@ def audit_real_option(opt, now_str: str, today_date):
             """, [live, pnl_pct, status, now_str, opt["date_key"]])
         finally:
             con.close()
-    cloud_update("options_journal", {"date_key": opt["date_key"]},
-                 {"status": status, "current_option_price": live, "pnl_pct": pnl_pct, "last_audited": now_str}, "Audit Option Sync")
 
 # ==============================================================================
 # 7. LOGGING, DAILY QUOTA, SECTOR & PORTFOLIO-RISK GUARDRAILS
@@ -2636,23 +2859,48 @@ def get_active_sector_exposure() -> dict:
     return counts
 
 def get_portfolio_capacity() -> dict:
+    """Self-financing paper account, not an unlimited phantom wallet.
+
+    The starting cash is a user-configured virtual amount without a hard ceiling.
+    Realised P/L changes the amount available; open allocations reserve cash.
+    """
     df = get_active_positions_df()
     n_open = len(df)
-    risk = 0.0
+    invested, risk = 0.0, 0.0
     for _, r in df.iterrows():
         try:
-            e, s, cap = float(r["entry_price"]), float(r["stop_loss"]), float(r["capital_allocated"])
-            if e > 0 and s < e:
-                risk += cap * (e - s) / e
+            e, stop, capital = float(r["entry_price"]), float(r["stop_loss"]), float(r["capital_allocated"])
+            if not (math.isfinite(e) and math.isfinite(stop) and math.isfinite(capital) and e > 0 and stop > 0 and capital > 0):
+                raise ValueError("Invalid open paper-trade amounts")
+            invested += capital
+            risk += capital * max(0.0, e - stop) / e
         except Exception:
-            pass
-    ok = (n_open < MAX_OPEN_POSITIONS) and (risk < MAX_OPEN_RISK_GBP)
-    reason = ""
-    if n_open >= MAX_OPEN_POSITIONS:
-        reason = f"You already have the maximum number of open trades ({n_open}/{MAX_OPEN_POSITIONS})"
-    elif risk >= MAX_OPEN_RISK_GBP:
-        reason = f"Too much money is at risk already (£{risk:.0f} of £{MAX_OPEN_RISK_GBP:.0f})"
-    return {"open": n_open, "risk_gbp": round(risk, 2), "ok": ok, "reason": reason}
+            return {"open": n_open, "risk_gbp": float("inf"), "invested_gbp": float("inf"),
+                    "cash_gbp": 0.0, "equity_gbp": 0.0, "risk_budget_gbp": 0.0,
+                    "ok": False, "reason": "Open position needs manual review"}
+    realised = 0.0
+    with DB_LOCK:
+        con = duckdb.connect(DB_PATH, read_only=True)
+        try:
+            rows = con.execute("SELECT capital_allocated, pnl_pct, status FROM trade_journal WHERE status != 'ACTIVE'").fetchall()
+            for amt, pnl, status in rows:
+                if classify_outcome(status) in ("WIN", "LOSS", "BE", "EXPIRED"):
+                    a, p = float(amt), float(pnl)
+                    if math.isfinite(a) and math.isfinite(p) and a > 0:
+                        realised += a * p / 100.0
+        finally:
+            con.close()
+    equity = max(0.0, get_starting_paper_cash() + realised)
+    cash = max(0.0, equity - invested)
+    risk_budget = max(0.0, equity * MAX_PORTFOLIO_RISK_FRACTION)
+    ok = cash >= MIN_POSITION_SIZE_GBP and risk < risk_budget and equity > 0
+    reason = "" if ok else ("Not enough virtual cash" if cash < MIN_POSITION_SIZE_GBP else
+                             "Estimated open risk reached 5% of virtual account capital")
+    return {"open": n_open, "risk_gbp": round(risk, 2), "invested_gbp": round(invested, 2),
+            "cash_gbp": round(cash, 2), "equity_gbp": round(equity, 2),
+            "risk_budget_gbp": round(risk_budget, 2), "realised_gbp": round(realised, 2),
+            "ok": ok, "reason": reason}
+
 
 def get_todays_logged_equities() -> pd.DataFrame:
     today_str = london_now().strftime('%Y-%m-%d')
@@ -2686,111 +2934,119 @@ def get_recent_cooldown_tickers() -> set:
     return cooldown
 
 def log_equity_signal_safely(sig: dict, enforce_sector_cap: bool = True) -> bool:
-    now = london_now()
-    today_str = now.strftime('%Y-%m-%d')
-    now_str = now.strftime('%Y-%m-%d %H:%M:%S')
-    ticker = str(sig.get('Ticker', '')).strip()
+    """Record a simulated order only with a valid budget, a live session and durable backup.
 
+    The SQL risk recheck and journal insert share the same application lock. The
+    cloud insert precedes local insertion so a restart cannot silently lose a
+    newly created trade when Streamlit's filesystem is ephemeral.
+    """
     def fail(msg):
         st.session_state["last_log_reason"] = msg
         return False
 
+    now = london_now()
+    today_str, now_str = now.strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d %H:%M:%S")
+    ticker = str(sig.get("Ticker", "")).strip().upper()
     if not is_valid_lse_ticker(ticker):
-        return fail("Invalid ticker")
+        return fail("Invalid LSE ticker")
     if not is_entry_window_open():
-        return fail("It is outside buying hours (08:30–16:00 London on trading days; shut at weekends and on bank holidays)")
-    if not sig.get("Loggable", True):
-        return fail("No live price from today yet")
+        return fail("Outside LSE entry hours or not a trading day")
+    if not sig.get("Loggable", False):
+        return fail("A same-day quotation was not verified")
     if is_market_stress(get_cross_asset_macro_regime()):
-        return fail("Buying is paused because the UK market fell sharply this week")
-    cap_state = get_portfolio_capacity()
-    if not cap_state["ok"]:
-        return fail(cap_state["reason"])
+        return fail("New entries are paused by the market-stress rule")
+    if REQUIRE_DURABLE_CLOUD and not supabase:
+        return fail("Supabase backup is not configured/connected — no trades recorded on ephemeral storage")
+    if STORAGE_MODE == "cloud" and (st.session_state.get("cloud_read_error") or (st.session_state.get("hydrate_info") or {}).get("bad_rows")):
+        return fail("Cloud backup contains unreadable/incomplete data. Resolve backup errors before opening positions")
 
-    sector = str(sig.get('Sector') or get_ticker_sector(ticker, resolve=False))
-    if enforce_sector_cap:
-        sec_counts = get_active_sector_exposure()
-        if sec_counts.get(sector, 0) >= MAX_ACTIVE_PER_SECTOR:
-            return fail(f"You already hold {MAX_ACTIVE_PER_SECTOR} trades in {sector}")
+    price = _num(sig.get("Price (p)"), float("nan"))
+    stop = _num(sig.get("Stop Loss (p)"), float("nan"))
+    target = _num(sig.get("Target (p)"), float("nan"))
+    shares = _int(str(sig.get("Recommended Shares", "0")).split()[0])
+    capital = _num(sig.get("Capital"), float("nan"))
+    real_cost = shares * price / 100.0
+    if not (all(math.isfinite(v) for v in (price, stop, target, capital))
+            and 0 < stop < price < target and shares > 0 and capital > 0):
+        return fail("Invalid or missing price, stop, target, quantity or capital")
+    if abs(real_cost - capital) > 0.011:
+        return fail("Share count and capital disagree — order refused")
+    sector = str(sig.get("Sector") or get_ticker_sector(ticker, resolve=False))
+    if real_cost > get_position_size_gbp(price, stop, sector) + 0.011:
+        return fail("Trade exceeds virtual cash, concentration or per-trade risk allowance")
 
-    f_dict = sig.get('FeaturesDict', {})
-    f_json_str = json.dumps(f_dict)
-    friction = get_trade_friction_pct(ticker, f_json_str)
-    init_net_pnl = -friction
-    logged_local = False
+    f_dict = sig.get("FeaturesDict") or {}
+    if not isinstance(f_dict, dict):
+        return fail("Invalid signal metadata")
+    if f_dict.get("price_currency") != "GBp":
+        return fail("LSE quote currency was not verified — refusing price-unit ambiguity")
+    sector = str(sig.get("Sector") or get_ticker_sector(ticker, resolve=False))
+    risk_added = real_cost * (price - stop) / price
+    today_count = 0
 
     with DB_LOCK:
+        # Risk checks MUST be repeated under the same lock as the INSERT.
+        cap_state = get_portfolio_capacity()
+        if not cap_state["ok"]:
+            return fail(cap_state["reason"])
+        if cap_state["risk_gbp"] + risk_added > cap_state["risk_budget_gbp"] + 0.000001:
+            return fail("Trade exceeds the 5% total portfolio stop-risk allowance")
+        if real_cost > cap_state["cash_gbp"] + 0.001:
+            return fail("Not enough virtual cash")
+        # Atomic second concentration/risk sizing check: a parallel tab may have
+        # created another position since this idea was first calculated.
+        if real_cost > get_position_size_gbp(price, stop, sector) + 0.011:
+            return fail("Portfolio allocation changed before this order; signal was not recorded")
+        if enforce_sector_cap and get_active_sector_exposure().get(sector, 0) >= MAX_ACTIVE_PER_SECTOR:
+            return fail("Sector exposure cap reached")
+
         con = duckdb.connect(DB_PATH, read_only=False)
         try:
-            today_count_df = con.execute("SELECT COUNT(*) AS cnt FROM trade_journal WHERE date_str = ?", [today_str]).df()
-            if not today_count_df.empty and int(today_count_df["cnt"].iloc[0]) >= MAX_DAILY_EQUITY_TRADES:
-                return fail("All of today's picks are already used")
-
-            existing = con.execute("""
-                SELECT trade_id FROM trade_journal 
-                WHERE ticker = ? AND (status = 'ACTIVE' OR date_str = ?)
-            """, [ticker, today_str]).df()
-
-            if existing.empty:
-                trade_id = f"{ticker}_{today_str}"
-                shares_num = int(str(sig['Recommended Shares']).split()[0])
-                con.execute("""
-                    INSERT INTO trade_journal 
-                    (trade_id, timestamp, date_str, ticker, asset_type, entry_price, target_price,
-                     stop_loss, shares, capital_allocated, status, latest_price, pnl_pct, exit_price,
-                     exit_timestamp, last_audited, features_json)
-                    VALUES (?, ?, ?, ?, 'EQUITY', ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, 0.0, NULL, ?, ?)
-                """, [
-                    trade_id, now_str, today_str, ticker, float(sig['Price (p)']),
-                    float(sig['Target (p)']), float(sig['Stop Loss (p)']),
-                    shares_num, float(sig['Capital']), float(sig['Price (p)']), init_net_pnl, now_str, f_json_str
-                ])
-                logged_local = True
-            else:
-                return fail("You already hold this stock")
+            today_count = con.execute("SELECT COUNT(*) FROM trade_journal WHERE date_str=?", [today_str]).fetchone()[0]
+            # No arbitrary daily count limit. Signal quality, available cash and risk decide.
+            existing = con.execute("SELECT 1 FROM trade_journal WHERE ticker=? AND (status='ACTIVE' OR date_str=?)", [ticker, today_str]).fetchone()
+            if existing:
+                return fail("This share is already open or was traded today")
+            f_dict = dict(f_dict, capital_gbp=capital)
+            cost_pct = get_trade_friction_pct(ticker, f_dict, capital)
+            if not math.isfinite(cost_pct):
+                return fail("Trade friction could not be calculated")
+            trade_id = f"{ticker}_{today_str}"
+            # Journal integrity: if Supabase insert fails, do not claim the paper trade was saved.
+            if supabase:
+                try:
+                    remote_daily = supabase.table("predictions").select("ticker,status,predicted_date").eq("predicted_date", today_str).execute()
+                    remote_rows = remote_daily.data or []
+                    if any(str(r.get("ticker", "")).upper() == ticker for r in remote_rows):
+                        return fail("Cloud already has this share/date")
+                    remote_held = supabase.table("predictions").select("ticker,status").eq("ticker", ticker).execute()
+                    if any(_norm_status(r.get("status")) == "ACTIVE" for r in (remote_held.data or [])):
+                        return fail("Cloud records show this stock already open")
+                    supabase.table("predictions").insert({
+                        "predicted_date": today_str, "ticker": ticker, "company_name": f"{ticker} ({sector})",
+                        "entry_price": price, "target_price": target, "stop_loss": stop,
+                        "position_gbp": capital, "shares_qty": shares,
+                        "profit_goal": _num(sig.get("ReturnNum")),
+                        "confidence": _int(str(sig.get("AI Win Confidence", "0")).replace("%", "")),
+                        "hold_days": MAX_HOLD_CALENDAR_DAYS, "status": "ACTIVE", "latest_price": price,
+                        "pnl_pct": -cost_pct, "news_status": str(sig.get("RNS", ""))[:200],
+                        "rns_headline": str(sig.get("RNSHeadline", ""))[:120],
+                        "features_json": f_dict, "last_checked": now_str
+                    }).execute()
+                except Exception as exc:
+                    record_db_error("Create durable paper trade", exc)
+                    return fail("Cloud journal write failed; no new trade was recorded")
+            con.execute("""INSERT INTO trade_journal
+                (trade_id,timestamp,date_str,ticker,asset_type,entry_price,target_price,stop_loss,
+                 shares,capital_allocated,status,latest_price,pnl_pct,exit_price,exit_timestamp,last_audited,features_json)
+                VALUES (?,?,?,?, 'EQUITY',?,?,?,?,?, 'ACTIVE',?,?,0.0,NULL,?,?)""",
+                [trade_id,now_str,today_str,ticker,price,target,stop,shares,capital,price,-cost_pct,now_str,json.dumps(f_dict)])
+        except Exception as exc:
+            record_db_error("Create local paper trade", exc)
+            return fail("Local journal failed; check the cloud backup before retrying")
         finally:
             con.close()
-
-    if supabase and logged_local:
-        try:
-            today_cloud = supabase.table("predictions").select("id").eq("predicted_date", today_str).execute()
-            if today_cloud.data and len(today_cloud.data) >= MAX_DAILY_EQUITY_TRADES:
-                return logged_local
-
-            c_check = supabase.table("predictions").select("id, status, predicted_date").eq("ticker", ticker).execute()
-            already_open_or_today = False
-            if c_check.data:
-                for row in c_check.data:
-                    if str(row.get("status", "")).upper() == "ACTIVE" or str(row.get("predicted_date", "")) == today_str:
-                        already_open_or_today = True
-                        break
-
-            if not already_open_or_today:
-                shares_num = int(str(sig['Recommended Shares']).split()[0])
-                supabase.table("predictions").insert({
-                    "predicted_date": today_str,
-                    "ticker": ticker,
-                    "company_name": f"{ticker} ({sector})",
-                    "entry_price": float(sig['Price (p)']),
-                    "target_price": float(sig['Target (p)']),
-                    "stop_loss": float(sig['Stop Loss (p)']),
-                    "position_gbp": float(sig['Capital']),
-                    "shares_qty": shares_num,
-                    "profit_goal": float(sig['ReturnNum']),
-                    "confidence": int(float(str(sig['AI Win Confidence']).replace("%", ""))),
-                    "hold_days": 5,
-                    "status": "ACTIVE",
-                    "latest_price": float(sig['Price (p)']),
-                    "pnl_pct": init_net_pnl,
-                    "news_status": sig.get('RNS', 'Clean'),
-                    "rns_headline": str(sig.get('RNSHeadline', 'Active LSE Quant Signal'))[:120],
-                    "features_json": f_dict,
-                    "last_checked": now_str
-                }).execute()
-        except Exception as e:
-            record_db_error("Insert Equity", e)
-
-    return logged_local
+    return True
 
 # ==============================================================================
 # 8. UNIVERSE & DUAL-ENSEMBLE ML ENGINE
@@ -2822,6 +3078,12 @@ def analyse_share(ticker: str, df: pd.DataFrame, today_date, market_open: bool, 
         return "no_data", None
     if len(df_model) < 55:
         return "short", None                                  # history too short to score honestly
+    # Corporate actions can invalidate price/trade equivalence and model features.
+    # Wait for a fresh stable history before considering a split-adjusted ticker.
+    if "Stock Splits" in df_model.columns:
+        splits = pd.to_numeric(df_model["Stock Splits"].tail(55), errors="coerce").fillna(0.0)
+        if (splits != 0).any():
+            return "wild", None  # corporate-action review, not a reliable entry signal
     recent = df_model.tail(20)
     avg_turnover = float((recent["Close"] * recent["Volume"]).mean() / 100.0)      # pence -> £
     if (not math.isfinite(avg_turnover)) or live_price < MIN_PRICE_P or avg_turnover < MIN_AVG_TURNOVER_GBP:
@@ -3028,13 +3290,20 @@ def run_predictions():
             if not math.isfinite(atr) or atr <= 0:
                 atr = live_price * float(ctx.get("atr_pct", 2.0)) / 100.0
             atr_pct = round((atr / live_price) * 100.0, 2)
-            target = round(live_price + (1.8 * atr), 2)
-            stop = round(live_price - (1.2 * atr), 2)
+            target = round(live_price + (1.8 * atr), 4)
+            stop = round(live_price - (1.2 * atr), 4)
+            if stop <= 0 or target <= live_price:
+                continue
             gross_return_pct = ((target - live_price) / live_price) * 100.0
 
             spread_pct = estimate_spread_pct(ticker, avg_turnover)
             commission = get_commission_gbp()
-            friction_pct = compute_friction_pct(ticker, spread_pct, commission)
+            desired_capital = get_position_size_gbp(live_price, stop, sector)
+            estimated_shares = int(desired_capital * 100 / live_price)
+            if estimated_shares < 1:
+                continue
+            estimated_capital = estimated_shares * live_price / 100.0
+            friction_pct = round(get_sdrt_pct(ticker) + spread_pct + commission_round_trip_pct(commission, estimated_capital), 3)
             net_return_pct = round(gross_return_pct - friction_pct, 1)
             tax_regime = "AIM (0% SDRT)" if is_aim_exempt(ticker) else "Main (0.5% SDRT)"
 
@@ -3046,9 +3315,15 @@ def run_predictions():
             final_confidence = int(min(98, max(25, base_confidence + total_delta)))
             ev_pct = expected_value_pct(final_confidence / 100.0, live_price, target, stop, friction_pct)
 
-            live_price = round(live_price, 2)                      # the price the trade is recorded at
-            shares = max(1, int((POSITION_SIZE_GBP * 100) / live_price))
-            capital = round(shares * live_price / 100.0, 2)            # so shares x price always equals money in
+            live_price = round(live_price, 4)                      # use four-decimal pence in journal/UI
+            if live_price <= 0:
+                continue  # sub-0.0001p feeds require finer precision; reject rather than log zero
+            shares = int(math.floor((desired_capital * 100) / live_price))
+            if shares < 1:
+                continue  # expensive shares must fit the selected budget in whole shares
+            capital = round(shares * live_price / 100.0, 2)
+            if capital > desired_capital + 0.011 or capital <= 0:
+                continue
             be_pct = breakeven_win_pct(live_price, target, stop, friction_pct)
             safe = (not blocked and net_return_pct >= MIN_NET_RETURN_PCT)
             is_qualified = safe and ev_pct > MIN_EV_PCT
@@ -3066,7 +3341,7 @@ def run_predictions():
                 "raw_features": raw_feature_map, "atr_pct": atr_pct, "raw_prob": round(blended, 4),
                 "base_ml_conf": base_confidence, "learner_delta": learner["delta"], "macro_delta": macro_delta,
                 "evidence_delta": ev_delta, "ev_pct": ev_pct, "breakeven_pct": be_pct, "ctx": ctx, "sector": sector, "spread_pct": spread_pct,
-                "commission_gbp": commission, "friction_pct": round(get_sdrt_pct(ticker) + spread_pct, 3),
+                "commission_gbp": commission, "capital_gbp": capital, "price_currency": "GBp", "friction_pct": round(get_sdrt_pct(ticker) + spread_pct, 3),
                 "avg_turnover_gbp": round(avg_turnover, 0), "tax_regime": tax_regime, "nlp_tags": rns_data["nlp_tags"],
                 "entry_bar": str(df_model.index[-1].date()) if hasattr(df_model.index[-1], "date") else str(dates[-1]),
                 "cal_mode": cal_info["mode"],
@@ -3076,7 +3351,7 @@ def run_predictions():
                 note_parts.append("Evidence: " + "; ".join(ev_notes))
             results.append({
                 "Ticker": ticker, "Company": ticker, "Sector": sector, "Tax Regime": tax_regime,
-                "Friction": f"-{friction_pct:.2f}%", "Price (p)": round(live_price, 2),
+                "Friction": f"-{friction_pct:.2f}%", "Price (p)": round(live_price, 4),
                 "Expected Return": f"+{net_return_pct}% Net", "ReturnNum": net_return_pct,
                 "Expected value": ev_pct, "Vs FTSE (20d)": ctx.get("rs20"),
                 "Est. Time to Target": "3-7 Days", "Recommended Shares": f"{shares} shares",
@@ -3656,7 +3931,7 @@ def build_insights(perf_df: pd.DataFrame) -> list:
         if worst["Sector"] != best["Sector"]:
             out.append(f"Toughest sector so far: **{worst['Sector']}** (average {worst['avg']:+.1f}% per trade over {int(worst['n'])} trades).")
     try:
-        frs = [get_trade_friction_pct(r["ticker"], r["features_json"]) for _, r in perf_df.iterrows()]
+        frs = [get_trade_friction_pct(r["ticker"], r["features_json"], r.get("capital_allocated")) for _, r in perf_df.iterrows()]
         if frs:
             out.append(f"Fees, spread and stamp duty take about **{np.mean(frs):.1f}%** off every trade — a trade has to beat that before it earns anything.")
     except Exception:
@@ -3713,7 +3988,14 @@ mkt_state = get_market_state()
 market_is_open = is_lse_market_open()
 
 st.sidebar.header("⚙️ Settings")
-st.sidebar.caption("🔭 Looks at **every FTSE 350 share plus liquid AIM shares** each time.")
+st.sidebar.caption("🔭 FTSE 350, selected AIM and your extra .L tickers; UK quoted shares only. Paper trades, not brokerage execution.")
+st.sidebar.number_input("Virtual account balance (£)", min_value=MIN_POSITION_SIZE_GBP,
+                        value=float(get_starting_paper_cash()), step=1_000.0,
+                        key="paper_starting_cash_input", help="No fixed upper amount. Changes are virtual deposits, not trading profit; save to persist across restarts.")
+if st.sidebar.button("Save virtual account balance", width="stretch"):
+    save_starting_paper_cash(st.session_state["paper_starting_cash_input"])
+    st.sidebar.success("Saved on this laptop.")
+st.sidebar.caption("Each trade is sized automatically using its stop-loss distance and the account's available cash.")
 st.sidebar.number_input("Broker fee per trade (£)", min_value=0.0, max_value=25.0, value=DEFAULT_COMMISSION_GBP, step=0.5, key="commission_gbp",
                         help="Charged when you buy and again when you sell. Included in every profit/loss number you see. Many UK apps charge £0 — "
                              "set yours, because on a £500 trade a £3 fee each way costs 1.2%, which decides which picks are worth it.")
@@ -3727,18 +4009,18 @@ refresh_interval_sec = st.sidebar.selectbox("Check every", [300, 900, 3600], for
 
 with st.sidebar.expander("🛡️ Built-in safety rules"):
     st.markdown(
-        f"- Max **{MAX_DAILY_EQUITY_TRADES} new trades** per day\n"
-        f"- Max **{MAX_ACTIVE_PER_SECTOR} open trades** in any one sector\n"
-        f"- Max **{MAX_OPEN_POSITIONS} open trades** in total (and about £{MAX_OPEN_RISK_GBP:.0f} at risk)\n"
-        f"- Once a trade is about **{int(BREAKEVEN_TRIGGER_RATIO * 100)}%** of the way to its goal, its safety exit moves up so it can't lose money\n"
+        "- No arbitrary daily-trade or share-count ceiling; each trade must still qualify on quality and cash.\n"
+        f"- Maximum **{MAX_SINGLE_POSITION_FRACTION:.0%} of the virtual account** per trade and **{MAX_SECTOR_FRACTION:.0%}** per sector; these scale with your configured cash.\n"
+        f"- Individual safety-exit risk up to **{MAX_SINGLE_TRADE_RISK_FRACTION:.0%}**, combined risk up to **{MAX_PORTFOLIO_RISK_FRACTION:.0%}** of virtual account capital (gaps can exceed planned losses).\n"
+        f"- Once the simulated price is {int(BREAKEVEN_TRIGGER_RATIO * 100)}% of the way to target, the stop may ratchet up; this **does not guarantee** a no-loss exit\n"
         f"- A stock isn't bought again for **{COOLDOWN_CALENDAR_DAYS} days** after you sell it\n"
         f"- Buying only **{ENTRY_WINDOW_START.strftime('%H:%M')}–{ENTRY_WINDOW_END.strftime('%H:%M')}** London time, using real prices\n"
-        f"- Skips shares under {MIN_PRICE_P:.0f}p, trading under £{MIN_AVG_TURNOVER_GBP / 1e6:.0f}m a day, suspended, or swinging more than {MAX_ATR_PCT:.0f}% on a normal day\n"
+        f"- No minimum share price; still skips shares trading under £{MIN_AVG_TURNOVER_GBP / 1e6:.0f}m a day, suspended, or swinging more than {MAX_ATR_PCT:.0f}% on a normal day\n"
         f"- Only buys when a pick is **expected to make money after all costs**\n"
         f"- While still learning (under {MIN_CALIBRATION_SAMPLES} clear results), at most **{LEARNING_PICKS_PER_DAY} 🧪 learning pick a day** if nothing else qualifies\n"
         f"- Buying pauses if the UK market falls sharply in a week\n"
         f"- Shut at weekends and on UK bank holidays; closes at 12:30 on Christmas Eve and New Year's Eve\n"
-        f"- Every result includes UK stamp duty, spread and your broker fee"
+        f"- Returns include estimated UK transaction tax, bid/ask spread and your broker fee (real execution can differ)"
     )
 
 with st.sidebar.expander("🏖️ Market holidays"):
@@ -3759,13 +4041,57 @@ if is_new_loop_tick:
     st.session_state["last_loop_tick"] = loop_tick
     st.session_state["last_audit_str"] = london_now().strftime("%d %b %H:%M")
 
+with st.sidebar.expander("💾 Save and move your AI's learning", expanded=False):
+    st.write("Daily local backups keep the latest 7 snapshots. Download a copy to a different drive so a laptop failure cannot erase your learning.")
+    if st.button("Create portable learning backup", width="stretch"):
+        try:
+            with DB_LOCK:
+                _manual_archive = create_backup(DATA_DIR)
+            st.session_state["portable_backup_zip"] = str(_manual_archive)
+            st.success("Backup ready. Download it below.")
+        except Exception as exc:
+            st.error(f"Cannot create a backup ({type(exc).__name__}). Stop running scans and retry.")
+    _ready = st.session_state.get("portable_backup_zip")
+    if _ready and Path(_ready).is_file():
+        st.download_button("Download learning backup ZIP", data=Path(_ready).read_bytes(),
+                           file_name=Path(_ready).name, mime="application/zip", width="stretch")
+    if st.session_state.get("backup_warning"):
+        st.warning(st.session_state["backup_warning"])
+    st.caption("Restore from a backup using the included alpha_backup.py script while the app is stopped.")
+    if STORAGE_MODE == "local":
+        st.markdown("**Switching from your old Streamlit Cloud deployment?**")
+        if st.button("Import existing Supabase paper history", width="stretch"):
+            _migration_cloud = get_supabase_client()
+            if not _migration_cloud:
+                st.error("Add SUPABASE_URL and SUPABASE_KEY to your local Streamlit secrets first.")
+            else:
+                # Borrow the old cloud reader for a one-off migration, then immediately
+                # return to local-only writes. Existing newer local trades are preserved.
+                supabase = _migration_cloud
+                try:
+                    hydrate_duckdb_from_supabase()
+                    _m = st.session_state.get("hydrate_info", {})
+                    if _m.get("bad_rows") or st.session_state.get("cloud_read_error"):
+                        st.warning("Import was incomplete. Check the cloud schema and try again after resolving errors.")
+                    else:
+                        st.success(f"Imported/reconciled {_m.get('remote',0)} share entries from your existing backup. Local-only mode has resumed.")
+                finally:
+                    supabase = None
+
 with st.sidebar.expander("🩺 System health"):
     try:
         prices_ok = not fetch_cached_history("SHEL.L", period="5d").empty
     except Exception:
         prices_ok = False
     st.write(f"{'🟢' if prices_ok else '🔴'} Share prices {'arriving' if prices_ok else 'not arriving (Yahoo may be down)'}")
-    st.write(f"{'🟢' if supabase else '🔴'} Online backup {'connected' if supabase else 'not connected'}")
+    st.write(f"{'🟢 Local disk' if STORAGE_MODE == 'local' else ('🟢 Cloud' if supabase else '🔴 Cloud missing')} journal mode")
+    if st.session_state.get("unpriced_open_tickers"):
+        st.error("Prices missing for open: " + ", ".join(sorted(st.session_state["unpriced_open_tickers"])) + ". Left OPEN for manual review.")
+    if st.session_state.get("corporate_action_review"):
+        st.error("Stock split while held: " + ", ".join(sorted(st.session_state["corporate_action_review"])) + ". Check quantity, cost and target manually; trade left OPEN.")
+    cap_state = get_portfolio_capacity()
+    st.write(f"💼 Used: {gbp(cap_state.get('invested_gbp', 0))} · Available: {gbp(cap_state.get('cash_gbp', 0))} · Risk: {gbp(cap_state.get('risk_gbp', 0))}")
+    st.caption(f"Build {APP_VERSION}; local files persist on this laptop, but need independent backups.")
     st.write(f"{'🟢' if get_ml_model() is not None else '🔴'} AI model {'loaded' if get_ml_model() is not None else 'missing'}")
     st.write(f"🕒 Last check: {st.session_state.get('last_audit_str', '-')}")
     _ub = get_market_box().get("universe")
@@ -3791,6 +4117,7 @@ if st.session_state.get("pending_cloud_sync"):
 
 if st.sidebar.button("🚪 Log Out", width="stretch"):
     st.session_state["password_correct"] = False
+    st.session_state.pop("auth_login_ts", None)
     st.rerun()
 
 macro_bar = get_cross_asset_macro_regime()
@@ -3813,11 +4140,11 @@ pulse_chip = (f'<span class="chip {"up" if (_ps.get("breadth_pct") or 0) >= 50 e
               if _ps.get("scanned") else "")
 st.markdown(_collapse(f"""
 <div class="hero">
-  <h1>⚡ ALPHA-LSE Quant Terminal</h1>
+  <h1>⚡ ALPHA-LSE · Simple Investing Lab</h1>
   <div class="sub">An AI that picks UK shares and practises trading them with pretend money — so you can see if it really works.</div>
   <div class="chips">
     {mkt_chip}
-    <span class="chip {'up' if supabase else 'down'}">{'☁️ Saved online' if supabase else '☁️ Not saved online'}</span>
+    <span class="chip up">{'💻 Saved on this laptop' if STORAGE_MODE == 'local' else ('☁️ Cloud synced' if supabase else '⚠️ Cloud unavailable')}</span>
     {macro_chip('UK market this week', macro_bar['ftse_5d'])}{macro_chip('Oil', macro_bar['brent_5d'])}{macro_chip('Copper', macro_bar['copper_5d'])}{macro_chip('£ vs $', macro_bar['gbpusd_5d'])}
     {stress_chip}{feed_chip}{pulse_chip}
     <span class="chip">Last checked {esc(st.session_state.get('last_audit_str', '-'))}</span>
@@ -3827,10 +4154,10 @@ st.markdown(_collapse(f"""
 
 with st.expander("💡 New here? 30-second guide"):
     st.markdown(
-        "- This app **pretends to buy** UK shares, about **£500 each**. It's practice — no real money is used.\n"
+        "- This app **pretends to buy** UK shares using a virtual account you control. It risks a small proportion per idea; no real money is used.\n"
         "- Every time it checks, it looks at **every FTSE 350 share plus liquid AIM shares**, throws out the ones that are hard to trade or risky, and only buys picks that are expected to make money after all costs.\n"
         "- Every pick has a **Goal** (the price to sell at for a profit) and a **Safety exit** (the price to sell at to limit the loss).\n"
-        "- When a trade gets about two-thirds of the way to its goal, the safety exit moves up so the trade **can't lose money** any more.\n"
+        "- After sufficient price progress the planned safety exit may rise, but **gaps and fees can still cause a loss**.\n"
         "- **AI confidence** is how sure the AI is that the goal is reached before the safety exit. It's a rough guide, not a promise.\n"
         "- Every profit/loss number is **after fees and UK stamp duty**.\n"
         "- If neither the goal nor the safety exit is reached, the trade closes after **7 days**.\n"
@@ -3838,10 +4165,10 @@ with st.expander("💡 New here? 30-second guide"):
     )
 
 tab_home, tab_perf, tab_learn, tab_options = st.tabs([
-    "☀️ Today",
-    "📈 Performance",
-    "🧠 What the AI Learned",
-    "🎲 Options"
+    "☀️ Today's choices",
+    "💷 Results in pounds",
+    "🧠 Learning progress",
+    "🎲 Advanced options"
 ])
 
 # ==============================================================================
@@ -3865,7 +4192,7 @@ def render_cohort(todays_df: pd.DataFrame):
                 pos_i + 1, tkr_sym, sec_name, t_row["status"], float(t_row["entry_price"]), float(t_row["target_price"]),
                 float(t_row["stop_loss"]), float(t_row["latest_price"]), float(t_row["pnl_pct"]), int(t_row["shares"]),
                 float(t_row["capital_allocated"]), base_c + adj, base_c, adj, tax_tag,
-                get_trade_friction_pct(tkr_sym, f_meta), t_row["last_audited"], be_active, bool(f_meta.get("learning_pick"))), unsafe_allow_html=True)
+                get_trade_friction_pct(tkr_sym, f_meta, t_row["capital_allocated"]), t_row["last_audited"], be_active, bool(f_meta.get("learning_pick"))), unsafe_allow_html=True)
 
 with tab_home:
     brief_box = st.container()
@@ -3876,7 +4203,7 @@ with tab_home:
     with col_picks:
 
         todays_logged_df = get_todays_logged_equities()
-        quota_filled = len(todays_logged_df) >= MAX_DAILY_EQUITY_TRADES
+        quota_filled = False
 
         cap_state = get_portfolio_capacity()
         picks_title = st.container()                       # filled after the check, so the count includes anything just bought
@@ -3900,7 +4227,7 @@ with tab_home:
                 st.session_state["scan_ts"] = london_now().strftime("%H:%M:%S")
                 st.session_state["scan_epoch"] = time.time()
         if quota_filled and not re_scan:
-            st.info(f"🔒 You've used all {MAX_DAILY_EQUITY_TRADES} picks for today. This stops over-trading. They're in Your positions.")
+            st.info("Paper account has no arbitrary daily trade limit.")
             with st.expander(f"📌 Today's {len(todays_logged_df)} trades in detail (costs, confidence, tax)"):
                 render_cohort(todays_logged_df)
         else:
@@ -3925,16 +4252,16 @@ with tab_home:
             held_now = get_currently_active_tickers() | set(todays_logged_df["ticker"].tolist() if not todays_logged_df.empty else [])
             df_res = (df_all_res[(df_all_res["Qualified"] == True) & (~df_all_res["Ticker"].isin(held_now))].reset_index(drop=True)
                       if (not df_all_res.empty and "Qualified" in df_all_res.columns) else pd.DataFrame())
-            quota_now = len(todays_logged_df) >= MAX_DAILY_EQUITY_TRADES
+            quota_now = False
             stats = st.session_state.get("scan_stats", {})
             if stats and not stats.get("error"):
                 st.caption(
                     f"Last check {st.session_state.get('scan_ts', '-')} (took {stats.get('seconds', 0):.0f}s): {stats.get('scanned', 0):,} tradable shares checked out of "
                     f"{stats.get('listed', 0):,} · {stats.get('deep', 0)} finalists · {stats.get('rns_blocked', 0)} blocked by bad news · "
-                    f"bought {stats.get('logged', 0)} automatically · {len(todays_logged_df)} of {MAX_DAILY_EQUITY_TRADES} picks used today")
+                    f"recorded {stats.get('logged', 0)} new paper ideas · {len(todays_logged_df)} recorded today")
                 if stats.get("priced", 0) and not stats.get("scanned", 0):
                     st.warning(f"🔎 **None of the {stats.get('priced', 0):,} shares with prices could be checked.** Why: {stats.get('short', 0):,} had too little price history · "
-                               f"{stats.get('illiquid', 0):,} too thinly traded or under {MIN_PRICE_P:.0f}p · {stats.get('wild', 0):,} suspended or too jumpy · "
+                               f"{stats.get('illiquid', 0):,} too thinly traded · {stats.get('wild', 0):,} suspended or too jumpy · "
                                f"{stats.get('no_data', 0):,} without usable prices · {stats.get('model_errors', 0):,} errors. Nothing is guessed.")
                 if stats.get("priced", 0) >= 20 and stats.get("short", 0) > stats["priced"] * 0.5:
                     st.warning(f"📏 Price history came back too short for {stats['short']:,} of {stats['priced']:,} shares (the AI needs about 3 months of daily prices). "
@@ -3950,8 +4277,7 @@ with tab_home:
                 st.error(stats["error"])
 
             if quota_now:
-                st.info(f"🔒 All {MAX_DAILY_EQUITY_TRADES} picks for today are used (they're in Your positions). This stops over-trading."
-                        + (f" {len(df_res)} more share(s) passed every check — see the finalists list below." if not df_res.empty else ""))
+                st.info("There is no preset maximum number of daily trades; only available cash, risks and verified signals decide.")
             elif st.session_state.get("has_cleared", False) and not df_res.empty:
                 st.success(f"🟢 {len(df_res)} share(s) passed every check")
 
@@ -3997,7 +4323,7 @@ with tab_home:
                                "and expected to make money after all costs). Doing nothing is a valid choice.")
 
         with picks_title:
-            sec_title("🎯", "Today's picks", f"{len(get_todays_logged_equities())} of {MAX_DAILY_EQUITY_TRADES} used")
+            sec_title("🎯", "Today's picks", f"{len(get_todays_logged_equities())} paper trades recorded today")
 
     # ---------------- market pulse (the whole UK market, from the latest check) ----------------
     stats_p = st.session_state.get("scan_stats", {}) or {}
@@ -4143,11 +4469,7 @@ with tab_options:
         ])
         if perf_opt["n"] < 20:
             callout("warn", "⏳", f"<b>Too early to judge.</b> Only {perf_opt['n']} option idea{'s have' if perf_opt['n'] != 1 else ' has'} finished. Options swing a lot, so early results are mostly luck.")
-        oc1, oc2 = st.columns([3, 2])
-        with oc1:
-            chart_cumulative_pnl(perf_opt_df, "Options running profit/loss (£)", key="cum_options")
-        with oc2:
-            chart_outcome_donut(perf_opt, title="How your option ideas ended", key="outcomes_options")
+        st.caption("Options results are summarised above; no graphs needed.")
         if opt_learn.get("old"):
             rl, ol = opt_learn.get("real"), opt_learn.get("old")
             q1, q2 = st.columns(2)
@@ -4260,11 +4582,7 @@ with tab_perf:
         if n_ < 100 and n_ >= 30:
             st.caption("Still a fairly small sample — be cautious about drawing firm conclusions.")
 
-        ch1, ch2 = st.columns([3, 2])
-        with ch1:
-            chart_cumulative_pnl(perf_eq_df, "Your running profit/loss (£) — going up is good", key="cum_shares")
-        with ch2:
-            chart_outcome_donut(perf_eq, key="outcomes_shares")
+        st.caption("Profits, losses and win rates are shown as plain numbers above.")
 
         sec_title("✨", "Highlights")
         best_i = perf_eq_df["pnl_pct"].idxmax()
@@ -4303,7 +4621,7 @@ with tab_perf:
             b3.metric("Money won ÷ money lost", f"{perf_eq['profit_factor']:.2f}" if perf_eq["profit_factor"] is not None else "no losses yet",
                       help="Above 1 means more money won than lost.")
             b4.metric("Biggest drop from a peak", gbp(perf_eq['max_dd_gbp'], sign=True), help="The worst losing streak, measured from the highest point your running total reached.")
-            chart_pnl_hist(perf_eq_df)
+            st.caption("Individual results are available in the trade history below.")
             sg = sector_stats(perf_eq_df)
             if not sg.empty:
                 tbl = sg.rename(columns={"n": "Trades", "avg": "Average %", "win_rate": "Win rate %"})[["Sector", "Trades", "Average %", "Win rate %"]].round(1)
@@ -4345,7 +4663,7 @@ with pos_box:
         sec_exp = get_active_sector_exposure()
         if sec_exp:
             with st.expander("📊 Open trades by sector"):
-                chart_sector_exposure(sec_exp)
+                st.caption("Sector exposure is included in the figures above.")
     else:
         callout("info", "🌙", "<b>Nothing open right now.</b> When a share passes every check during buying hours, it's bought (with pretend money) and appears here.")
 
@@ -4368,11 +4686,11 @@ def build_briefing() -> str:
     t_df = get_todays_logged_equities()
     names = ", ".join(str(t).replace(".L", "") for t in (t_df["ticker"].tolist() if not t_df.empty else []))
     q_n = int(stt.get("qualified", 0) or 0)
-    parts.append(f"Today it has used <b>{len(t_df)} of {MAX_DAILY_EQUITY_TRADES}</b> picks" + (f" ({esc(names)})" if names else "")
+    parts.append(f"Today it has recorded <b>{len(t_df)}</b> paper trades" + (f" ({esc(names)})" if names else "")
                  + (f", and <b>{q_n}</b> share{'s' if q_n != 1 else ''} currently pass every check." if stt else "."))
     if n_open_all:
         parts.append(f"You have <b>{n_open_all} trade{'s' if n_open_all != 1 else ''} open</b> ({esc(open_split_text())}), "
-                     f"<b class=\"{'pos' if open_unreal_all >= 0 else 'neg'}\">{gbp(open_unreal_all, sign=True)}</b> so far" + (f"; {be_prot} can no longer lose." if be_prot else "."))
+                     f"<b class=\"{'pos' if open_unreal_all >= 0 else 'neg'}\">{gbp(open_unreal_all, sign=True)}</b> so far" + (f"; {be_prot} has a raised safety exit, but losses are still possible." if be_prot else "."))
     if perf_eq["n"]:
         parts.append(f"So far <b>{perf_eq['n']}</b> share trades have finished: {perf_eq['wins']} hit their goal, "
                      f"<b class=\"{'pos' if perf_eq['net_gbp'] >= 0 else 'neg'}\">{gbp(perf_eq['net_gbp'], sign=True)}</b> after all costs"
@@ -4388,8 +4706,8 @@ with brief_box:
     todays_n = len(get_todays_logged_equities())
     score_cards([
         ("Open right now", str(n_open_all), f"{open_split_text()} · {gbp(open_unreal_all, sign=True)}", "good" if open_unreal_all > 0 else ("bad" if open_unreal_all < 0 else ""), ""),
-        ("Picks used today", f"{todays_n} of {MAX_DAILY_EQUITY_TRADES}", "stops over-trading", "warn" if todays_n >= MAX_DAILY_EQUITY_TRADES else "", ""),
-        ("Money at risk", gbp(cap_now["risk_gbp"], 0), f"if every open trade hit its safety exit (cap {gbp(MAX_OPEN_RISK_GBP, 0)})", "warn" if not cap_now["ok"] else "", ""),
+        ("Paper trades today", str(todays_n), "no arbitrary count ceiling", "", ""),
+        ("Money at risk", gbp(cap_now["risk_gbp"], 0), f"estimated to stops (allowance {gbp(cap_now['risk_budget_gbp'], 0)})", "warn" if not cap_now["ok"] else "", ""),
         ("Share profit/loss", gbp(perf_eq.get("net_gbp", 0.0), sign=True) if perf_eq["n"] else "£0.00", f"{perf_eq['n']} finished · after all costs" if perf_eq["n"] else "nothing finished yet",
          ("good" if perf_eq.get("net_gbp", 0) > 0 else ("bad" if perf_eq.get("net_gbp", 0) < 0 else "")) if perf_eq["n"] else "", ("pos" if perf_eq.get("net_gbp", 0) > 0 else ("neg" if perf_eq.get("net_gbp", 0) < 0 else "")) if perf_eq["n"] else ""),
     ])
@@ -4512,9 +4830,10 @@ with tab_learn:
             else:
                 st.caption("No sector is clearly losing (or not enough trades yet).")
 
-        sec_title("📈", "Is it getting better?", "win rate of the last 10 trades")
-        chart_rolling(perf_eq_df, 10)
-        st.caption("A line trending up means the AI is improving. Flat or falling means it isn't (yet).")
+        sec_title("🧠", "Is it getting better?", "Results from the latest ten finished trades")
+        last10 = perf_eq_df.tail(10)
+        st.write(f"Last {len(last10)}: {int((last10['pnl_pct'] > 0).sum())} profitable · average return {float(last10['pnl_pct'].mean()):+.2f}% after estimated costs.")
+        st.caption("A short winning streak does not prove predictive accuracy; the model upgrades only on held-out tests.")
 
         sec_title("🧷", "Stocks it remembers", "lessons fade by half every 30 days")
         careful, liked = compute_memory(closed_all)
@@ -4531,7 +4850,7 @@ with tab_learn:
                 st.markdown(hbars_html([(t, float(p), f"+{p} pts · ~{d}d left") for t, p, d in liked[:6]]), unsafe_allow_html=True)
             else:
                 st.caption("None right now.")
-        st.caption("“pts” are points added to or taken from the AI's confidence for that stock when it next looks at it.")
+        st.caption("“pts” are heuristic score adjustments. They are not validated probabilities of a profitable trade.")
 
     sec_title("🎚️", "Can you trust its confidence number?")
     cal_rows = calibration_rows(closed_all)
@@ -4544,7 +4863,7 @@ with tab_learn:
             callout("good", "🎚️", f"On average the AI said it was <b>{avg_said:.0f}% sure</b> and was right <b>{actual:.0f}%</b> of the time — it has been a little modest.")
         else:
             callout("good", "🎚️", f"On average the AI said it was <b>{avg_said:.0f}% sure</b> and was right <b>{actual:.0f}%</b> of the time — its confidence is a fair guide.")
-        chart_calibration(cal_rows)
+        st.caption("Model calibration is described in plain language above.")
         st.caption("If the green bars are about as tall as the purple ones, the confidence number is trustworthy.")
     else:
         st.info("This appears once at least 10 trades have clearly won or lost.")
@@ -4586,7 +4905,7 @@ with tab_learn:
     st.markdown(
         f"- **Version in use:** {st.session_state.get('ml_model_source', 'not loaded yet')}\n"
         f"- **Last upgrade:** {state.get('last_promoted', 'never — still the original')}\n"
-        f"- **Upgrade rule:** only after {MIN_SETTLED_TO_RETRAIN}+ clear win/loss trades, and only if the new version tests better than the old one. Your original AI file is never overwritten."
+        f"- **Upgrade rule:** on this laptop, retraining runs after {MIN_SETTLED_TO_RETRAIN}+ labelled trades and saves only a challenger that beats the existing model on later held-out trades. Cloud retraining remains off until model storage is persistent."
         + (f"\n- **Confidence tuning:** based on {cal['decided']} trades that clearly won or lost." if cal else "")
         + f"\n- **Evidence learner:** {'in use' if ev_model.get('ready') else 'collecting evidence'} (see above)."
         + "\n- **Options:** this AI learns from share trades only. Options have their own separate learner — see the 🎲 Options tab.")
@@ -4614,4 +4933,4 @@ with tab_learn:
                           "BE": "Safety exit protected the money — no change.", "EXPIRED": "Timed out — nothing learned."}.get(o_, "")
                 st.markdown(f"**{c_row['ticker']}** ({c_row['date_str']}) · {friendly_status(c_row['status'])} · {float(c_row['pnl_pct']):+.2f}% — _{lesson}_")
 
-st.markdown('<div class="disc">Practice tool using pretend money. Not financial advice. Past results don’t predict future results.</div>', unsafe_allow_html=True)
+st.markdown('<div class="disc">Paper trading only. Signals are model estimates, not validated probabilities or guarantees. Market prices may be delayed. Costs and fills are simulated. Model, data provider and calendar require ongoing maintenance.</div>', unsafe_allow_html=True)
