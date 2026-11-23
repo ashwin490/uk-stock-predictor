@@ -92,7 +92,9 @@ def test_old_us_options_engine_is_retired_and_new_commodity_tab_replaces_it():
 
 def test_commodity_prices_show_buy_target_stop_and_automatic_recording():
     s=(ROOT/'app.py').read_text(encoding='utf-8')
-    assert '"Buy at"' in s and '"Sell target"' in s and '"Stop-loss"' in s
+    cards=(ROOT/'commodity_dashboard.py').read_text(encoding='utf-8')
+    assert 'Buy at' in cards and 'Sell target' in cards and 'Stop-loss' in cards
+    assert 'commodity_signal_card_html(it)' in s
     assert "log_equity_signal_safely(idea['_order']" in s
     assert 'Automatically paper-buy qualifying commodity ETCs' in s
 

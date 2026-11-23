@@ -49,3 +49,7 @@
 - `python -m py_compile app.py alpha_backup.py setup_auth.py` — syntax passed.
 - I did **not** validate live quotes, your actual Supabase project, your trained model, or end-to-end Streamlit deployment. Trading forecasts are not guaranteed to be accurate.
 - This application records **simulated paper trades**, not actual brokerage orders.
+
+### New Commodity dashboard
+
+Copy **both** `commodity_dashboard.py` and `auto_refresh_schedule.py` with the updated `app.py`. On the home page look for **Commodities at a glance**. On the Commodities tab check the five visual cards, completed trade outcomes and CSV export. Auto-refresh automatically starts on the next UK market opening while the app browser tab is active; it can still be manually paused for the session.

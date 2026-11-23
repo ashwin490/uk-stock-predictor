@@ -19,6 +19,9 @@ from alpha_backup import create_backup
 from intraday_exit import first_intraday_exit
 from commodity_etps import COMMODITY_ETPS, FUTURES_REFERENCES, is_commodity_etc
 from commodity_signals import evaluate_commodity_signal, STRATEGY_NAME
+from commodity_dashboard import (commodity_signal_card_html, commodity_journal_view,
+                                 summarise_commodity_history, assess_commodity_history)
+from auto_refresh_schedule import choose_auto_refresh
 from option_retirement import make_options_archive, retire_options
 
 import streamlit as st
@@ -3966,10 +3969,22 @@ st.sidebar.number_input("Broker fee per trade (£)", min_value=0.0, max_value=25
                         help="Charged when you buy and again when you sell. Included in every profit/loss number you see. Many UK apps charge £0 — "
                              "set yours, because on a £500 trade a £3 fee each way costs 1.2%, which decides which picks are worth it.")
 broker_mode = "paper trade"      # everything here is pretend money
-if "auto_loop_toggle" not in st.session_state or st.session_state.get("last_market_open_state") != market_is_open:
-    st.session_state["auto_loop_toggle"] = market_is_open
-    st.session_state["last_market_open_state"] = market_is_open
-auto_mode = st.sidebar.toggle("Auto-refresh", key="auto_loop_toggle", help="Turns on by itself when the London market opens and off when it closes (including bank holidays).")
+# Automatic wake-up on a transition to open trading, even if the page was
+# opened before 08:00. A manual pause applies until the next session/window.
+_entry_window_active = is_entry_window_open()
+st.session_state["auto_loop_toggle"] = choose_auto_refresh(
+    market_open=market_is_open,
+    in_entry_window=_entry_window_active,
+    previous_market_open=st.session_state.get("last_market_open_state"),
+    previous_entry_window=st.session_state.get("last_entry_window_state"),
+    current_setting=st.session_state.get("auto_loop_toggle"))
+st.session_state["last_market_open_state"] = market_is_open
+st.session_state["last_entry_window_state"] = _entry_window_active
+auto_mode = st.sidebar.toggle(
+    "Auto-refresh", key="auto_loop_toggle",
+    help="Automatically switches ON when the UK market/trading window opens. You can pause it for the rest of the session; it automatically restarts at the next opening. Requires an active browser tab.")
+st.sidebar.caption("🟢 Automatic checks active during trading hours." if auto_mode else
+                   "⏰ Waiting for market opening (or paused for this session). A browser tab must stay open for automatic wake-up.")
 refresh_interval_sec = st.sidebar.selectbox("Check every", [300, 900, 3600], format_func=lambda x: f"{x//60} minutes",
                                             help="Open trades are checked every time. Prices for the whole market are re-downloaded at most every 15 minutes; finalists always get a fresh price.")
 
@@ -4003,16 +4018,20 @@ with st.sidebar.expander("🏖️ Market holidays"):
     _hb = get_market_box().get("holidays")
     st.caption("From gov.uk's official list." if _hb and _hb[2] else "gov.uk isn't reachable right now, so these come from the standard bank-holiday rules.")
 
+# The lightweight heartbeat also runs outside trading hours, so a tab
+# opened early can turn itself ON at the opening bell. No full scan is run
+# on a heartbeat when Auto-refresh is OFF.
 loop_tick = 0
-if auto_mode and st_autorefresh:
-    loop_tick = st_autorefresh(interval=refresh_interval_sec * 1000, key="unified_autonomous_loop")
+if st_autorefresh:
+    wake_interval_sec = refresh_interval_sec if auto_mode else 300
+    loop_tick = st_autorefresh(interval=wake_interval_sec * 1000, key="unified_autonomous_loop")
 
-is_new_loop_tick = ("last_loop_tick" not in st.session_state) or (loop_tick != st.session_state["last_loop_tick"])
-
+is_new_loop_tick = ("last_loop_tick" not in st.session_state) or (
+    bool(auto_mode) and loop_tick != st.session_state.get("last_loop_tick"))
+st.session_state["last_loop_tick"] = loop_tick
 if is_new_loop_tick:
     audit_and_reconcile_all_trades()
     hydrate_duckdb_from_supabase()
-    st.session_state["last_loop_tick"] = loop_tick
     st.session_state["last_audit_str"] = london_now().strftime("%d %b %H:%M")
 
 with st.sidebar.expander("💾 Save and move your AI's learning", expanded=False):
@@ -4406,17 +4425,38 @@ def commodity_price_text(p):
     return f"{float(p):,.4f}p" if abs(float(p)) < 1 else f"{float(p):,.2f}p"
 
 
+def get_commodity_feedback(ticker: str):
+    """Read only finished ETC trades from the same journal used by the dashboard.
+
+    In cloud mode, that journal has already been hydrated from Supabase. Never
+    use unfinished trades or stock-model results to adjust a commodity stake.
+    """
+    with DB_LOCK:
+        con = duckdb.connect(DB_PATH, read_only=True)
+        try:
+            rows = con.execute(
+                "SELECT ticker,status,pnl_pct,exit_timestamp,last_audited FROM trade_journal "
+                "WHERE asset_type='ETC' AND ticker=?", [ticker]).df()
+        except Exception as exc:
+            LOGGER.warning("Commodity feedback unavailable for %s: %s", ticker, type(exc).__name__)
+            return assess_commodity_history(pd.DataFrame(), ticker)
+        finally:
+            con.close()
+    return assess_commodity_history(rows, ticker)
+
+
 def commodity_idea(ticker: str, *, refresh: bool = False) -> dict:
     """Read completed bars for rules; live daily close only for current paper entry.
 
     A signal does not imply guaranteed execution at its quote or stop price.
     """
     item = COMMODITY_ETPS[ticker]
+    feedback = get_commodity_feedback(ticker)
     out = {"Ticker": ticker, "Commodity": item['underlying'], "Product": item['name'],
            "Decision": "WAIT", "Explanation": "Waiting for verified market data",
            "Buy (p)": None, "Sell target (p)": None, "Stop-loss (p)": None,
            "Units": 0, "Paper amount (£)": 0.0, "Trend checks": "—",
-           "Potential net return (%)": None, "_order": None}
+           "Potential net return (%)": None, "History note": feedback.note, "_order": None}
     h = _download_history_raw(ticker, '6mo') if refresh else fetch_cached_history(ticker, '6mo')
     if h is None or h.empty or not isinstance(h.index, pd.DatetimeIndex):
         out['Explanation'] = 'Verified sterling price unavailable or data feed failed'
@@ -4463,7 +4503,9 @@ def commodity_idea(ticker: str, *, refresh: bool = False) -> dict:
     stop = float(evaluation.stop_pence)
     target = float(evaluation.target_pence)
     sector = item['sector']
-    amount = get_position_size_gbp(price, stop, sector)
+    # Feedback only scales *down* after 20+ settled trades with a persistently
+    # weak recent run. This is risk control, not a prediction accuracy claim.
+    amount = get_position_size_gbp(price, stop, sector) * feedback.stake_fraction
     units = int(max(0.0, (amount * 100) / price))
     capital = round(units * price / 100,2)
     out['Units'] = units
@@ -4485,6 +4527,8 @@ def commodity_idea(ticker: str, *, refresh: bool = False) -> dict:
     meta = {"price_currency": "GBp", "spread_pct": spread,
             "commission_gbp": fees, "asset_class": "COMMODITY_ETC", "sector": sector,
             "strategy_id": STRATEGY_NAME, "model_validated": False,
+            "commodity_history_size_factor": feedback.stake_fraction,
+            "commodity_history_sample": feedback.count,
             "commodity_rule_score": evaluation.score, "commodity_rule_reason": evaluation.reason,
             "atr_pct": (evaluation.atr_pence / price * 100) if evaluation.atr_pence is not None else None,
             "source": "UNVALIDATED_RULE_BASED_ETC", "market_data_delayed": True}
@@ -4520,7 +4564,7 @@ def scan_commodity_ideas(*, auto_record: bool):
                           "Explanation":"Scan unavailable; no trade recorded", "Buy (p)":None,
                           "Sell target (p)":None,"Stop-loss (p)":None,"Units":0,
                           "Paper amount (£)":0.0,"Trend checks":"—","Potential net return (%)":None,
-                          "_order": None})
+                          "History note":"No reliable signal available", "_order": None})
     st.session_state['commodity_ideas'] = ideas
     st.session_state['commodity_scan_ts'] = london_now().strftime('%d %b %H:%M:%S')
     st.session_state['commodity_last_buys'] = recorded
@@ -4533,33 +4577,6 @@ _auto_etc = bool(st.session_state.get('auto_buy_commodity_etcs', True))
 _due = is_new_loop_tick and market_is_open and is_entry_window_open()
 if 'commodity_ideas' not in st.session_state or _due:
     scan_commodity_ideas(auto_record=bool(_due and auto_mode and _auto_etc))
-
-with tab_commodity:
-    sec_title('🪙', 'Gold, silver, oil & gas', 'UK-listed, sterling-quoted commodity ETCs')
-    st.caption('Rule-based paper signals, NOT predictions from your share AI. Prices are pence per listed ETC unit, not gold/oil spot or US futures. Data may be delayed.')
-    st.info('**Buy at** is a reference price, **Sell target** is a profit-taking level, and **Stop-loss** is a loss-limiting level. None is guaranteed to execute at the exact price.')
-    cc1, cc2 = st.columns([1,2])
-    with cc1:
-        if st.button('🔄 Check commodity prices and signals', width='stretch'):
-            scan_commodity_ideas(auto_record=False)
-    with cc2:
-        st.caption('Automatic paper-buy is controlled in Settings; trades can only be saved during UK buying hours.')
-    ideas = st.session_state.get('commodity_ideas', [])
-    if st.session_state.get('commodity_last_buys'):
-        st.success('New commodity paper purchases: ' + ', '.join(st.session_state['commodity_last_buys']))
-    st.caption('Last checked: ' + str(st.session_state.get('commodity_scan_ts','not yet')))
-    view = []
-    for it in ideas:
-        view.append({"Commodity":it['Commodity'], "Symbol":it['Ticker'], "Action":it['Decision'],
-                     "Buy at":commodity_price_text(it['Buy (p)']),
-                     "Sell target":commodity_price_text(it['Sell target (p)']),
-                     "Stop-loss":commodity_price_text(it['Stop-loss (p)']),
-                     "Units":it['Units'], "Paper spend":gbp(it['Paper amount (£)']),
-                     "Conditions":it['Trend checks'], "Potential net %":it['Potential net return (%)'],
-                     "Why":it['Explanation']})
-    if view:
-        st.dataframe(pd.DataFrame(view), hide_index=True, width='stretch')
-    st.caption('Profit targets use 2.4 × 14-day ATR; initial stop-losses use 1.5 × ATR, from completed daily bars. This is an unvalidated heuristic; no known win probability.')
 
 # ==============================================================================
 # DATA LOAD (after scanner/options so anything just bought is included)
@@ -4599,25 +4616,92 @@ def open_split_text() -> str:
 
 closed_all = load_closed_trades_df()
 
+
+with tab_commodity:
+    sec_title('🪙', 'Gold, silver, oil & gas', 'five UK-listed sterling-quoted ETCs')
+    st.caption('Rule-based paper research, NOT probabilities from the share AI. Prices below are pence per ETC unit, not gold/oil spot or USD futures. Quotes may be delayed.')
+    st.markdown("""<style>
+    .cm-wrap{margin-bottom:14px}
+    .commodity-card{border:1px solid var(--line);border-radius:17px;padding:20px;
+        background:var(--secondary-background-color,rgba(128,128,128,.06));height:100%;
+        box-shadow:0 4px 12px rgba(0,0,0,.06);overflow-wrap:anywhere}
+    .cm-top{display:flex;justify-content:space-between;align-items:start;flex-wrap:wrap;gap:10px;margin-bottom:16px}
+    .cm-name{font-size:1.2rem;font-weight:800}.cm-symbol{font-size:.78rem;opacity:.75}
+    .cm-status{font-size:.77rem;font-weight:700;border:1px solid var(--line);border-radius:9px;
+        padding:5px 9px;max-width:240px;text-align:right}
+    .cm-status.ok{color:#16a34a}.cm-status.hold{color:#d97706}
+    .cm-price-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-bottom:14px}
+    .cm-price-grid>div{border:1px solid var(--line);border-radius:10px;padding:12px 8px}
+    .cm-price-grid small{font-size:.72rem;display:block;opacity:.75;margin-bottom:4px}
+    .cm-price-grid b{font-size:1.08rem;font-variant-numeric:tabular-nums}
+    .cm-details{display:flex;gap:10px;flex-wrap:wrap;font-size:.85rem;margin-bottom:10px}
+    .cm-why{border-top:1px solid var(--line);padding-top:12px;font-size:.85rem;line-height:1.5}
+    .cm-learning{opacity:.8;font-size:.75rem;line-height:1.4;margin-top:9px}
+    @media(max-width:650px){.cm-price-grid{grid-template-columns:1fr}.cm-price-grid>div{padding:6px 8px}}
+    </style>""", unsafe_allow_html=True)
+    _etc_summary = summarise_commodity_history(etc_df)
+    score_cards([
+        ('Open commodities', str(_etc_summary['open']), 'simulated positions currently open', '', ''),
+        ('Open profit/loss', gbp(_etc_summary['unrealised_gbp'], sign=True), 'estimated, not yet realised', 'good' if _etc_summary['unrealised_gbp'] > 0 else ('bad' if _etc_summary['unrealised_gbp'] < 0 else ''), ''),
+        ('Finished profit/loss', gbp(_etc_summary['realised_gbp'], sign=True), f"{_etc_summary['closed']} closed · after estimated costs", 'good' if _etc_summary['realised_gbp'] > 0 else ('bad' if _etc_summary['realised_gbp'] < 0 else ''), ''),
+        ('Won / lost', f"{_etc_summary['won']} / {_etc_summary['lost']}", f"{_etc_summary['saved']} protected · {_etc_summary['expired']} timed out", '', '')
+    ])
+    left, right = st.columns([1,2])
+    with left:
+        if st.button('🔄 Check commodity prices and signals', width='stretch'):
+            scan_commodity_ideas(auto_record=False)
+    with right:
+        st.caption('Automatic paper-buy follows the Settings toggle and UK trading hours. Clicking Check refreshes prices only.')
+    ideas = st.session_state.get('commodity_ideas', [])
+    if st.session_state.get('commodity_last_buys'):
+        st.success('New commodity paper purchases: ' + ', '.join(st.session_state['commodity_last_buys']))
+    st.caption('Last checked: ' + str(st.session_state.get('commodity_scan_ts','not yet')))
+    if ideas:
+        for start in range(0,len(ideas),2):
+            cols = st.columns(2, gap='medium')
+            for col,it in zip(cols,ideas[start:start+2]):
+                with col:
+                    st.markdown(commodity_signal_card_html(it), unsafe_allow_html=True)
+    else:
+        st.warning('Commodity prices have not been checked successfully yet. Retry using the refresh control.')
+    st.caption('Targets use 2.4× 14-day ATR and stops use 1.5× ATR on completed daily bars. No guarantee of execution or future profit.')
+
 # ==============================================================================
 # 13b. COMMODITY PERFORMANCE (separate from the share-trained AI)
 # ==============================================================================
 with tab_commodity:
-    sec_title('📒', 'Commodity paper trades', 'kept separate from stock-AI performance')
+    sec_title('📒', 'Every commodity paper trade', 'original purchases, current holdings and closed results')
     if not etc_df.empty:
-        etc_open = etc_df[etc_df['status'].apply(classify_outcome) == 'ACTIVE']
-        st.write(f"{len(etc_open)} open · {len(etc_df)-len(etc_open)} finished")
-        if perf_etc['n']:
-            st.metric('Finished ETC paper profit/loss', gbp(perf_etc['net_gbp'], sign=True))
-        display = etc_df[['date_str','ticker','entry_price','target_price','stop_loss','shares',
-                          'capital_allocated','latest_price','pnl_pct','status']].copy()
-        display.columns=['Bought','ETC','Buy (p)','Sell target (p)','Stop-loss (p)',
-                         'Units','Spent (£)','Latest (p)','P/L (%)','Status']
-        st.dataframe(display, width='stretch', hide_index=True)
+        journal = commodity_journal_view(etc_df)
+        journal['Commodity'] = journal['Symbol'].map(
+            lambda t: COMMODITY_ETPS.get(t, {}).get('underlying', t))
+        st.caption(f"{len(journal)} saved ETC trades across your history. £ profit/loss uses the app's estimated trading costs. Open P/L is unrealised.")
+        st.dataframe(journal, width='stretch', hide_index=True,
+            column_config={
+                'Invested (£)': st.column_config.NumberColumn(format='£%.2f'),
+                'Paper P/L (£)': st.column_config.NumberColumn(format='£%.2f'),
+                'Paper P/L (%)': st.column_config.NumberColumn(format='%.2f%%')
+            })
+        st.download_button('⬇️ Export commodity history (CSV)',
+                           journal.to_csv(index=False).encode('utf-8'),
+                           file_name='alpha_lse_commodity_trades.csv', mime='text/csv',
+                           key='export_commodity_journal')
+        st.markdown('**What its commodity history has taught it**')
+        st.caption('A separate, conservative rule reduces a product’s paper position size by half only after at least 20 closed trades and consistently weak recent results. It never increases position risk. This is not validated AI predictive learning.')
+        feedback_table=[]
+        for ticker in COMMODITY_ETPS:
+            subset=etc_df[etc_df['ticker']==ticker]
+            smry=summarise_commodity_history(subset)
+            f=assess_commodity_history(etc_df,ticker)
+            feedback_table.append({'Commodity':COMMODITY_ETPS[ticker]['underlying'],
+                'Closed trades':smry['closed'],'Wins':smry['won'],'Losses':smry['lost'],
+                'Past paper P/L':gbp(smry['realised_gbp'], sign=True),
+                'Future paper stake':f'{f.stake_fraction:.0%} of normal', 'Lesson':f.note})
+        st.dataframe(pd.DataFrame(feedback_table),hide_index=True,width='stretch')
     else:
-        st.info('No commodity paper purchases recorded yet. That is expected until one passes every entry safeguard.')
+        st.info('No commodity paper purchases recorded yet. All five signal cards above remain visible even when nothing qualifies.')
     with st.expander('Why not US call options?'):
-        st.write('This app no longer proposes, purchases or audits US options. Earlier option results are excluded from ongoing performance. Existing historic options can be archived and removed from the Settings panel below.')
+        st.write('This app no longer proposes, purchases or audits US options. Earlier option results are excluded from ongoing performance. Existing historic options can be archived and removed from Settings.')
 
 # ==============================================================================
 # 14. OVERVIEW (SCOREBOARD)
@@ -4766,6 +4850,11 @@ def build_briefing() -> str:
     if n_open_all:
         parts.append(f"You have <b>{n_open_all} trade{'s' if n_open_all != 1 else ''} open</b> ({esc(open_split_text())}), "
                      f"<b class=\"{'pos' if open_unreal_all >= 0 else 'neg'}\">{gbp(open_unreal_all, sign=True)}</b> so far" + (f"; {be_prot} has a raised safety exit, but losses are still possible." if be_prot else "."))
+    _cm_brief = summarise_commodity_history(etc_df)
+    if _cm_brief['open'] or _cm_brief['closed']:
+        parts.append(f"Commodities: <b>{_cm_brief['open']} open</b>, <b>{_cm_brief['closed']} finished</b>, "
+                     f"{_cm_brief['won']} won and {_cm_brief['lost']} lost; "
+                     f"completed paper P/L <b>{gbp(_cm_brief['realised_gbp'], sign=True)}</b>.")
     if perf_eq["n"]:
         parts.append(f"So far <b>{perf_eq['n']}</b> share trades have finished: {perf_eq['wins']} hit their goal, "
                      f"<b class=\"{'pos' if perf_eq['net_gbp'] >= 0 else 'neg'}\">{gbp(perf_eq['net_gbp'], sign=True)}</b> after all costs"
@@ -4785,6 +4874,14 @@ with brief_box:
         ("Money at risk", gbp(cap_now["risk_gbp"], 0), f"estimated to stops (allowance {gbp(cap_now['risk_budget_gbp'], 0)})", "warn" if not cap_now["ok"] else "", ""),
         ("Share profit/loss", gbp(perf_eq.get("net_gbp", 0.0), sign=True) if perf_eq["n"] else "£0.00", f"{perf_eq['n']} finished · after all costs" if perf_eq["n"] else "nothing finished yet",
          ("good" if perf_eq.get("net_gbp", 0) > 0 else ("bad" if perf_eq.get("net_gbp", 0) < 0 else "")) if perf_eq["n"] else "", ("pos" if perf_eq.get("net_gbp", 0) > 0 else ("neg" if perf_eq.get("net_gbp", 0) < 0 else "")) if perf_eq["n"] else ""),
+    ])
+    _comm_home = summarise_commodity_history(etc_df)
+    st.markdown('**🪙 Commodities at a glance**')
+    score_cards([
+        ('Open commodities', str(_comm_home['open']), 'currently monitored ETC positions', '', ''),
+        ('Commodity P/L — open', gbp(_comm_home['unrealised_gbp'], sign=True), 'estimated, unrealised', 'good' if _comm_home['unrealised_gbp'] > 0 else ('bad' if _comm_home['unrealised_gbp'] < 0 else ''), ''),
+        ('Commodity P/L — closed', gbp(_comm_home['realised_gbp'], sign=True), f"{_comm_home['closed']} finished · estimated costs included", 'good' if _comm_home['realised_gbp'] > 0 else ('bad' if _comm_home['realised_gbp'] < 0 else ''), ''),
+        ('Commodity wins / losses', f"{_comm_home['won']} / {_comm_home['lost']}", f"{_comm_home['saved']} saved · {_comm_home['expired']} expired", '', ''),
     ])
 
 # ==============================================================================

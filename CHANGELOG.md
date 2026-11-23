@@ -58,3 +58,11 @@ git push origin HEAD
 ```
 
 The GitHub commands intentionally stage only source files and documents, not `secrets.toml`, model binaries or your trade database.
+
+## 2026-11-23 — Commodity dashboard and market-hours scheduler
+- Replaced the commodity signals table with five responsive visual cards showing buy, target, stop, decision and reason.
+- Added separate commodity open count, realised and unrealised P/L, and win/loss summaries to the front page and commodity tab.
+- Added full historical ETC purchase and outcome table with CSV export.
+- Added conservative, trade-history-based commodity *paper stake reduction only* after sufficient evidence; no self-claimed AI forecasts.
+- Added market-open/entry-window state transition auto-refresh and lightweight browser-session heartbeat.
+- Added offline tests for history totals, visual card formatting, feedback and auto-refresh state transitions.
