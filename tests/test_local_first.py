@@ -114,7 +114,7 @@ def trade_env(position_cap=2500):
         return dict(ok=used<10000,cash_gbp=10000-used,equity_gbp=10000,risk_gbp=0,risk_budget_gbp=500,
                     invested_gbp=used,reason='paper balance used',open=n)
     ctx=functions('log_equity_signal_safely', st=st, london_now=lambda:datetime(2026,11,20,11),
-        is_valid_lse_ticker=lambda t:t.endswith('.L'), is_entry_window_open=lambda:True,
+        is_valid_lse_ticker=lambda t:t.endswith('.L'), is_commodity_etc=lambda t:False, is_entry_window_open=lambda:True,
         is_market_stress=lambda m:False, get_cross_asset_macro_regime=lambda:{},
         STORAGE_MODE='local',supabase=None,REQUIRE_DURABLE_CLOUD=False,
         _num=lambda v,default=0.0:float(v) if v is not None else default,_int=lambda v:int(float(v)),

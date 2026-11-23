@@ -1,3 +1,5 @@
+> **Superseded by the 23 November upgrade for this package:** [NOV23_UPDATE.md](NOV23_UPDATE.md). The original 20 November release notes below are retained for historical context. The updated package includes the corrected `feature_engine.py`, minute-exit and commodity modules; the current test total is **55**.
+
 # ALPHA-LSE final reviewed package — 20 November 2026
 
 **This is the latest complete `app.py` replacement, including previous changes.** It remains a **paper-trading research simulator**: it does not submit actual broker orders. The system estimates outcomes from public, potentially delayed market data; it is not proven to be profitable, and no one can guarantee ten years without maintenance.
