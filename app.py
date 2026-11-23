@@ -104,7 +104,7 @@ POSITION_SIZE_GBP = 500.0   # backward compatibility when reading old trades
 MIN_POSITION_SIZE_GBP = 1.0
 REQUIRE_DURABLE_CLOUD = (STORAGE_MODE == "cloud")  # cloud mode requires Supabase; local uses persistent DuckDB
 DATA_FRESHNESS_HOURS = 30               # non-trading-day data can be older; new entries still need today's bar
-APP_VERSION = "2026.11.23-commodity-paper-v2"
+APP_VERSION = "2026.11.23-commodity-cards-runtime-fix"
 
 def load_paper_settings() -> dict:
     """Persist virtual-account configuration independent of browser sessions."""
@@ -1675,7 +1675,7 @@ def option_ask_price(spot, strike, days, sigma, q):
 def option_bid_price(spot, strike, days, sigma, q):
     return max(round(calculate_black_scholes_call(spot, strike, days, 0.05, sigma, q) * (1.0 - OPTION_HALF_SPREAD_PCT / 100.0), 2), 0.01)
 
-def normalize_lse_history_prices(df: pd.DataFrame, currency: str) -> pd.DataFrame:
+def normalize_lse_history_prices(df: pd.DataFrame, currency: str, ticker: str = "unknown") -> pd.DataFrame:
     """Price convention inside this app: *all* .L OHLC are pence (GBp).
 
     Yahoo may supply 'GBp'/'GBX' in pence or 'GBP' in pounds. Missing/other
@@ -1688,7 +1688,7 @@ def normalize_lse_history_prices(df: pd.DataFrame, currency: str) -> pd.DataFram
     elif currency == "GBP":
         factor = 100.0
     else:
-        LOGGER.warning("Skipping LSE price feed with unknown/unexpected currency: %s", currency)
+        LOGGER.warning("Skipping LSE price feed for %s: unexpected currency %s", ticker, currency)
         return pd.DataFrame()
     required = ("Open", "High", "Low", "Close")
     if any(col not in df.columns for col in required):
@@ -1706,7 +1706,7 @@ def normalize_lse_history_prices(df: pd.DataFrame, currency: str) -> pd.DataFram
     valid &= result["Low"] <= result[["Open", "High", "Close"]].min(axis=1) + 1e-7
     rejected = int((~valid).sum())
     if rejected:
-        LOGGER.warning("Discarded %d invalid LSE price bars", rejected)
+        LOGGER.warning("Discarded %d invalid LSE price bars for %s", rejected, ticker)
     result = result.loc[valid].copy()
     result.attrs["quote_currency_original"] = currency
     result.attrs["price_currency"] = "GBp"
@@ -1728,7 +1728,7 @@ def _verified_history(ticker: str, period: str) -> pd.DataFrame:
             cur = stock.fast_info.get("currency")
         except Exception:
             pass
-    return normalize_lse_history_prices(df, cur)
+    return normalize_lse_history_prices(df, cur, ticker=ticker)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -1752,7 +1752,7 @@ def fetch_one_minute_lse_bars(ticker: str) -> pd.DataFrame:
             currency = stock.fast_info.get("currency")
         if not isinstance(bars.index, pd.DatetimeIndex) or bars.index.tz is None:
             return pd.DataFrame()
-        return normalize_lse_history_prices(bars, currency)
+        return normalize_lse_history_prices(bars, currency, ticker=ticker)
     except Exception as exc:
         LOGGER.info("One-minute price history unavailable for %s: %s", ticker, type(exc).__name__)
         return pd.DataFrame()
@@ -4519,8 +4519,17 @@ def commodity_idea(ticker: str, *, refresh: bool = False) -> dict:
         out['Decision'] = 'WAIT — trend/risk rules'
         return out
     if not is_today or not market_open_now or not is_entry_window_open():
-        out['Decision'] = 'WATCH — market/entry window closed'
-        out['Explanation'] = 'Trend criteria met; needs a current trading-day quote during UK buying hours'
+        out['Decision'] = 'WATCH — no new paper entry'
+        if not is_today:
+            out['Explanation'] = 'Trend rules passed, but the latest quote is not dated today. No entry on stale prices.'
+        elif not market_open_now:
+            out['Explanation'] = 'Trend rules passed, but the UK market is closed. Monitoring resumes when it reopens.'
+        else:
+            out['Explanation'] = (
+                f'Trend rules passed, but new paper purchases stop at '
+                f'{entry_window_end().strftime("%H:%M")} London time. '
+                'Existing trades continue to be monitored while the market is open.'
+            )
         return out
     if not (evaluation.stop_pence and evaluation.target_pence):
         return out
@@ -4651,7 +4660,16 @@ closed_all = load_closed_trades_df()
 with tab_commodity:
     sec_title('🪙', 'Gold, silver, oil & gas', 'five UK-listed sterling-quoted ETCs')
     st.caption('Rule-based paper research, NOT probabilities from the share AI. Prices below are pence per ETC unit, not gold/oil spot or USD futures. Quotes may be delayed.')
-    st.markdown("""<style>
+    _buy_end = entry_window_end().strftime('%H:%M')
+    if market_is_open and not is_entry_window_open():
+        st.info(f'UK market is open for monitoring, but new paper buying finished at {_buy_end} London time. Existing paper trades continue to be checked until the market closes.')
+    elif market_is_open:
+        st.caption(f'New paper entries: {ENTRY_WINDOW_START.strftime("%H:%M")}–{_buy_end} London time. Monitoring continues through market close.')
+    else:
+        st.caption('UK market closed: no new paper entries. Displayed prices may be from the last trading session.')
+    # Use Streamlit's dedicated, sanitized HTML renderer. Markdown can display
+    # nested <div> markup as literal text (the observed cm-why/cm-learning bug).
+    st.html("""<style>
     .cm-wrap{margin-bottom:14px}
     .commodity-card{border:1px solid var(--line);border-radius:17px;padding:20px;
         background:var(--secondary-background-color,rgba(128,128,128,.06));height:100%;
@@ -4669,7 +4687,7 @@ with tab_commodity:
     .cm-why{border-top:1px solid var(--line);padding-top:12px;font-size:.85rem;line-height:1.5}
     .cm-learning{opacity:.8;font-size:.75rem;line-height:1.4;margin-top:9px}
     @media(max-width:650px){.cm-price-grid{grid-template-columns:1fr}.cm-price-grid>div{padding:6px 8px}}
-    </style>""", unsafe_allow_html=True)
+    </style>""")
     _etc_summary = summarise_commodity_history(etc_df)
     score_cards([
         ('Open commodities', str(_etc_summary['open']), 'simulated positions currently open', '', ''),
@@ -4696,7 +4714,7 @@ with tab_commodity:
             cols = st.columns(2, gap='medium')
             for col,it in zip(cols,ideas[start:start+2]):
                 with col:
-                    st.markdown(commodity_signal_card_html(it), unsafe_allow_html=True)
+                    st.html(commodity_signal_card_html(it))
     else:
         st.warning('Commodity prices have not been checked successfully yet. Retry using the refresh control.')
     st.caption('WAIT levels are provisional and may change each refresh. OPEN trade entry and target are locked to the journal; an active stop can only be adjusted by the existing risk rule. Targets use 2.4× 14-day ATR and initial stops use 1.5× ATR. No guarantee of execution or future profit.')
