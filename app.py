@@ -20,7 +20,8 @@ from intraday_exit import first_intraday_exit
 from commodity_etps import COMMODITY_ETPS, FUTURES_REFERENCES, is_commodity_etc
 from commodity_signals import evaluate_commodity_signal, STRATEGY_NAME
 from commodity_dashboard import (commodity_signal_card_html, commodity_journal_view,
-                                 summarise_commodity_history, assess_commodity_history)
+                                 summarise_commodity_history, assess_commodity_history,
+                                 decorate_commodity_card)
 from auto_refresh_schedule import choose_auto_refresh
 from option_retirement import make_options_archive, retire_options
 
@@ -3969,22 +3970,45 @@ st.sidebar.number_input("Broker fee per trade (£)", min_value=0.0, max_value=25
                         help="Charged when you buy and again when you sell. Included in every profit/loss number you see. Many UK apps charge £0 — "
                              "set yours, because on a £500 trade a £3 fee each way costs 1.2%, which decides which picks are worth it.")
 broker_mode = "paper trade"      # everything here is pretend money
-# Automatic wake-up on a transition to open trading, even if the page was
-# opened before 08:00. A manual pause applies until the next session/window.
+# Auto-refresh must start ON when opening the app *during* UK trading hours.
+# Older versions could carry a False widget value into a fresh session. Only an
+# explicit click in the current session may pause it. A market/window opening
+# clears the pause; outside hours the setting is always OFF.
 _entry_window_active = is_entry_window_open()
+_prev_market_open = st.session_state.get("last_market_open_state")
+_prev_entry_window = st.session_state.get("last_entry_window_state")
+if _prev_market_open is False and market_is_open or (
+    _entry_window_active and _prev_entry_window is False
+):
+    st.session_state["auto_loop_manual_paused"] = False
 st.session_state["auto_loop_toggle"] = choose_auto_refresh(
     market_open=market_is_open,
     in_entry_window=_entry_window_active,
-    previous_market_open=st.session_state.get("last_market_open_state"),
-    previous_entry_window=st.session_state.get("last_entry_window_state"),
-    current_setting=st.session_state.get("auto_loop_toggle"))
+    previous_market_open=_prev_market_open,
+    previous_entry_window=_prev_entry_window,
+    current_setting=st.session_state.get("auto_loop_toggle"),
+    manually_paused=bool(st.session_state.get("auto_loop_manual_paused", False)),
+    session_initialized=bool(st.session_state.get("auto_refresh_initialized", False)))
+st.session_state["auto_refresh_initialized"] = True
 st.session_state["last_market_open_state"] = market_is_open
 st.session_state["last_entry_window_state"] = _entry_window_active
+
+def _on_auto_refresh_click():
+    # This callback runs only for an actual user toggle, not on routine reruns.
+    st.session_state["auto_loop_manual_paused"] = not bool(st.session_state["auto_loop_toggle"])
+
 auto_mode = st.sidebar.toggle(
-    "Auto-refresh", key="auto_loop_toggle",
-    help="Automatically switches ON when the UK market/trading window opens. You can pause it for the rest of the session; it automatically restarts at the next opening. Requires an active browser tab.")
-st.sidebar.caption("🟢 Automatic checks active during trading hours." if auto_mode else
-                   "⏰ Waiting for market opening (or paused for this session). A browser tab must stay open for automatic wake-up.")
+    "Auto-refresh", key="auto_loop_toggle", on_change=_on_auto_refresh_click,
+    disabled=not market_is_open,
+    help="Automatically ON for a newly opened session during UK trading hours. You can pause it until the next market/buy-window opening. Requires an active browser tab.")
+if not st_autorefresh:
+    st.sidebar.error("Automatic refresh is unavailable: install streamlit-autorefresh and restart the app.")
+elif auto_mode:
+    st.sidebar.caption("🟢 Auto-refresh ON — market is open; scheduled scans are active while this browser session stays connected.")
+elif market_is_open:
+    st.sidebar.caption("⏸️ Manually paused for this trading session. Switch ON to resume.")
+else:
+    st.sidebar.caption("⏰ Market closed. This tab checks periodically and will switch ON automatically at the next opening.")
 refresh_interval_sec = st.sidebar.selectbox("Check every", [300, 900, 3600], format_func=lambda x: f"{x//60} minutes",
                                             help="Open trades are checked every time. Prices for the whole market are re-downloaded at most every 15 minutes; finalists always get a fresh price.")
 
@@ -4454,6 +4478,7 @@ def commodity_idea(ticker: str, *, refresh: bool = False) -> dict:
     feedback = get_commodity_feedback(ticker)
     out = {"Ticker": ticker, "Commodity": item['underlying'], "Product": item['name'],
            "Decision": "WAIT", "Explanation": "Waiting for verified market data",
+           "Current (p)": None, "Quote date": None,
            "Buy (p)": None, "Sell target (p)": None, "Stop-loss (p)": None,
            "Units": 0, "Paper amount (£)": 0.0, "Trend checks": "—",
            "Potential net return (%)": None, "History note": feedback.note, "_order": None}
@@ -4473,6 +4498,11 @@ def commodity_idea(ticker: str, *, refresh: bool = False) -> dict:
     if not math.isfinite(price) or price <= 0:
         out['Explanation'] = 'Latest price is invalid'
         return out
+    # This is the latest *available* GBp daily-bar quote, not a guaranteed
+    # live exchange trade. Always display it separately from any saved paper
+    # entry, which must remain immutable after purchase.
+    out['Current (p)'] = round(price, 4)
+    out['Quote date'] = str(dates[-1])
     out['Buy (p)'] = round(price,4)
     if 'Stock Splits' in completed.columns and (pd.to_numeric(completed['Stock Splits'].tail(65), errors='coerce').fillna(0) != 0).any():
         out['Explanation'] = 'Recent split/corporate-action risk: no automatic entry'
@@ -4562,6 +4592,7 @@ def scan_commodity_ideas(*, auto_record: bool):
             ideas.append({"Ticker":ticker, "Commodity":COMMODITY_ETPS[ticker]['underlying'],
                           "Product":COMMODITY_ETPS[ticker]['name'],"Decision":"WAIT — data error",
                           "Explanation":"Scan unavailable; no trade recorded", "Buy (p)":None,
+                          "Current (p)":None,"Quote date":None,
                           "Sell target (p)":None,"Stop-loss (p)":None,"Units":0,
                           "Paper amount (£)":0.0,"Trend checks":"—","Potential net return (%)":None,
                           "History note":"No reliable signal available", "_order": None})
@@ -4630,7 +4661,7 @@ with tab_commodity:
     .cm-status{font-size:.77rem;font-weight:700;border:1px solid var(--line);border-radius:9px;
         padding:5px 9px;max-width:240px;text-align:right}
     .cm-status.ok{color:#16a34a}.cm-status.hold{color:#d97706}
-    .cm-price-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-bottom:14px}
+    .cm-price-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:14px}
     .cm-price-grid>div{border:1px solid var(--line);border-radius:10px;padding:12px 8px}
     .cm-price-grid small{font-size:.72rem;display:block;opacity:.75;margin-bottom:4px}
     .cm-price-grid b{font-size:1.08rem;font-variant-numeric:tabular-nums}
@@ -4652,10 +4683,14 @@ with tab_commodity:
             scan_commodity_ideas(auto_record=False)
     with right:
         st.caption('Automatic paper-buy follows the Settings toggle and UK trading hours. Clicking Check refreshes prices only.')
-    ideas = st.session_state.get('commodity_ideas', [])
+    # The trade journal is authoritative for an actual paper purchase.
+    # Never let a later signal overwrite its buy price, target or stop.
+    ideas = [decorate_commodity_card(it, etc_df)
+             for it in st.session_state.get('commodity_ideas', [])]
     if st.session_state.get('commodity_last_buys'):
         st.success('New commodity paper purchases: ' + ', '.join(st.session_state['commodity_last_buys']))
-    st.caption('Last checked: ' + str(st.session_state.get('commodity_scan_ts','not yet')))
+    st.caption('Last signal check: ' + str(st.session_state.get('commodity_scan_ts','not yet')) +
+               '. Market prices are the latest available quotes, not guaranteed real-time fills.')
     if ideas:
         for start in range(0,len(ideas),2):
             cols = st.columns(2, gap='medium')
@@ -4664,7 +4699,7 @@ with tab_commodity:
                     st.markdown(commodity_signal_card_html(it), unsafe_allow_html=True)
     else:
         st.warning('Commodity prices have not been checked successfully yet. Retry using the refresh control.')
-    st.caption('Targets use 2.4× 14-day ATR and stops use 1.5× ATR on completed daily bars. No guarantee of execution or future profit.')
+    st.caption('WAIT levels are provisional and may change each refresh. OPEN trade entry and target are locked to the journal; an active stop can only be adjusted by the existing risk rule. Targets use 2.4× 14-day ATR and initial stops use 1.5× ATR. No guarantee of execution or future profit.')
 
 # ==============================================================================
 # 13b. COMMODITY PERFORMANCE (separate from the share-trained AI)

@@ -135,21 +135,101 @@ def assess_commodity_history(df: pd.DataFrame, ticker: str) -> CommodityFeedback
     return CommodityFeedback(n, 1.0, f'{n} completed trades; normal paper risk limits retained (recent average {avg:+.1f}%)')
 
 
+def decorate_commodity_card(signal: dict, journal: pd.DataFrame) -> dict:
+    """Combine a fresh signal with *read-only* persisted trade details.
+
+    The live/last available quote always stays separate from historical buys.
+    In particular, WAIT signals are never treated as executed orders. A saved
+    open paper trade overrides recalculated levels, even if a current quote is
+    unavailable. Closed trades remain unchanged in the journal/history table.
+    """
+    item = dict(signal)
+    item.setdefault('Current (p)', item.get('Buy (p)'))
+    item['Display mode'] = 'WAIT'
+    item['Quote source'] = 'Latest available LSE market-data daily bar; may be delayed'
+    decision = str(item.get('Decision') or '').upper()
+    if 'BUY CANDIDATE' in decision or 'PAPER BOUGHT' in decision:
+        item['Display mode'] = 'CANDIDATE'
+    if journal is None or journal.empty or not {'ticker','status'}.issubset(journal.columns):
+        return item
+    matches = journal[journal['ticker'].astype(str) == str(item.get('Ticker') or '')]
+    active = matches[matches['status'].map(lambda v: _kind(v) == 'OPEN')]
+    if not active.empty:
+        # Prefer the latest open entry; under normal safeguards there is one.
+        if 'timestamp' in active.columns:
+            active = active.sort_values('timestamp', ascending=False, kind='stable')
+        rec = active.iloc[0].to_dict()
+        item['Display mode'] = 'OPEN'
+        item['Decision'] = 'PAPER OPEN — monitoring'
+        item['Buy (p)'] = _number(rec.get('entry_price'), float('nan'))
+        item['Sell target (p)'] = _number(rec.get('target_price'), float('nan'))
+        item['Stop-loss (p)'] = _number(rec.get('stop_loss'), float('nan'))
+        item['Units'] = int(_number(rec.get('shares')))
+        item['Paper amount (£)'] = _number(rec.get('capital_allocated'))
+        item['Recorded price (p)'] = _number(rec.get('latest_price'), float('nan'))
+        item['Paper P/L (%)'] = _number(rec.get('pnl_pct'))
+        item['Paper P/L (£)'] = round(item['Paper amount (£)'] * item['Paper P/L (%)']/100.0, 2)
+        item['Paper last audited'] = str(rec.get('last_audited') or 'Unknown')
+        item['Paper bought on'] = str(rec.get('timestamp') or rec.get('date_str') or 'Unknown')
+        item['Explanation'] = 'Simulated purchase already recorded. Original entry and target stay fixed; active stop only changes through the configured protection rule.'
+        return item
+    # Historical closes do not freeze a new WAIT signal: instead preserve the
+    # last deal summary separately, while all original levels remain in history.
+    closed = matches[matches['status'].map(lambda v: _kind(v) in ('WON','LOST','SAVED','EXPIRED'))]
+    if not closed.empty:
+        if 'exit_timestamp' in closed.columns:
+            closed = closed.sort_values('exit_timestamp', ascending=False, kind='stable')
+        rec = closed.iloc[0].to_dict()
+        label = {'WON':'Won','LOST':'Lost','SAVED':'Protected','EXPIRED':'Expired'}[_kind(rec.get('status'))]
+        item['Last finished trade'] = (f"{label}: bought {_number(rec.get('entry_price')):,.2f}p, "
+                                      f"exited {_number(rec.get('exit_price')):,.2f}p, "
+                                      f"paper P/L {_number(rec.get('pnl_pct')):+.2f}%")
+    return item
+
+
 def commodity_signal_card_html(item: dict) -> str:
-    """Escaped accessible text cards; display only, no buttons or network calls."""
+    """Accessible, escaped display: latest quote ≠ suggested entry ≠ actual purchase."""
     e = lambda val: html.escape(str(val), quote=True)
     def fmt_price(v):
         x = _number(v, float('nan'))
-        return f'{x:,.4f}p' if math.isfinite(x) and 0 < abs(x) < 1 else (f'{x:,.2f}p' if math.isfinite(x) else '—')
+        return (f'{x:,.4f}p' if math.isfinite(x) and 0 < abs(x) < 1
+                else f'{x:,.2f}p' if math.isfinite(x) and x > 0 else '—')
+    def fmt_pl(v):
+        x = _number(v, float('nan'))
+        return f'{x:+,.2f}' if math.isfinite(x) else '—'
     decision = str(item.get('Decision') or 'WAIT')
-    tone = 'ok' if 'BOUGHT' in decision or 'CANDIDATE' in decision else 'hold'
+    mode = str(item.get('Display mode') or 'WAIT').upper()
+    tone = 'ok' if mode == 'OPEN' or mode == 'CANDIDATE' else 'hold'
     explanation = str(item.get('Explanation') or 'No explanation available')
+    if mode == 'OPEN':
+        entry_label, target_label, stop_label = 'Buy at (recorded)', 'Sell target (locked)', 'Stop-loss (active)'
+    elif mode == 'CANDIDATE':
+        entry_label, target_label, stop_label = 'Buy at (suggested)', 'Sell target (proposed)', 'Stop-loss (proposed)'
+    else:
+        entry_label, target_label, stop_label = 'Buy at (provisional)', 'Sell target (indicative)', 'Stop-loss (indicative)'
+    quote = item.get('Current (p)', item.get('Buy (p)'))
+    quote_date = str(item.get('Quote date') or 'date unavailable')
+    quote_note = f'Latest available market quote · bar dated {quote_date} · may be delayed'
+    trade_details = ''
+    if mode == 'OPEN':
+        trade_details = (f'<div class="cm-why"><b>Recorded paper trade:</b> '
+                         f'bought {e(item.get("Paper bought on") or "Unknown")} · '
+                         f'last audited {e(item.get("Paper last audited") or "Unknown")} · '
+                         f'paper P/L <b>{e(fmt_pl(item.get("Paper P/L (%)")))}%</b> '
+                         f'(£{e(fmt_pl(item.get("Paper P/L (£)")))}) · '
+                         f'journal mark {e(fmt_price(item.get("Recorded price (p)")))}</div>')
+    elif item.get('Last finished trade'):
+        trade_details = f'<div class="cm-learning">Last closed trade: {e(item["Last finished trade"])}. Full original details remain in the history table.</div>'
     return f'''<div class="commodity-card" role="group" aria-label="{e(item.get('Commodity','Commodity'))}">
-      <div class="cm-top"><div><div class="cm-name">{e(item.get('Commodity','Commodity'))}</div><div class="cm-symbol">{e(item.get('Ticker',''))} · sterling-listed ETC</div></div><div class="cm-status {tone}">{e(decision)}</div></div>
-      <div class="cm-price-grid"><div><small>Buy at</small><b>{e(fmt_price(item.get('Buy (p)')))}</b></div>
-      <div><small>Sell target</small><b>{e(fmt_price(item.get('Sell target (p)')))}</b></div>
-      <div><small>Stop-loss</small><b>{e(fmt_price(item.get('Stop-loss (p)')))}</b></div></div>
+      <div class="cm-top"><div><div class="cm-name">{e(item.get('Commodity','Commodity'))}</div><div class="cm-symbol">{e(item.get('Ticker',''))} · UK-listed ETC</div></div><div class="cm-status {tone}">{e(decision)}</div></div>
+      <div class="cm-price-grid">
+      <div><small>Latest available price</small><b>{e(fmt_price(quote))}</b></div>
+      <div><small>{e(entry_label)}</small><b>{e(fmt_price(item.get('Buy (p)')))}</b></div>
+      <div><small>{e(target_label)}</small><b>{e(fmt_price(item.get('Sell target (p)')))}</b></div>
+      <div><small>{e(stop_label)}</small><b>{e(fmt_price(item.get('Stop-loss (p)')))}</b></div></div>
+      <div class="cm-learning">{e(quote_note)}</div>
       <div class="cm-details"><span>Trend: <b>{e(item.get('Trend checks','—'))}</b></span><span>Quantity: <b>{int(_number(item.get('Units'))):,}</b></span><span>Paper spend: <b>£{_number(item.get('Paper amount (£)')):,.2f}</b></span></div>
+      {trade_details}
       <div class="cm-why"><b>Why:</b> {e(explanation)}</div>
-      <div class="cm-learning">History: {e(item.get('History note') or 'No completed commodity trades yet')}</div>
+      <div class="cm-learning">History/risk feedback: {e(item.get('History note') or 'No completed commodity trades yet')}</div>
       </div>'''
