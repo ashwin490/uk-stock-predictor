@@ -1,3 +1,5 @@
+> **Historical release notes only:** the newest changes (commodity Buy/Sell/Stop and legacy options deletion) are documented in [COMMODITIES_AND_OPTIONS.md](COMMODITIES_AND_OPTIONS.md).
+
 > **Superseded by the 23 November upgrade for this package:** [NOV23_UPDATE.md](NOV23_UPDATE.md). The original 20 November release notes below are retained for historical context. The updated package includes the corrected `feature_engine.py`, minute-exit and commodity modules; the current test total is **55**.
 
 # ALPHA-LSE final reviewed package — 20 November 2026

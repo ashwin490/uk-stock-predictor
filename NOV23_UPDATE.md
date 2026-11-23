@@ -1,3 +1,5 @@
+> **Historical change record; superseded by [COMMODITIES_AND_OPTIONS.md](COMMODITIES_AND_OPTIONS.md).** The new version retires the US options tab and enables separate rule-based commodity paper-trading signals.
+
 # ALPHA-LSE — 23 November 2026 (paper-trading research upgrade)
 
 ## Scope

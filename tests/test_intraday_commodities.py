@@ -80,11 +80,21 @@ def test_old_cloud_rows_not_given_fabricated_purchase_timestamp():
     assert 'entry_timestamp_london=now_str' in s
 
 
-def test_no_auto_new_calls_as_default():
+def test_old_us_options_engine_is_retired_and_new_commodity_tab_replaces_it():
     s=(ROOT/'app.py').read_text(encoding='utf-8')
-    assert 'key="allow_new_call_ideas"' in s
-    assert 'if not st.session_state.get("allow_new_call_ideas", False):' in s
-    assert 'recent = real_d[' in s
+    assert 'tab_home, tab_perf, tab_learn, tab_commodity' in s
+    assert 'tab_options' not in s
+    assert 'allow_new_call_ideas' not in s
+    assert 'opt_data = []' in s
+    assert 'active_opts = pd.DataFrame()' in s
+    assert 'from commodity_signals import evaluate_commodity_signal' in s
+
+
+def test_commodity_prices_show_buy_target_stop_and_automatic_recording():
+    s=(ROOT/'app.py').read_text(encoding='utf-8')
+    assert '"Buy at"' in s and '"Sell target"' in s and '"Stop-loss"' in s
+    assert "log_equity_signal_safely(idea['_order']" in s
+    assert 'Automatically paper-buy qualifying commodity ETCs' in s
 
 
 def test_paper_etc_requires_explicit_authorisation():
@@ -100,12 +110,13 @@ def test_paper_etc_requires_explicit_authorisation():
     assert db.conn.execute("select asset_type from trade_journal").fetchone()[0]=='ETC'
 
 
-def test_main_option_summary_does_not_count_old_synthetic_gains():
-    source=(ROOT/'app.py').read_text(encoding='utf-8')
-    assert 'if perf_real_opt["n"]:' in source
-    assert "perf_real_opt['net_gbp']" in source
-    assert "if perf_opt[\"n\"]:" not in source
-    assert 'Older practice-price ideas' in source
+def test_legacy_options_excluded_from_share_and_etc_results():
+    s=(ROOT/'app.py').read_text(encoding='utf-8')
+    assert "share_df = df_eq[df_eq['asset_type'].fillna('EQUITY') != 'ETC']" in s
+    assert "etc_df = df_eq[df_eq['asset_type'] == 'ETC']" in s
+    assert "AND (asset_type IS NULL OR asset_type = 'EQUITY')" in s
+    assert "def scan_commodity_ideas(" in s
+    assert "with tab_commodity:" in s
 
 
 def test_entry_day_fallback_uses_original_stop_not_later_raised_stop():

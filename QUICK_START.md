@@ -1,8 +1,10 @@
-> **IMPORTANT: 23 NOVEMBER 2026 RELEASE** — The complete replacement includes `app.py`, `feature_engine.py`, `intraday_exit.py`, `commodity_etps.py` and `requirements.txt`. **Copy all five files together.** Back up your trade history, model and secrets first. Existing `rns_scraper.py` and model files remain untouched. No new learning picks. New call ideas OFF by default. See [NOV23_UPDATE.md](NOV23_UPDATE.md).
+> **LATEST: 23 NOVEMBER commodities upgrade** — You must also copy `commodity_signals.py` and `option_retirement.py` (not only `app.py`). The US options tab is retired; commodity price/target/stop predictions replace it. See [COMMODITIES_AND_OPTIONS.md](COMMODITIES_AND_OPTIONS.md).
+
+> **IMPORTANT: 23 NOVEMBER 2026 RELEASE** — The complete replacement includes `app.py`, `feature_engine.py`, `intraday_exit.py`, `commodity_etps.py` and `requirements.txt`. **Copy the complete project, including the two additional commodity modules.** Back up your trade history, model and secrets first. Existing `rns_scraper.py` and model files remain untouched. No new learning picks. US call-option engine now removed. See [NOV23_UPDATE.md](NOV23_UPDATE.md).
 
 > **Final reviewed package:** See [FINAL_RELEASE_NOTES.md](FINAL_RELEASE_NOTES.md) for the replacement steps, password compatibility, and validation limits.
 
-> **New reliability build:** replace `app.py` only after backing up your trade database and model. Review [CHANGELOG.md](CHANGELOG.md); 55 offline tests passed.
+> **New reliability build:** replace `app.py` only after backing up your trade database and model. Review [CHANGELOG.md](CHANGELOG.md); See COMMODITIES_AND_OPTIONS.md for current test results.
 
 # ALPHA-LSE — November 2026 update
 
