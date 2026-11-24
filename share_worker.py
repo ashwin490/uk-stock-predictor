@@ -234,7 +234,7 @@ def scorecard(bucket,today,champion_version=None):
 
 
 def health(bucket,mode:str,ok:bool,today,details=None):
-    old=read_json(bucket,HEALTH,{})
+    old=read_json(bucket,HEALTH,{},fresh=True)
     old.update({'schema':1,'last_mode':mode,'last_run_utc':datetime.now(timezone.utc).isoformat(),
                 'last_status':'ok' if ok else 'failed','last_detail':details or {}})
     if mode=='daily' and ok:

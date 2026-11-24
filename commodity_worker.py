@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import os
+import secrets
 import time as sleep_time
 from zoneinfo import ZoneInfo
 
@@ -122,7 +123,50 @@ def not_found(exc) -> bool:
     return status == '404' or code in ('404','not_found','no_such_key') or 'not found' in s or 'does not exist' in s
 
 
-def read_json(bucket, key, default=None):
+def _fresh_private_json(key):
+    """Uncached, authenticated private Storage GET for worker read/write checks.
+
+    Supabase Storage may temporarily serve old bytes after an overwrite.  The
+    nonce makes each read a distinct cache key without exposing service keys in
+    a URL.  This is only used in the trusted server-side worker environment.
+    """
+    from urllib.parse import quote
+    import requests
+
+    root = os.environ['SUPABASE_URL'].strip().split('/rest/v1')[0].rstrip('/')
+    token = os.environ['SUPABASE_MODEL_SERVICE_KEY'].strip()
+    bucket = os.environ.get('ALPHA_COMMODITY_ML_BUCKET', 'alpha-lse-models').strip()
+    if not (root.startswith('https://') and token and bucket):
+        raise RuntimeError('Fresh cloud read configuration is invalid')
+    path = f'{quote(bucket, safe="")}/{quote(key, safe="/")}'
+    try:
+        r = requests.get(
+            root + '/storage/v1/object/authenticated/' + path,
+            headers={'apikey': token, 'Authorization': 'Bearer ' + token,
+                     'Cache-Control': 'no-cache'},
+            params={'cacheNonce': secrets.token_hex(12)}, timeout=20)
+    except requests.RequestException as exc:
+        raise RuntimeError('Fresh cloud read failed for ' + key) from exc
+    if r.status_code == 404:
+        return None
+    if r.status_code == 400 and ('not found' in r.text.lower() or 'does not exist' in r.text.lower()):
+        return None
+    if r.status_code != 200:
+        # No response body or HTTP headers: avoid accidentally logging secrets.
+        raise RuntimeError(f'Fresh cloud read failed for {key} (HTTP {r.status_code})')
+    if len(r.content) > MAX_BYTES:
+        raise RuntimeError('Oversized cloud record: ' + key)
+    try:
+        return json.loads(r.content.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError('Invalid JSON in cloud record: ' + key) from exc
+
+
+def read_json(bucket, key, default=None, *, fresh=False):
+    if (fresh and os.environ.get('SUPABASE_URL', '').startswith('https://')
+            and os.environ.get('SUPABASE_MODEL_SERVICE_KEY', '').strip()):
+        result = _fresh_private_json(key)
+        return default if result is None else result
     try:
         raw = bytes(bucket.download(key))
     except Exception as exc:
@@ -136,27 +180,40 @@ def read_json(bucket, key, default=None):
 
 def save_json(bucket, key, value, *, immutable=False):
     payload = json_bytes(value)
-    old = read_json(bucket, key)
+    # Read mutable object state from origin rather than a cached older version.
+    old = read_json(bucket, key, fresh=True)
     if immutable and old is not None:
         if json_bytes(old) != payload:
             raise RuntimeError('Immutable forecast cannot be overwritten: ' + key)
         return False
     if old is not None and json_bytes(old) == payload:
         return False
-    options = {'content-type': 'application/json'}
+    options = {'content-type': 'application/json', 'cache-control': '0'}
+    write_exc = None
     try:
         if old is None:
             bucket.upload(key, payload, file_options=options)
         else:
             bucket.update(key, payload, file_options=options)
     except Exception as exc:
-        # Upsert race: only accept exact content readback, never assume success.
-        check = read_json(bucket, key)
-        if check is None or json_bytes(check) != payload:
-            raise RuntimeError('Cloud write not verified: ' + key) from exc
-    if json_bytes(read_json(bucket, key)) != payload:
-        raise RuntimeError('Cloud readback mismatch: ' + key)
-    return True
+        # Upsert races must still be checked, not silently treated as success.
+        write_exc = exc
+    # CDN invalidation may lag successful PUT, so use uncached requests and
+    # bounded retries.  Never report success if the expected bytes don't appear.
+    for attempt in range(6):
+        try:
+            check = read_json(bucket, key, fresh=True)
+        except RuntimeError:
+            if attempt == 5:
+                raise
+            check = None
+        if check is not None and json_bytes(check) == payload:
+            return True
+        if attempt < 5:
+            sleep_time.sleep(min(0.5 * (2 ** attempt), 4.0))
+    if write_exc:
+        raise RuntimeError('Cloud write not verified: ' + key) from write_exc
+    raise RuntimeError('Cloud readback mismatch after retries: ' + key)
 
 
 def connection_from_env():
@@ -311,7 +368,7 @@ def alert(message):
 
 
 def save_health(bucket, mode, success, today, *, detail=None):
-    previous = read_json(bucket, HEALTH_KEY, default={'schema': 1})
+    previous = read_json(bucket, HEALTH_KEY, default={'schema': 1}, fresh=True)
     out = dict(previous)
     out['schema'] = 1
     out['last_'+mode+'_utc'] = datetime.now(timezone.utc).isoformat()
