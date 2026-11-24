@@ -1,0 +1,52 @@
+name: ALPHA-LSE autonomous UK share intelligence
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Worker task'
+        type: choice
+        required: true
+        default: check
+        options: [check, daily, audit, monitor]
+  schedule:
+    # Scheduled times are UTC; share_worker checks actual XLON close.
+    - cron: '7 19 * * 1-5'
+    - cron: '47 20 * * 1-5'
+    - cron: '23 12 * * 1-5'
+    - cron: '31 19 * * 0'
+concurrency:
+  group: alpha-lse-share-research-writer
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  share-intelligence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_MODEL_SERVICE_KEY: ${{ secrets.SUPABASE_MODEL_SERVICE_KEY }}
+      ALPHA_COMMODITY_ML_BUCKET: ${{ vars.ALPHA_COMMODITY_ML_BUCKET || 'alpha-lse-models' }}
+      ALPHA_SHARE_MAX_SYMBOLS: ${{ vars.ALPHA_SHARE_MAX_SYMBOLS || '120' }}
+      ALPHA_REFRESH_UNIVERSE: '1'
+      ALPHA_ALERT_WEBHOOK_URL: ${{ secrets.ALPHA_ALERT_WEBHOOK_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install worker dependencies
+        run: python -m pip install -r requirements-worker.txt
+      - name: UK share daily forecast and five-session verification
+        if: github.event_name == 'schedule' && (github.event.schedule == '7 19 * * 1-5' || github.event.schedule == '47 20 * * 1-5')
+        run: python share_worker.py --mode daily
+      - name: Health monitor
+        if: github.event_name == 'schedule' && github.event.schedule == '23 12 * * 1-5'
+        run: python share_worker.py --mode monitor
+      - name: Independent paper-journal accounting audit
+        if: github.event_name == 'schedule' && github.event.schedule == '31 19 * * 0'
+        run: python share_worker.py --mode audit
+      - name: Manual action
+        if: github.event_name == 'workflow_dispatch'
+        run: python share_worker.py --mode '${{ inputs.mode }}'

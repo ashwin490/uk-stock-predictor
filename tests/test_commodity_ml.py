@@ -186,7 +186,7 @@ def test_card_output_shows_explicit_five_day_forecast_not_trade_win():
                                     'ML forecast (%)':63.2, 'ML threshold (%)':58.0,
                                     'ML status':'historically tested', 'Current (p)':4500})
     assert '63.2%' in html and '58.0%' in html
-    assert 'before costs' in html and 'Not a target-hit / trade-win probability' in html
+    assert 'before costs' in html and '5-session ETC gain' in html
 
 
 def test_source_integration_never_reuses_stock_ml_or_overrides_securities():
@@ -246,8 +246,8 @@ def test_research_card_is_explicitly_unvalidated_and_not_trade_win():
                                     'ML research threshold (%)':57.0,
                                     'ML research bar date':'2026-11-23','Current (p)':4500})
     assert '47.8%' in html and '57.0%' in html and '2026-11-23' in html
-    assert 'EXPERIMENTAL ML' in html and 'Candidate failed historical validation' in html
-    assert 'cannot approve a paper buy' in html and 'Not a trade-win probability' in html
+    assert 'Commodity ML · Preview' in html and 'Model: unvalidated' in html
+    assert 'Does not authorise entries' in html and 'five sessions' in html
 
 
 def test_research_only_model_never_assigned_to_trade_filter():

@@ -3239,6 +3239,77 @@ def breakeven_win_pct(entry: float, target: float, stop: float, friction_pct: fl
 def is_learning_trade(f_json) -> bool:
     return bool(_parse_features(f_json).get("learning_pick"))
 
+@st.cache_data(ttl=900, show_spinner=False)
+def load_share_worker_status() -> dict:
+    """Read the independent validated price-event model and forward results.
+
+    Never download an untrusted joblib or treat this model's five-session
+    event as the original share predictor's target/stop win probability.
+    """
+    result={'health':{}, 'forecast':{}, 'score':{},'state':{},'audit':{},'available':False}
+    if STORAGE_MODE!='cloud' or create_client is None:
+        return result
+    try:
+        uri=st.secrets.get('SUPABASE_URL','')
+        key=st.secrets.get('SUPABASE_MODEL_SERVICE_KEY','')
+        bucket_name=st.secrets.get('ALPHA_COMMODITY_ML_BUCKET','alpha-lse-models')
+        if not (uri and key and bucket_name):
+            return result
+        client=create_client(str(uri).strip().split('/rest/v1')[0].rstrip('/'),str(key).strip())
+        bucket=client.storage.from_(str(bucket_name))
+        for field,path in (
+            ('health','research/shares/worker_health_v1.json'),
+            ('forecast','research/shares/latest_forecasts_v1.json'),
+            ('score','research/shares/scorecard_v1.json'),
+            ('state','research/shares/model_state_v1.json'),
+            ('audit','research/shares/accounting_audit_v1.json')):
+            result[field]=read_worker_json(bucket,path,default={}) or {}
+        result['available']=True
+    except Exception as err:
+        result['unavailable']=type(err).__name__
+    return result
+
+
+def independent_share_ml_filter(ticker: str):
+    """Optional negative-only gate, never a new reason to authorise a trade.
+
+    Requires >=100 genuine forward outcomes, a good baseline comparison,
+    recent worker proof, matching champion and a fresh ticker forecast.
+    No verdict means original safeguards are unchanged.
+    """
+    record=load_share_worker_status()
+    state=record.get('state') or {}
+    champ=state.get('champion') or {}
+    sc=record.get('score') or {}
+    health=record.get('health') or {}
+    if not (record.get('available') and champ and not state.get('champion_paused')
+            and sc.get('forward_filter_eligible') and
+            sc.get('matured',0)>=100 and
+            sc.get('brier',1)+.01<sc.get('baseline_brier',0)):
+        return None
+    try:
+        worker_day=datetime.fromisoformat(health['last_daily_utc']).astimezone(pytz.UTC)
+        if not (0 <= (datetime.now(pytz.UTC)-worker_day).total_seconds() <= 120*3600):
+            return None
+    except (ValueError,TypeError,KeyError):
+        return None
+    forecasts=(record.get('forecast') or {}).get('forecasts') or []
+    for f in forecasts:
+        if (str(f.get('ticker','')).upper()==str(ticker).upper()
+                and f.get('model_version')==champ.get('version')
+                and f.get('validated') is True):
+            try:
+                day=datetime.strptime(f['date'],'%Y-%m-%d').date()
+                if not (0 <= (london_now().date()-day).days <=5):
+                    return None
+                return {'allowed':float(f['probability'])>=float(f['threshold']),
+                        'probability':float(f['probability']),
+                        'version':champ['version'],'forecast_day':f['date']}
+            except (KeyError,TypeError,ValueError):
+                return None
+    return None
+
+
 def run_predictions():
     """Looks at EVERY FTSE 350 share plus liquid AIM shares:
        1) download prices for all of them (in parallel; quiet shares are re-checked less often),
@@ -3484,6 +3555,24 @@ def run_predictions():
         st.session_state["scan_stats"] = stats
         return pd.DataFrame(), False
 
+    # Independent share ML can only VETO an already-qualified paper idea
+    # after 100 genuinely forward-scored forecasts beat their baseline.
+    # It cannot independently create paper orders or reprice any old deal.
+    external_vetoed=0
+    for sig in results:
+        if not sig.get('Qualified'):
+            continue
+        independent=independent_share_ml_filter(sig['Ticker'])
+        if independent is None:
+            continue
+        sig['FeaturesDict']['share_research_ml_version']=independent['version']
+        sig['FeaturesDict']['share_research_ml_probability']=round(independent['probability'],6)
+        sig['FeaturesDict']['share_research_ml_forecast_date']=independent['forecast_day']
+        if not independent['allowed']:
+            sig['Qualified']=False
+            sig['Rejection Reason']='Independent forward-validated share risk filter: below entry threshold'
+            external_vetoed+=1
+    stats['share_ml_vetoed']=external_vetoed
     df_out = pd.DataFrame(results).sort_values(by=["Qualified", "Expected value", "Adjusted Score"], ascending=[False, False, False]).reset_index(drop=True)
     qualified_only = df_out[df_out["Qualified"] == True].copy().reset_index(drop=True)
     stats["qualified"] = int(len(qualified_only))
@@ -4053,8 +4142,7 @@ st.sidebar.toggle(
     help="When an independently tested commodity model is available, require its 5-session gain forecast "
          "to exceed a guarded threshold in addition to all existing rules. Until a model passes validation, "
          "the earlier rule-only strategy remains active (clearly marked).")
-st.sidebar.caption("ML predicts a 5-session price move over +1.5% BEFORE costs, not a trade win probability. "
-                   "Only historical evidence can trigger a model upgrade; neither ML nor paper trading guarantees profits.")
+st.sidebar.caption("Commodity forecast horizon: 5 sessions · +1.5% price-event threshold · Model validation enforced.")
 
 with st.sidebar.expander("🛡️ Built-in safety rules"):
     st.markdown(
@@ -4248,11 +4336,12 @@ pulse_chip = (f'<span class="chip {"up" if (_ps.get("breadth_pct") or 0) >= 50 e
               if _ps.get("scanned") else "")
 st.markdown(_collapse(f"""
 <div class="hero">
-  <h1>⚡ ALPHA-LSE · Simple Investing Lab</h1>
-  <div class="sub">An AI that picks UK shares and practises trading them with pretend money — so you can see if it really works.</div>
+  <h1>⚡ ALPHA-LSE · Market Intelligence</h1>
+  <div class="sub">UK Shares · Commodity Markets · Forecast Performance · Automated Research</div>
   <div class="chips">
+    <span class="chip">◉ PAPER ACCOUNT</span>
     {mkt_chip}
-    <span class="chip up">{'💻 Saved on this laptop' if STORAGE_MODE == 'local' else ('☁️ Cloud synced' if supabase else '⚠️ Cloud unavailable')}</span>
+    <span class="chip up">{'💻 Saved on this laptop' if STORAGE_MODE == 'local' else ('☁️ Cloud configured' if supabase else '⚠️ Cloud unavailable')}</span>
     {macro_chip('UK market this week', macro_bar['ftse_5d'])}{macro_chip('Oil', macro_bar['brent_5d'])}{macro_chip('Copper', macro_bar['copper_5d'])}{macro_chip('£ vs $', macro_bar['gbpusd_5d'])}
     {stress_chip}{feed_chip}{pulse_chip}
     <span class="chip">Last checked {esc(st.session_state.get('last_audit_str', '-'))}</span>
@@ -4931,8 +5020,7 @@ closed_all = load_closed_trades_df()
 
 with tab_commodity:
     sec_title('🪙', 'Gold, silver, oil & gas', 'five UK-listed sterling-quoted ETCs')
-    st.caption('Independent commodity ML may filter the existing five trend rules once a model beats its historical baseline. '
-               'It is NOT the share AI and does NOT estimate actual trade wins. Prices are pence per ETC unit; data may be delayed.')
+    st.caption('End-of-day price-event ML + trend signals · Pence per ETC unit · Quotes may be delayed')
     _buy_end = entry_window_end().strftime('%H:%M')
     if market_is_open and not is_entry_window_open():
         st.info(f'UK market is open for monitoring, but new paper buying finished at {_buy_end} London time. Existing paper trades continue to be checked until the market closes.')
@@ -5018,13 +5106,11 @@ with tab_commodity:
         st.caption(f"Latest independent historical test: {_ml_report['test_count']} labelled examples "
                    f"across {_ml_report.get('test_days','?')} dates from {_ml_report.get('test_from','?')}; "
                    f"candidate Brier {score.get('brier',0):.3f} vs constant baseline {baseline.get('brier',0):.3f}. "
-                   'Lower is better. Historical results do not guarantee live accuracy.')
+                   'Lower Brier is better.')
     _research_evidence = _ml_report.get('research_evidence') or {}
     if _research_evidence.get('by_product'):
-        st.markdown('**Historical ML test predictions — research only**')
-        st.caption('These probabilities were calculated on later historical dates that were excluded from model training. '
-                   'A predicted rise means the rejected candidate crossed its experimental cutoff; '
-                   'it does NOT mean it was a profitable paper trade.')
+        st.markdown('**Historical ML validation**')
+        st.caption('Out-of-sample forecast history · The current challenger has not passed promotion criteria.')
         _historic = pd.DataFrame(_research_evidence['by_product']).rename(columns={
             'ticker':'ETC', 'tested':'Tested days', 'predicted_rises':'Predicted rises',
             'correct_rises':'Predicted rises that occurred', 'actual_rises':'Actual rises',
@@ -5039,8 +5125,7 @@ with tab_commodity:
                 'actual_five_session_pct':'Actual 5-session change (%)',
                 'event_happened':'Rise over 1.5% occurred'})
             st.dataframe(_samples, width='stretch', hide_index=True)
-            st.caption('This is an illustrative held-out sample from the most recent historical test, '
-                       'not a complete trading backtest; costs and intraday stop/targets are excluded.')
+            st.caption('Historical price-event outcomes; execution costs are recorded separately in the portfolio journal.')
     _worker = _load_worker_research()
     if _worker.get('enabled'):
         st.markdown('**Independent background research — Supabase / GitHub Actions**')
@@ -5075,7 +5160,7 @@ with tab_commodity:
                     'signal_precision_pct':'Signal precision (%)', 'actual_rises':'Actual rises',
                     'brier':'ML Brier', 'baseline_brier':'Baseline Brier'}),
                     width='stretch', hide_index=True)
-                st.caption('These are recorded research forecasts; predicted price events are not paper-trade profits.')
+                st.caption('Forward five-session price-event forecasts, separate from the paper portfolio.')
         _market_snapshot = _worker.get('market') or {}
         if _market_snapshot.get('signals'):
             with st.expander('See last independent commodity price scan'):
@@ -5089,17 +5174,13 @@ with tab_commodity:
                     'date':'Forecast date', 'ticker':'ETC', 'probability':'P(rise >1.5%)',
                     'validated':'Validated model', 'model_version':'Model version'}),
                     width='stretch', hide_index=True)
-        st.caption('Background worker only collects research data and validates models. '
-                   'New paper orders and intraday exits still require the live Streamlit app.')
+        st.caption('Independent price research runs on schedule; paper-order monitoring requires an active trading session.')
     if STORAGE_MODE == 'cloud' and not _ml_champion:
         if _ml_state.get('last_attempt_day'):
-            st.caption('Cloud model-state history exists. No validated champion has passed promotion yet; '
-                       'the rejected research forecasts cannot authorise ML-filtered purchases.')
+            st.caption('Model state stored · Champion awaiting promotion · Forecasts displayed in Preview mode')
         else:
             st.caption('Cloud model-state access has not been verified. Check the private Supabase bucket and server-side model key.')
-    st.caption('ML predicts whether an ETC closes >1.5% higher after five sessions, BEFORE costs; '
-               'it does not predict an actual stop/target WIN. Trend, market hours, transaction costs '
-               'and portfolio risks still govern every paper order.')
+    st.caption('Forecast horizon: five sessions · Threshold: +1.5% · P/L shown separately')
     sec_title('📒', 'Every commodity paper trade', 'original purchases, current holdings and closed results')
     if not etc_df.empty:
         journal = commodity_journal_view(etc_df)
@@ -5144,7 +5225,7 @@ with tab_perf:
         sec_title("📈", "Scoreboard")
         score_cards([
             ("Share profit/loss", "£0.00", "no finished share trades yet", "", ""),
-            ("Win rate", "–", "needs finished share trades", "", ""),
+            ("Target-hit rate", "–", "needs finished share trades", "", ""),
             ("Finished share trades", "0", "come back soon", "", ""),
             ("Open right now", str(n_open_all), f"{open_split_text()} · {gbp(open_unreal_all, sign=True)} so far", "good" if open_unreal_all > 0 else ("bad" if open_unreal_all < 0 else ""), ""),
         ])
@@ -5156,7 +5237,7 @@ with tab_perf:
         sec_title("📈", "Scoreboard", "finished share trades, after fees & tax")
         score_cards([
             ("Share profit/loss", gbp(net, sign=True), f"{gbp(perf_eq['expectancy_gbp'], sign=True)} per trade on average", "good" if net > 0 else ("bad" if net < 0 else ""), "pos" if net > 0 else ("neg" if net < 0 else "")),
-            ("Win rate", f"{perf_eq['target_hit_rate']:.0f}%", f"{perf_eq['wins']} won · {perf_eq['losses']} lost · {perf_eq['be']} saved · {perf_eq['expired']} timed out", "", ""),
+            ("Target-hit rate", f"{perf_eq['target_hit_rate']:.0f}%", f"{perf_eq['wins']} won · {perf_eq['losses']} lost · {perf_eq['be']} saved · {perf_eq['expired']} timed out", "", ""),
             ("Finished share trades", str(n_), f"likely win rate {perf_eq['ci_low']:.0f}–{perf_eq['ci_high']:.0f}%", "", ""),
             ("Open right now", str(n_open_all), f"{open_split_text()} · {gbp(open_unreal_all, sign=True)} so far · 🛡️ {be_prot} raised stops (gaps can lose)", "good" if open_unreal_all > 0 else ("bad" if open_unreal_all < 0 else ""), ""),
         ])
@@ -5381,6 +5462,48 @@ with tab_perf:
 # 16. WHAT THE AI HAS LEARNED
 # ==============================================================================
 with tab_learn:
+    share_status=load_share_worker_status()
+    share_h=share_status.get('health') or {}
+    share_f=share_status.get('forecast') or {}
+    share_sc=share_status.get('score') or {}
+    share_model=share_status.get('state') or {}
+    share_a=share_status.get('audit') or {}
+    sec_title('📡', 'Share intelligence', 'independent daily forecasts and verified five-session outcomes')
+    champion=share_model.get('champion') or {}
+    ai_cols=st.columns(4)
+    ai_cols[0].metric('Share model', 'Validated' if champion and not share_model.get('champion_paused') else ('Preview' if share_model.get('research_model') else 'Pending'))
+    ai_cols[1].metric('Shares forecast', len(share_f.get('forecasts') or []))
+    ai_cols[2].metric('Forward outcomes', int(share_sc.get('matured',0)))
+    ai_cols[3].metric('Last daily run', str(share_h.get('last_daily_date') or 'Pending'))
+    if share_h.get('last_daily_status')=='ok':
+        st.caption('Scheduled UK-share research operational · Forecast date ' + str(share_f.get('as_of','—')))
+    else:
+        st.caption('Scheduled UK-share research awaiting its first successful daily run. GitHub Actions: autonomous UK share intelligence.')
+    report=share_model.get('last_evaluation') or {}
+    if report.get('test_count'):
+        c=report.get('candidate') or {}; b=report.get('baseline') or {}
+        st.caption(f"Share model holdout: {report['test_count']} observations · Brier {c.get('brier','—')} "
+                   f"vs baseline {b.get('brier','—')} · Decision: {share_model.get('last_decision','—')}")
+    if share_sc.get('matured'):
+        st.caption(f"Forward record: {share_sc['matured']} completed · Brier {share_sc.get('brier','—')} "
+                   f"vs baseline {share_sc.get('baseline_brier','—')} · 5-session event, not target-hit win rate")
+    if (share_f.get('forecasts') or []):
+        with st.expander('View all dated UK-share forecasts', expanded=False):
+            sf=pd.DataFrame(share_f['forecasts']).rename(columns={
+                'ticker':'Share','probability':'Five-session rise probability',
+                'date':'Forecast date','predicted_rise':'Above forecast threshold',
+                'validated':'Validated','model_version':'Model version'})
+            st.dataframe(sf,hide_index=True,width='stretch')
+    if share_a.get('audited_utc'):
+        ac=st.columns(3)
+        ac[0].metric('Paper ledger rows audited', int(share_a.get('audited',0)))
+        ac[1].metric('P/L mismatches', int(share_a.get('mismatch_count',0)))
+        ac[2].metric('Unverifiable old rows', int(share_a.get('unknown_count',0)))
+        if share_a.get('mismatch_count') or share_a.get('duplicate_count'):
+            st.warning('Paper-journal reconciliation needs review; scheduled worker cannot silently alter history.')
+        with st.expander('Accounting audit details'):
+            st.json({k:v for k,v in share_a.items() if k not in ('unknown_examples',)})
+    st.divider()
     n_ = perf_eq["n"]
     decided_n = int((perf_eq_df["outcome"].isin(["WIN", "LOSS"])).sum()) if not perf_eq_df.empty else 0
     level = "🌱 Rookie" if n_ < 30 else ("📚 Learning" if n_ < 100 else "🎓 Experienced")
@@ -5507,7 +5630,7 @@ with tab_learn:
     st.markdown(
         f"- **Version in use:** {st.session_state.get('ml_model_source', 'not loaded yet')}\n"
         f"- **Last upgrade:** {state.get('last_promoted', 'never — still the original')}\n"
-        f"- **Upgrade rule:** on this laptop, retraining runs after {MIN_SETTLED_TO_RETRAIN}+ labelled trades and saves a challenger only if it beats the current model in a date-separated validation with a 7-day gap. This is still a paper-trading estimate, not guaranteed real-world accuracy. Cloud retraining remains off until model storage is persistent."
+        f"- **Upgrade rule:** on this laptop, retraining runs after {MIN_SETTLED_TO_RETRAIN}+ labelled trades and saves a challenger only if it beats the current model in a date-separated validation with a 7-day gap. This is still a paper-trading estimate, not guaranteed real-world accuracy. Independent share price-event retraining and versioned storage operate in the background. The original trade-win model still requires its own separately verified retraining before replacement."
         + (f"\n- **Confidence tuning:** based on {cal['decided']} trades that clearly won or lost." if cal else "")
         + f"\n- **Evidence learner:** {'in use' if ev_model.get('ready') else 'collecting evidence'} (see above)."
         + (f"\n- **Latest AI validation:** {state['validation_n']} later paper trades from {state['validation_start_date']}, excluding {state['purge_days']} days around the training boundary." if state.get('validation_n') else "\n- **Latest AI validation:** waiting for enough independent closed paper trades.")
@@ -5536,4 +5659,4 @@ with tab_learn:
                           "BE": "Safety exit protected the money — no change.", "EXPIRED": "Timed out — nothing learned."}.get(o_, "")
                 st.markdown(f"**{c_row['ticker']}** ({c_row['date_str']}) · {friendly_status(c_row['status'])} · {float(c_row['pnl_pct']):+.2f}% — _{lesson}_")
 
-st.markdown('<div class="disc">Paper trading only. Signals are model estimates, not validated probabilities or guarantees. Market prices may be delayed. Costs and fills are simulated. Model, data provider and calendar require ongoing maintenance.</div>', unsafe_allow_html=True)
+st.markdown('<div class="disc">ALPHA-LSE · Simulated executions · Vendor quotes may be delayed · Model status shown beside each forecast</div>', unsafe_allow_html=True)

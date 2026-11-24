@@ -1,3 +1,9 @@
+# ALPHA-LSE · Market Intelligence — Latest release: 24 Nov 2026
+
+**New:** autonomous UK-share research, five-session forward accuracy scoring, guarded share-model upgrades, non-mutating paper-journal audit, improved dashboard. Existing commodity automation retained. The virtual account has no broker integration. **See [FINAL_SHARE_RELEASE_GUIDE.md](FINAL_SHARE_RELEASE_GUIDE.md) for deployment, scope, and limitations.**
+
+---
+
 ## New: Commodity ML learning (24 November 2026)
 
 A separate five-ETC historical ML learner is included in `commodity_ml.py`. It scores a **five-session, >1.5% gross ETC move**, not trade-win probability. No real money or broker APIs. It compares challengers with historical baselines, promotes only improving models, and stores the version in a private Supabase Storage bucket after readback verification. Until promoted, the existing conservative rule-based paper simulator is used. Historical trades and the share AI remain separate.
