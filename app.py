@@ -107,7 +107,7 @@ POSITION_SIZE_GBP = 500.0   # backward compatibility when reading old trades
 MIN_POSITION_SIZE_GBP = 1.0
 REQUIRE_DURABLE_CLOUD = (STORAGE_MODE == "cloud")  # cloud mode requires Supabase; local uses persistent DuckDB
 DATA_FRESHNESS_HOURS = 30               # non-trading-day data can be older; new entries still need today's bar
-APP_VERSION = "2026.11.24-commodity-ml-v1.1-research"
+APP_VERSION = "2026.11.24-commodity-ml-v1.2-storage-recovery"
 
 def load_paper_settings() -> dict:
     """Persist virtual-account configuration independent of browser sessions."""
@@ -4493,55 +4493,85 @@ def _get_commodity_ml_store():
     return CommodityMLStore(path, cloud_mode=True, bucket=client.storage.from_(bucket))
 
 
+def _commodity_ml_safe_error_label(exc: Exception) -> str:
+    """Disclose only error type/status to UI, never credentials or request data."""
+    chain = exc
+    seen = set()
+    while chain is not None and id(chain) not in seen:
+        seen.add(id(chain))
+        status = getattr(chain, 'status_code', getattr(chain, 'statusCode', None))
+        if status is not None and str(status).isdigit():
+            return f'{type(exc).__name__}; HTTP {status}'
+        chain = getattr(chain, '__cause__', None)
+    return type(exc).__name__
+
+
 def _prepare_commodity_ml():
     today = london_now().date()
     if st.session_state.get('commodity_ml_checked_day') == today.isoformat():
         return
-    st.session_state['commodity_ml_checked_day'] = today.isoformat()
-    # Avoid carrying a stale prior-session model across a failed remote read.
+    if float(st.session_state.get('commodity_ml_retry_at', 0)) > time.time():
+        return
+    # Do not mark the day successful until the remote state has been verified.
+    # Failed remote saves must be retried, rather than silently disabled until
+    # the app restarts. Keep a bounded cooldown to avoid hammering Supabase.
+    stage = 'connecting to private model storage'
     st.session_state['commodity_ml_state'] = {}
+    st.session_state['commodity_ml_state_loaded'] = False
     try:
         store = _get_commodity_ml_store()
+        stage = 'reading the saved model state'
         state = store.load()
         st.session_state['commodity_ml_state'] = state
-        # First upgrade from v1: old cloud state has already been evaluated
-        # today, but held-out examples and its rejected research model were not
-        # stored. Backfill RESEARCH ONLY immediately without changing the
-        # champion/promotion/watermark; persist before showing any forecasts.
+        st.session_state['commodity_ml_state_loaded'] = True
         _prior_test = (state.get('last_evaluation') or state.get('report') or {})
         if (not state.get('champion') and not state.get('research_model')
                 and _prior_test.get('test_count')):
+            stage = 'fetching data for research backfill'
             _history = {}
             for _ticker in COMMODITY_ETPS:
                 _bars = fetch_cached_history(_ticker, '5y')
                 if _bars is not None and not _bars.empty and _bars.attrs.get('price_currency') == 'GBp':
                     _history[_ticker] = _bars
+            stage = 'building historical research predictions'
             _new_state, _changed = backfill_research_preview(_history, state, today)
             if _changed:
+                stage = 'saving research predictions to Supabase'
                 store.save(_new_state)
                 state = _new_state
                 st.session_state['commodity_ml_state'] = state
         if state.get('last_attempt_day') == today.isoformat():
             st.session_state['commodity_ml_message'] = str((state.get('report') or {}).get('status','Model checked'))
+            st.session_state['commodity_ml_checked_day'] = today.isoformat()
+            st.session_state.pop('commodity_ml_retry_at', None)
             return
+        stage = 'fetching historical commodity bars'
         historical = {}
         for tick in COMMODITY_ETPS:
             bars = fetch_cached_history(tick, '5y')
             if bars is not None and not bars.empty and bars.attrs.get('price_currency') == 'GBp':
                 historical[tick] = bars
+        stage = 'evaluating historical ML challenger'
         proposed, report, needs_save = train_or_update(historical, state, today)
         if needs_save:
+            stage = 'saving evaluated ML state to Supabase'
             store.save(proposed)  # MUST persist before in-session activation.
         st.session_state['commodity_ml_state'] = proposed
         st.session_state['commodity_ml_message'] = str(report.get('status','Model checked'))
+        st.session_state['commodity_ml_checked_day'] = today.isoformat()
+        st.session_state.pop('commodity_ml_retry_at', None)
     except Exception as exc:
-        # In cloud mode a failed read/write is NOT a green light to use an
-        # ephemeral model. Already loaded champion, if any, is retained.
-        LOGGER.warning('Commodity ML unavailable: %s', type(exc).__name__)
+        # Preserve the last successfully downloaded state, not an unpersisted
+        # challenger. Never expose exception text: it could include a secret.
+        label = _commodity_ml_safe_error_label(exc)
+        LOGGER.warning('Commodity ML failure at %s (%s)', stage, label)
+        st.session_state['commodity_ml_retry_at'] = time.time() + 900
         st.session_state['commodity_ml_message'] = (
-            'ML storage or training unavailable (' + type(exc).__name__ + '). '
-            'Existing rule-based paper safeguards remain; configure private model storage. '
-            'See COMMODITY_ML_SETUP.md.')
+            f'Commodity ML update failed while {stage} ({label}). '
+            'The previously saved ML state is retained; no unvalidated model can trade. '
+            'An automatic retry is scheduled in 15 minutes while this app session is active. '
+            'Check Streamlit Cloud logs for the failure stage; never share service keys.'
+        )
 
 
 _prepare_commodity_ml()

@@ -486,9 +486,32 @@ class CommodityMLStore:
             if self.bucket is None:
                 raise RuntimeError('Private Supabase ML bucket is not configured')
             try:
-                self.bucket.upload('commodity_ml_champion_v1.json', payload,
-                                   file_options={'content-type':'application/json','upsert':'true'})
-                check = bytes(self.bucket.download('commodity_ml_champion_v1.json'))
+                model_key = 'commodity_ml_champion_v1.json'
+                # Primary path is Supabase Storage upsert. Some server/client
+                # combinations report 'already exists' for this operation;
+                # update() is explicitly defined to overwrite an existing object.
+                # Never remove a model to work around a storage error.
+                try:
+                    self.bucket.upload(model_key, payload,
+                                       file_options={'content-type': 'application/json',
+                                                     'upsert': 'true'})
+                except Exception as exc:
+                    err = str(exc).lower()
+                    code = str(getattr(exc, 'code', '')).lower()
+                    status = str(getattr(exc, 'status_code', getattr(exc, 'statusCode', '')))
+                    exists = (code in ('already_exists', 'resource_already_exists', 'duplicate')
+                              or status == '409'
+                              or 'already exists' in err
+                              or 'already_exists' in err)
+                    if not exists:
+                        raise
+                    # Retry only when the server said the object EXISTS.
+                    # Never retry authentication, permissions, or network errors
+                    # as though they were conflicts.
+                    self.bucket.update(model_key, payload,
+                                       file_options={'content-type': 'application/json'})
+                # Require exact readback before switching any in-memory champion.
+                check = bytes(self.bucket.download(model_key))
                 if check != payload:
                     raise ValueError('Cloud model readback differs from saved model')
             except Exception as exc:
