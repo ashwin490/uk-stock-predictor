@@ -169,6 +169,22 @@ def _fit_model(rows: pd.DataFrame) -> dict:
 
 
 def validate_model(model: dict):
+    # Backward-compatible read of the existing linear champion, plus a bounded
+    # product-specialised challenger (all parameters remain safe JSON values).
+    if isinstance(model, dict) and model.get('kind') == 'product_specialists_v1':
+        if model.get('schema') != MODEL_SCHEMA:
+            raise ValueError('Unsupported specialist model schema')
+        validate_model(model.get('pooled_model'))
+        specialists = model.get('specialists')
+        if not isinstance(specialists, dict) or any(k not in PRODUCTS for k in specialists):
+            raise ValueError('Invalid specialist tickers')
+        for sub in specialists.values():
+            if sub.get('kind') == 'product_specialists_v1':
+                raise ValueError('Recursive specialist model forbidden')
+            validate_model(sub)
+        if _safe_float(model.get('event_base_rate')) is None:
+            raise ValueError('Specialist prior missing')
+        return
     if not isinstance(model, dict) or model.get('schema') != MODEL_SCHEMA or model.get('features') != list(FEATURE_NAMES):
         raise ValueError('Unsupported commodity model format')
     for key in ('mean', 'scale', 'coef'):
@@ -186,6 +202,16 @@ def validate_model(model: dict):
 
 def predict_proba(model: dict, frame: pd.DataFrame) -> np.ndarray:
     validate_model(model)
+    if model.get('kind') == 'product_specialists_v1':
+        if 'ticker' not in frame.columns:
+            raise ValueError('Specialist prediction needs an explicit ticker')
+        out = np.zeros(len(frame), dtype=float)
+        tickers = frame['ticker'].astype(str).to_numpy()
+        for t in sorted(set(tickers)):
+            mask = tickers == t
+            sub = model['specialists'].get(t, model['pooled_model'])
+            out[mask] = predict_proba(sub, frame.iloc[np.flatnonzero(mask)])
+        return out
     x = frame[list(FEATURE_NAMES)].to_numpy(dtype=float)
     z = np.clip((x - np.asarray(model['mean'])) / np.asarray(model['scale']), -8, 8)
     logits = z @ np.asarray(model['coef']) + float(model['intercept'])
@@ -202,7 +228,7 @@ def latest_forecast(model: dict, ticker: str, completed: pd.DataFrame, today: da
     feats = _features(bars, ticker)
     if feats.empty or feats.index[-1] != bars.index[-1]:
         raise ValueError('Latest completed bar lacks valid features')
-    p = float(predict_proba(model, feats.tail(1))[0])
+    p = float(predict_proba(model, feats.tail(1).assign(ticker=ticker))[0])
     base = float(model['event_base_rate'])
     # Threshold is for a historically defined event, not the probability of
     # achieving the separately calculated sell target or an actual profit.
@@ -217,6 +243,53 @@ def _metrics(y, p):
     p = np.clip(np.asarray(p, dtype=float), 0.0001, 0.9999)
     return {'brier': float(np.mean((y-p)**2)),
             'logloss': float(np.mean(-y*np.log(p)-(1-y)*np.log1p(-p)))}
+
+
+def _fit_specialists(rows: pd.DataFrame) -> dict:
+    """Fit independent linear predictors per ETC, falling back to pooled model
+    only for products with insufficient both-class evidence. Never mix classes.
+    """
+    pooled = _fit_model(rows)
+    parts = {}
+    for ticker in PRODUCTS:
+        part = rows.loc[rows['ticker'] == ticker]
+        if len(part) >= 125 and part['label'].nunique() == 2 and part['label'].value_counts().min() >= 12:
+            parts[ticker] = _fit_model(part)
+    wrapper = {'schema':MODEL_SCHEMA, 'kind':'product_specialists_v1',
+               'pooled_model':pooled, 'specialists':parts,
+               'event_base_rate':pooled['event_base_rate'],
+               'rows':int(len(rows)), 'trained_through':pooled['trained_through']}
+    validate_model(wrapper)
+    return wrapper
+
+
+def _pick_architecture(inner_rows: pd.DataFrame) -> str:
+    """Architecture choice uses a *different*, time-purged period from the
+    outer untouched test block. The outer test is used only for promotion.
+    """
+    days = sorted(inner_rows['feature_date'].unique().tolist())
+    if len(days) < 125:
+        return 'pooled'
+    boundary = max(HORIZON+31, int(len(days)*0.78))
+    fit = inner_rows.loc[inner_rows['feature_date'] < days[boundary - HORIZON]]
+    val = inner_rows.loc[inner_rows['feature_date'] >= days[boundary]]
+    if len(fit) < 180 or len(val) < 45 or fit['label'].nunique() < 2:
+        return 'pooled'
+    try:
+        pooled = _fit_model(fit)
+        specialised = _fit_specialists(fit)
+        # Pick a specialist architecture only for meaningful improvement in
+        # both proper-scoring rules, NOT just for more positive BUY forecasts.
+        a = _metrics(val['label'], predict_proba(pooled, val))
+        b = _metrics(val['label'], predict_proba(specialised, val))
+        return ('specialists' if b['brier'] < a['brier'] - .002
+                and b['logloss'] < a['logloss'] - .002 else 'pooled')
+    except (ValueError, KeyError):
+        return 'pooled'
+
+
+def _fit_selected(rows: pd.DataFrame, architecture: str) -> dict:
+    return _fit_specialists(rows) if architecture == 'specialists' else _fit_model(rows)
 
 
 def _split_by_date(rows: pd.DataFrame, earliest_test_after: str | None):
@@ -323,7 +396,8 @@ def train_or_update(histories: Mapping[str, pd.DataFrame], old_state: dict | Non
         state['report'] = report
         return state, report, True
     train, test, test_start = pair
-    model = _fit_model(train)
+    architecture = _pick_architecture(train)
+    model = _fit_selected(train, architecture)
     pred = predict_proba(model, test)
     base_rate = float(train['label'].mean())
     baseline = _metrics(test['label'], np.full(len(test), base_rate))
@@ -338,12 +412,12 @@ def train_or_update(histories: Mapping[str, pd.DataFrame], old_state: dict | Non
                    'test_through':test['feature_date'].max(), 'base_rate':round(base_rate,4),
                    'baseline':baseline, 'challenger':candidate_metrics,
                    'champion_score':comparator_metrics if incumbent else None,
-                   'promoted':bool(pass_gate)})
+                   'promoted':bool(pass_gate), 'selected_architecture':architecture})
     # Do not repeatedly tune on already inspected days: another comparison only
     # after a fresh block of new matured observations has accrued.
     state['evaluated_through'] = str(dataset.feature_date.max())
     if pass_gate:
-        promoted = _fit_model(dataset)
+        promoted = _fit_selected(dataset, architecture)
         version = int(state.get('version', 0)) + 1
         promoted['version'] = version
         promoted['promoted_day'] = today.isoformat()
@@ -369,7 +443,7 @@ def train_or_update(histories: Mapping[str, pd.DataFrame], old_state: dict | Non
         # Show the user's historical-data research estimates immediately, even
         # though this rejected model NEVER authorises a paper purchase.
         # Fit only on fully matured history; today's unfinished bar is excluded.
-        state['research_model'] = _fit_model(dataset)
+        state['research_model'] = _fit_selected(dataset, architecture)
         state['research_model']['research_only'] = True
         state['research_model']['created_day'] = today.isoformat()
         report['status'] = 'Challenger rejected: did not beat baseline and current champion'
@@ -382,6 +456,38 @@ def train_or_update(histories: Mapping[str, pd.DataFrame], old_state: dict | Non
                 state['champion_last_confirmed_day'] = today.isoformat()
             else:
                 report['status'] += '; incumbent also failed baseline, new ML buys paused'
+                previous = state.get('previous_champion')
+                if previous:
+                    try:
+                        validate_model(previous)
+                        previous_metrics = _metrics(test['label'], predict_proba(previous, test))
+                        # Rollback only with NEW test evidence that the previous
+                        # proven version beats both baseline and current champion.
+                        if (_is_better(previous_metrics, baseline, first=True)
+                                and _is_better(previous_metrics, comparator_metrics, first=False)):
+                            restored = dict(previous)
+                            version = int(state.get('version', 0)) + 1
+                            restored['version'] = version
+                            restored['promoted_day'] = today.isoformat()
+                            restored['market_data_through'] = str(max(
+                                pd.Timestamp(b.index[-1]).date()
+                                for ticker,bars in histories.items()
+                                if ticker in usable and not (b := clean_completed_bars(bars,today)).empty))
+                            restored['validation'] = {'rollback_score':previous_metrics,
+                                                       'incumbent':comparator_metrics,
+                                                       'baseline':baseline,
+                                                       'n_test':len(test),'start':test_start}
+                            state['champion'] = restored
+                            state['previous_champion'] = incumbent
+                            state['version'] = version
+                            state['champion_last_confirmed_day'] = today.isoformat()
+                            state['champion_paused'] = False
+                            state['evaluated_through'] = restored['market_data_through']
+                            report['rollback'] = True
+                            report['status'] = f'Previous validated model restored as v{version} after fresh independent evaluation'
+                    except (ValueError, KeyError, TypeError):
+                        # Any doubt about the old model leaves all new ML entries paused.
+                        report['status'] += '; previous model could not be safely validated'
     # Keep the last evaluated predictions visible even while awaiting 22 NEW
     # test days; do not silently erase evidence on tomorrow's rerun.
     state['last_evaluation'] = report
@@ -408,7 +514,8 @@ def backfill_research_preview(histories: Mapping[str, pd.DataFrame],
     if pair is None:
         return state, False
     train, test, start = pair
-    candidate = _fit_model(train)
+    architecture = _pick_architecture(train)
+    candidate = _fit_selected(train, architecture)
     pred = predict_proba(candidate, test)
     prior = float(train['label'].mean())
     historical = _historical_research_evidence(test, pred, prior)
@@ -428,7 +535,7 @@ def backfill_research_preview(histories: Mapping[str, pd.DataFrame],
     report['research_evidence'] = historical
     report['research_backfilled'] = True
     state['last_evaluation'] = report
-    state['research_model'] = _fit_model(dataset)
+    state['research_model'] = _fit_selected(dataset, architecture)
     state['research_model']['research_only'] = True
     state['research_model']['created_day'] = today.isoformat()
     return state, True

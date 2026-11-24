@@ -26,6 +26,7 @@ from commodity_dashboard import (commodity_signal_card_html, commodity_journal_v
                                  summarise_commodity_history, assess_commodity_history,
                                  decorate_commodity_card)
 from auto_refresh_schedule import choose_auto_refresh
+from commodity_worker import read_json as read_worker_json
 from option_retirement import make_options_archive, retire_options
 
 import streamlit as st
@@ -107,7 +108,7 @@ POSITION_SIZE_GBP = 500.0   # backward compatibility when reading old trades
 MIN_POSITION_SIZE_GBP = 1.0
 REQUIRE_DURABLE_CLOUD = (STORAGE_MODE == "cloud")  # cloud mode requires Supabase; local uses persistent DuckDB
 DATA_FRESHNESS_HOURS = 30               # non-trading-day data can be older; new entries still need today's bar
-APP_VERSION = "2026.11.24-commodity-ml-v1.2-storage-recovery"
+APP_VERSION = "2026.11.24-autonomous-research-v2"
 
 def load_paper_settings() -> dict:
     """Persist virtual-account configuration independent of browser sessions."""
@@ -2982,6 +2983,7 @@ def log_equity_signal_safely(sig: dict, enforce_sector_cap: bool = True,
                                      or champion.get('promoted_day') if champion else None)
             fresh_model = (last_verified is not None and (now.date()-last_verified).days <= 60)
             if (champion and fresh_model and not ml_session_state.get('champion_paused')
+                    and _background_worker_healthy()
                     and int(metadata.get('commodity_ml_version',-1)) == int(champion.get('version',-2))
                     and math.isfinite(forecast) and math.isfinite(limit)
                     and 0 <= forecast <= 1 and 0 < limit < 1 and forecast >= limit):
@@ -4506,9 +4508,63 @@ def _commodity_ml_safe_error_label(exc: Exception) -> str:
     return type(exc).__name__
 
 
+def _autonomous_worker_enabled() -> bool:
+    """A single nominated writer protects the saved model against racing app tabs.
+
+    Worker mode is only enabled explicitly after the user has set GitHub Actions
+    secrets and seen a successful scheduled job. Do not infer from bucket presence.
+    """
+    try:
+        flag = os.environ.get('ALPHA_BACKGROUND_WORKER_ENABLED')
+        if flag is None:
+            flag = st.secrets.get('ALPHA_BACKGROUND_WORKER_ENABLED', False)
+        return str(flag).lower().strip() in ('1','true','yes','on')
+    except Exception:
+        return False
+
+
+def _load_worker_research():
+    """Bounded read-only status from the independent runner. Never approves buys."""
+    old = st.session_state.get('commodity_worker_read')
+    if old and time.time() - old.get('last_fetch', 0) < 900:
+        return old
+    values = {'last_fetch': time.time(), 'enabled':_autonomous_worker_enabled(),
+              'health':{}, 'score':{}, 'forecast':{}, 'market':{}}
+    if STORAGE_MODE != 'cloud':
+        return values
+    try:
+        bucket = _get_commodity_ml_store().bucket
+        for field, key in (('health','research/worker_health_v1.json'),
+                           ('score','research/scorecard_v1.json'),
+                           ('forecast','research/latest_forecasts_v1.json'),
+                           ('market','research/market_snapshot_v1.json')):
+            values[field] = read_worker_json(bucket, key, default={}) or {}
+    except Exception as exc:
+        values['unavailable'] = type(exc).__name__
+    st.session_state['commodity_worker_read'] = values
+    return values
+
+
+def _background_worker_healthy() -> bool:
+    if not _autonomous_worker_enabled():
+        return True
+    h = (_load_worker_research().get('health') or {})
+    stamp = h.get('last_daily_utc')
+    if not stamp or h.get('last_daily_status') != 'ok':
+        return False
+    try:
+        age = (datetime.now(pytz.UTC) - datetime.fromisoformat(stamp).astimezone(pytz.UTC)).total_seconds()
+        return -3600 < age <= 120 * 3600
+    except (ValueError, TypeError):
+        return False
+
+
 def _prepare_commodity_ml():
     today = london_now().date()
-    if st.session_state.get('commodity_ml_checked_day') == today.isoformat():
+    if _autonomous_worker_enabled():
+        if time.time() - float(st.session_state.get('commodity_ml_loaded_at',0)) < 900:
+            return
+    elif st.session_state.get('commodity_ml_checked_day') == today.isoformat():
         return
     if float(st.session_state.get('commodity_ml_retry_at', 0)) > time.time():
         return
@@ -4524,6 +4580,16 @@ def _prepare_commodity_ml():
         state = store.load()
         st.session_state['commodity_ml_state'] = state
         st.session_state['commodity_ml_state_loaded'] = True
+        if _autonomous_worker_enabled():
+            # Streamlit may have multiple sessions. Only the scheduled runner
+            # retrains and writes to this shared Supabase model state now.
+            st.session_state['commodity_ml_message'] = (
+                'Cloud background ML worker enabled; dashboard reads its saved '
+                'champion and research results (no in-browser model writes).')
+            st.session_state['commodity_ml_checked_day'] = today.isoformat()
+            st.session_state['commodity_ml_loaded_at'] = time.time()
+            st.session_state.pop('commodity_ml_retry_at', None)
+            return
         _prior_test = (state.get('last_evaluation') or state.get('report') or {})
         if (not state.get('champion') and not state.get('research_model')
                 and _prior_test.get('test_count')):
@@ -4672,8 +4738,9 @@ def commodity_idea(ticker: str, *, refresh: bool = False) -> dict:
                 (st.session_state.get('commodity_ml_state') or {}).get('champion_last_confirmed_day')
                 or champion['promoted_day'], '%Y-%m-%d').date()
             suspended = bool((st.session_state.get('commodity_ml_state') or {}).get('champion_paused'))
-            if suspended or (today - verified_day).days > 60:
+            if suspended or (today - verified_day).days > 60 or not _background_worker_healthy():
                 out['ML status'] = ('Champion underperformed baseline — new ML buys paused' if suspended
+                                    else 'Background monitoring is stale — new ML buys paused' if not _background_worker_healthy()
                                     else 'Model validation older than 60 days — new ML buys paused')
                 ml_forecast = None
             else:
@@ -4974,6 +5041,56 @@ with tab_commodity:
             st.dataframe(_samples, width='stretch', hide_index=True)
             st.caption('This is an illustrative held-out sample from the most recent historical test, '
                        'not a complete trading backtest; costs and intraday stop/targets are excluded.')
+    _worker = _load_worker_research()
+    if _worker.get('enabled'):
+        st.markdown('**Independent background research — Supabase / GitHub Actions**')
+        _health = _worker.get('health') or {}
+        if _worker.get('unavailable'):
+            st.warning('Background worker status unavailable (' + str(_worker['unavailable']) + '). '
+                       'Verify Supabase Storage permissions and GitHub Actions logs.')
+        elif _health.get('last_daily_utc'):
+            _heartbeat = str(_health['last_daily_utc'])
+            try:
+                _age = (datetime.now(pytz.UTC) - datetime.fromisoformat(_heartbeat).astimezone(pytz.UTC)).total_seconds()/3600
+            except (ValueError, TypeError):
+                _age = 9999
+            st.caption('Last independent daily run (UTC): ' + _heartbeat +
+                       ' · Status: ' + str(_health.get('last_daily_status','unknown')))
+            if _age > 120:
+                st.error('The scheduled worker has not reported in over five days. Check GitHub Actions immediately.')
+        else:
+            st.warning('No cloud-worker heartbeat found yet. Run the GitHub Actions workflow manually once to check setup.')
+        _sc = _worker.get('score') or {}
+        if _sc.get('matured', 0):
+            st.write(f"**Forward forecast score:** {_sc['matured']} completed predictions · "
+                     f"ML Brier {_sc.get('brier','—')} vs baseline {_sc.get('baseline_brier','—')} (lower is better)")
+            st.caption('These are predictions recorded before their outcomes matured, not backfilled hindsight results.')
+        else:
+            st.caption('Forward accuracy is pending: each forecast needs five later completed sessions.')
+        if _sc.get('by_product'):
+            with st.expander('See forward forecast accuracy by commodity'):
+                st.dataframe(pd.DataFrame(_sc['by_product']).rename(columns={
+                    'ticker':'ETC', 'matured':'Resolved forecasts',
+                    'predicted_rises':'Predicted rises', 'correct_predicted_rises':'Correct rises',
+                    'signal_precision_pct':'Signal precision (%)', 'actual_rises':'Actual rises',
+                    'brier':'ML Brier', 'baseline_brier':'Baseline Brier'}),
+                    width='stretch', hide_index=True)
+                st.caption('These are recorded research forecasts; predicted price events are not paper-trade profits.')
+        _market_snapshot = _worker.get('market') or {}
+        if _market_snapshot.get('signals'):
+            with st.expander('See last independent commodity price scan'):
+                st.caption('Recorded UTC: ' + str(_market_snapshot.get('as_of_utc','unknown')) +
+                           ' · Price checks only; no automatic background purchases.')
+                st.dataframe(pd.DataFrame(_market_snapshot['signals']), width='stretch', hide_index=True)
+        _saved = (_worker.get('forecast') or {}).get('forecasts') or []
+        if _saved:
+            with st.expander('See dated forecasts saved by the scheduled worker'):
+                st.dataframe(pd.DataFrame(_saved).rename(columns={
+                    'date':'Forecast date', 'ticker':'ETC', 'probability':'P(rise >1.5%)',
+                    'validated':'Validated model', 'model_version':'Model version'}),
+                    width='stretch', hide_index=True)
+        st.caption('Background worker only collects research data and validates models. '
+                   'New paper orders and intraday exits still require the live Streamlit app.')
     if STORAGE_MODE == 'cloud' and not _ml_champion:
         if _ml_state.get('last_attempt_day'):
             st.caption('Cloud model-state history exists. No validated champion has passed promotion yet; '

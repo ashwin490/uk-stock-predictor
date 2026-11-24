@@ -121,3 +121,12 @@ Offline tests: `python -m pytest -q tests/test_local_first.py`. The tests valida
 ### 23 November — commodity cards and home page totals
 
 Commodity signals are now shown as individual cards. The home page includes commodity counts, realised and unrealised paper results, and wins/losses. The Commodities tab includes the full historical paper journal and CSV export. `commodity_dashboard.py` and `auto_refresh_schedule.py` are required alongside `app.py`. See [`COMMODITY_DASHBOARD_UPDATE.md`](COMMODITY_DASHBOARD_UPDATE.md) for deployment and behavioural details.
+
+---
+
+## Autonomous commodity ML research (24 November 2026)
+
+**Start with [`AUTONOMOUS_FINAL_SETUP.md`](AUTONOMOUS_FINAL_SETUP.md).**
+The new `commodity_worker.py` runs under `.github/workflows/commodity_autonomous.yml` with independent UK market scans, scheduled commodity-model evaluation, dated forward forecasts, after-five-session outcome scoring, model rollback safeguards, health checks and private journal backups. It is completely separate from the trained UK share AI. The Streamlit code can display the worker's saved research results when `ALPHA_BACKGROUND_WORKER_ENABLED = true` is set.
+
+**Paper-only safety:** The worker NEVER makes simulated purchases, closes paper trades or touches real broker accounts. Existing app-based paper entries and intraday checks still require an active Streamlit browser session. No claim of a 10-year maintenance-free operation or guaranteed profitable forecasts is made.

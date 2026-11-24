@@ -29,6 +29,6 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pytest
       - name: Compile Python modules
-        run: python -m py_compile app.py alpha_backup.py setup_auth.py health_check.py feature_engine.py intraday_exit.py commodity_etps.py commodity_signals.py commodity_ml.py commodity_dashboard.py auto_refresh_schedule.py option_retirement.py
+        run: python -m py_compile app.py alpha_backup.py setup_auth.py health_check.py feature_engine.py intraday_exit.py commodity_etps.py commodity_signals.py commodity_ml.py commodity_worker.py commodity_dashboard.py auto_refresh_schedule.py option_retirement.py
       - name: Run offline regressions
         run: python -m pytest -q tests
