@@ -1,3 +1,5 @@
+> **Historical note (23 November 2026):** This document describes the original rule-only ETC release. The 24 November update adds independent commodity ML filtering and guarded model upgrades. Follow **COMMODITY_ML_SETUP.md** for current deployment and behaviour. The five original trend rules and safety checks below still apply.
+
 # 23 November 2026 — Commodity predictions and US options retirement
 
 ## What you will see

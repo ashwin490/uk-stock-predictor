@@ -19,6 +19,8 @@ from alpha_backup import create_backup
 from intraday_exit import first_intraday_exit
 from commodity_etps import COMMODITY_ETPS, FUTURES_REFERENCES, is_commodity_etc
 from commodity_signals import evaluate_commodity_signal, STRATEGY_NAME
+from commodity_ml import (CommodityMLStore, STRATEGY_NAME_ML,
+                          train_or_update, latest_forecast, validate_model)
 from commodity_dashboard import (commodity_signal_card_html, commodity_journal_view,
                                  summarise_commodity_history, assess_commodity_history,
                                  decorate_commodity_card)
@@ -104,7 +106,7 @@ POSITION_SIZE_GBP = 500.0   # backward compatibility when reading old trades
 MIN_POSITION_SIZE_GBP = 1.0
 REQUIRE_DURABLE_CLOUD = (STORAGE_MODE == "cloud")  # cloud mode requires Supabase; local uses persistent DuckDB
 DATA_FRESHNESS_HOURS = 30               # non-trading-day data can be older; new entries still need today's bar
-APP_VERSION = "2026.11.23-commodity-cards-runtime-fix"
+APP_VERSION = "2026.11.24-commodity-ml-v1"
 
 def load_paper_settings() -> dict:
     """Persist virtual-account configuration independent of browser sessions."""
@@ -2954,15 +2956,39 @@ def log_equity_signal_safely(sig: dict, enforce_sector_cap: bool = True,
     if not sig.get("Loggable", False):
         return fail("A same-day quotation was not verified")
     metadata = sig.get("FeaturesDict")
-    # Commodity ETCs have a separate, explicit rule engine, NOT the stock ML model.
+    # ETC buys require explicit evidence from the independent ETC safety rules.
+    # A promoted commodity model can FILTER those candidates; it never bypasses
+    # liquidity, time, commission, existing-position or portfolio safeguards.
     is_manual_etc = (manual_etc_authorised and is_commodity_etc(ticker)
                      and sig.get("ManualETC", False) is True)
     is_rule_etc = (is_commodity_etc(ticker) and sig.get("CommodityRuleQualified") is True
                    and isinstance(metadata, dict)
                    and metadata.get("strategy_id") == STRATEGY_NAME
                    and metadata.get("model_validated") is False)
-    if is_commodity_etc(ticker) and not (is_manual_etc or is_rule_etc):
-        return fail("Commodity security must pass its separate strategy or be manually authorised")
+    is_ml_etc = False
+    if (is_commodity_etc(ticker) and bool(st.session_state.get('commodity_ml_gate_enabled', True))
+            and sig.get('CommodityRuleQualified') is True
+            and sig.get('CommodityMLQualified') is True
+            and isinstance(metadata, dict)
+            and metadata.get('strategy_id') == STRATEGY_NAME_ML
+            and metadata.get('model_validated') is True):
+        champion = (st.session_state.get('commodity_ml_state') or {}).get('champion')
+        try:
+            forecast = float(metadata.get('commodity_ml_probability'))
+            limit = float(metadata.get('commodity_ml_threshold'))
+            ml_session_state = st.session_state.get('commodity_ml_state') or {}
+            last_verified = _to_date(ml_session_state.get('champion_last_confirmed_day')
+                                     or champion.get('promoted_day') if champion else None)
+            fresh_model = (last_verified is not None and (now.date()-last_verified).days <= 60)
+            if (champion and fresh_model and not ml_session_state.get('champion_paused')
+                    and int(metadata.get('commodity_ml_version',-1)) == int(champion.get('version',-2))
+                    and math.isfinite(forecast) and math.isfinite(limit)
+                    and 0 <= forecast <= 1 and 0 < limit < 1 and forecast >= limit):
+                is_ml_etc = True
+        except (TypeError, ValueError):
+            pass
+    if is_commodity_etc(ticker) and not (is_manual_etc or is_rule_etc or is_ml_etc):
+        return fail("Commodity security must pass its separate trend/ML strategy checks")
     if not sig.get("Qualified", False) and not is_manual_etc:
         return fail("Only paper signals that passed all checks or explicitly authorised manual commodity orders can be recorded")
     if is_rule_etc and not sig.get("Qualified", False):
@@ -4016,9 +4042,16 @@ st.sidebar.toggle(
     "Automatically paper-buy qualifying commodity ETCs",
     value=True,
     key="auto_buy_commodity_etcs",
-    help="Runs a separate, unvalidated 5-condition trend rule for verified GBP/GBp commodity ETCs. "
-         "It will not use the stock AI, and follows the same virtual cash, risk and market-hours safeguards.")
-st.sidebar.caption("Commodity signals are **not AI win probabilities**; you can turn their automatic paper orders off at any time.")
+    help="Paper-only. The proven existing trend, price, costs, entry-hour and risk checks still apply. "
+         "A separately validated commodity ML model can filter (never bypass) these checks.")
+st.sidebar.toggle(
+    "Use validated commodity ML to filter entries",
+    value=True, key="commodity_ml_gate_enabled",
+    help="When an independently tested commodity model is available, require its 5-session gain forecast "
+         "to exceed a guarded threshold in addition to all existing rules. Until a model passes validation, "
+         "the earlier rule-only strategy remains active (clearly marked).")
+st.sidebar.caption("ML predicts a 5-session price move over +1.5% BEFORE costs, not a trade win probability. "
+                   "Only historical evidence can trigger a model upgrade; neither ML nor paper trading guarantees profits.")
 
 with st.sidebar.expander("🛡️ Built-in safety rules"):
     st.markdown(
@@ -4437,7 +4470,65 @@ with tab_home:
             st.caption("“Expected value” = what a pick is worth on average after stamp duty, spread and fees, using the AI's chance of reaching the goal first.")
 
 # ==============================================================================
-# 12b. COMMODITIES — RULE-BASED PAPER PREDICTIONS AND AUTO TRADES
+# 12b. COMMODITIES — INDEPENDENT ML WITH CHAMPION/CHALLENGER
+# ==============================================================================
+# The model uses only historical completed GBp daily ETC bars. Training and
+# promotion are once daily at most, and the saved model must survive a cloud
+# restart before it may govern any automatic trade.
+
+def _get_commodity_ml_store():
+    path = DATA_DIR / 'models' / 'commodity_ml_champion_v1.json'
+    if STORAGE_MODE != 'cloud':
+        return CommodityMLStore(path)
+    try:
+        bucket = str(st.secrets.get('ALPHA_COMMODITY_ML_BUCKET','')).strip()
+        url = str(st.secrets.get('SUPABASE_URL','')).strip().split('/rest/v1')[0].rstrip('/')
+        service_key = str(st.secrets.get('SUPABASE_MODEL_SERVICE_KEY','')).strip()
+    except Exception:
+        bucket, url, service_key = '', '', ''
+    if not (bucket and url and service_key and create_client):
+        raise RuntimeError('Private ML bucket or dedicated server-side model key not configured')
+    client = create_client(url, service_key)
+    return CommodityMLStore(path, cloud_mode=True, bucket=client.storage.from_(bucket))
+
+
+def _prepare_commodity_ml():
+    today = london_now().date()
+    if st.session_state.get('commodity_ml_checked_day') == today.isoformat():
+        return
+    st.session_state['commodity_ml_checked_day'] = today.isoformat()
+    # Avoid carrying a stale prior-session model across a failed remote read.
+    st.session_state['commodity_ml_state'] = {}
+    try:
+        store = _get_commodity_ml_store()
+        state = store.load()
+        st.session_state['commodity_ml_state'] = state
+        if state.get('last_attempt_day') == today.isoformat():
+            st.session_state['commodity_ml_message'] = str((state.get('report') or {}).get('status','Model checked'))
+            return
+        historical = {}
+        for tick in COMMODITY_ETPS:
+            bars = fetch_cached_history(tick, '5y')
+            if bars is not None and not bars.empty and bars.attrs.get('price_currency') == 'GBp':
+                historical[tick] = bars
+        proposed, report, needs_save = train_or_update(historical, state, today)
+        if needs_save:
+            store.save(proposed)  # MUST persist before in-session activation.
+        st.session_state['commodity_ml_state'] = proposed
+        st.session_state['commodity_ml_message'] = str(report.get('status','Model checked'))
+    except Exception as exc:
+        # In cloud mode a failed read/write is NOT a green light to use an
+        # ephemeral model. Already loaded champion, if any, is retained.
+        LOGGER.warning('Commodity ML unavailable: %s', type(exc).__name__)
+        st.session_state['commodity_ml_message'] = (
+            'ML storage or training unavailable (' + type(exc).__name__ + '). '
+            'Existing rule-based paper safeguards remain; configure private model storage. '
+            'See COMMODITY_ML_SETUP.md.')
+
+
+_prepare_commodity_ml()
+
+# 12c. RULES + PAPER ORDERS (ML can filter, never override, these rules)
 # ==============================================================================
 # All values below refer to the LSE-listed ETC unit in pence, NOT a raw
 # ounce of bullion, oil barrel, gas contract, or a dollar futures price.
@@ -4481,7 +4572,10 @@ def commodity_idea(ticker: str, *, refresh: bool = False) -> dict:
            "Current (p)": None, "Quote date": None,
            "Buy (p)": None, "Sell target (p)": None, "Stop-loss (p)": None,
            "Units": 0, "Paper amount (£)": 0.0, "Trend checks": "—",
-           "Potential net return (%)": None, "History note": feedback.note, "_order": None}
+           "Potential net return (%)": None, "History note": feedback.note,
+           "ML status": "No validated commodity model yet; trend rules remain the fallback",
+           "ML forecast (%)": None, "ML threshold (%)": None,
+           "ML version": None, "_order": None}
     h = _download_history_raw(ticker, '6mo') if refresh else fetch_cached_history(ticker, '6mo')
     if h is None or h.empty or not isinstance(h.index, pd.DatetimeIndex):
         out['Explanation'] = 'Verified sterling price unavailable or data feed failed'
@@ -4515,6 +4609,34 @@ def commodity_idea(ticker: str, *, refresh: bool = False) -> dict:
     out['Trend checks'] = f"{evaluation.score}/5"
     out['Sell target (p)'] = evaluation.target_pence
     out['Stop-loss (p)'] = evaluation.stop_pence
+    champion = (st.session_state.get('commodity_ml_state') or {}).get('champion')
+    ml_forecast = None
+    ml_enabled = bool(st.session_state.get('commodity_ml_gate_enabled', True))
+    if champion:
+        try:
+            validate_model(champion)
+            ml_forecast = latest_forecast(champion, ticker, completed, today)
+            # An old ML version may display a forecast, but cannot authorise a new
+            # automatic paper order without timely independent evaluation.
+            verified_day = datetime.strptime(
+                (st.session_state.get('commodity_ml_state') or {}).get('champion_last_confirmed_day')
+                or champion['promoted_day'], '%Y-%m-%d').date()
+            suspended = bool((st.session_state.get('commodity_ml_state') or {}).get('champion_paused'))
+            if suspended or (today - verified_day).days > 60:
+                out['ML status'] = ('Champion underperformed baseline — new ML buys paused' if suspended
+                                    else 'Model validation older than 60 days — new ML buys paused')
+                ml_forecast = None
+            else:
+                out['ML status'] = (f"ML v{champion.get('version')} historically tested; "
+                                    + ('filter ON' if ml_enabled else 'filter OFF — rule-only purchases'))
+                out['ML forecast (%)'] = round(ml_forecast['probability']*100,1)
+                out['ML threshold (%)'] = round(ml_forecast['threshold']*100,1)
+                out['ML version'] = champion.get('version')
+                out['Explanation'] = out['Explanation'].replace('(rule-based, not ML)',
+                    '(trend safeguard; separate ML forecast below)')
+        except (ValueError, TypeError, KeyError) as exc:
+            out['ML status'] = 'ML data not verified; automatic ML-filtered entry paused'
+            LOGGER.warning('ETC model forecast unavailable for %s: %s',ticker,type(exc).__name__)
     if evaluation.action != 'BUY_CANDIDATE':
         out['Decision'] = 'WAIT — trend/risk rules'
         return out
@@ -4532,6 +4654,11 @@ def commodity_idea(ticker: str, *, refresh: bool = False) -> dict:
             )
         return out
     if not (evaluation.stop_pence and evaluation.target_pence):
+        return out
+    if champion and ml_enabled and (ml_forecast is None or not ml_forecast['qualified']):
+        out['Decision'] = 'WAIT — commodity ML safeguard'
+        out['Explanation'] = ('Model forecast is unavailable/stale; no ML-authorised entry' if ml_forecast is None
+                              else 'Trend conditions passed, but ML estimate is below its guarded threshold')
         return out
     if ticker in get_currently_active_tickers():
         out['Decision'] = 'OPEN — already paper-owned'
@@ -4563,21 +4690,29 @@ def commodity_idea(ticker: str, *, refresh: bool = False) -> dict:
         out['Decision'] = 'WAIT — target does not cover estimated costs'
         return out
     out['Decision'] = 'BUY CANDIDATE (paper)'
+    ml_qualified = bool(champion and ml_enabled and ml_forecast and ml_forecast['qualified'])
     meta = {"price_currency": "GBp", "spread_pct": spread,
             "commission_gbp": fees, "asset_class": "COMMODITY_ETC", "sector": sector,
-            "strategy_id": STRATEGY_NAME, "model_validated": False,
+            "strategy_id": STRATEGY_NAME_ML if ml_qualified else STRATEGY_NAME,
+            "model_validated": ml_qualified,
+            "commodity_ml_version": champion['version'] if ml_qualified else None,
+            "commodity_ml_probability": ml_forecast['probability'] if ml_qualified else None,
+            "commodity_ml_threshold": ml_forecast['threshold'] if ml_qualified else None,
+            "commodity_ml_event": '5-session ETC gain >1.5% before costs' if ml_qualified else None,
             "commodity_history_size_factor": feedback.stake_fraction,
             "commodity_history_sample": feedback.count,
             "commodity_rule_score": evaluation.score, "commodity_rule_reason": evaluation.reason,
             "atr_pct": (evaluation.atr_pence / price * 100) if evaluation.atr_pence is not None else None,
-            "source": "UNVALIDATED_RULE_BASED_ETC", "market_data_delayed": True}
+            "source": "HISTORICALLY_TESTED_COMMODITY_ML_FILTER" if ml_qualified else "RULE_BASED_ETC_FALLBACK",
+            "market_data_delayed": True}
     out['_order'] = {"Ticker": ticker, "Sector": sector, "Price (p)": round(price,4),
         "Target (p)": target, "Stop Loss (p)": stop,
         "Recommended Shares": f"{units} shares", "Capital": capital,
         "AI Win Confidence": "0%", "ReturnNum": round((target-price)/price*100,2),
         "FeaturesDict": meta, "RNS": "Commodity research; no regulatory-news screen",
-        "RNSHeadline": "Rule-based ETC candidate, not validated AI prediction",
-        "CommodityRuleQualified": True, "Qualified": True, "Loggable": True}
+        "RNSHeadline": "ETC candidate with historical ML filter" if ml_qualified else "Rule-based ETC candidate; ML not active",
+        "CommodityRuleQualified": True, "CommodityMLQualified": ml_qualified,
+        "Qualified": True, "Loggable": True}
     return out
 
 
@@ -4604,7 +4739,10 @@ def scan_commodity_ideas(*, auto_record: bool):
                           "Current (p)":None,"Quote date":None,
                           "Sell target (p)":None,"Stop-loss (p)":None,"Units":0,
                           "Paper amount (£)":0.0,"Trend checks":"—","Potential net return (%)":None,
-                          "History note":"No reliable signal available", "_order": None})
+                          "History note":"No reliable signal available",
+                          "ML status":"Price data unavailable; ML forecast not possible",
+                          "ML forecast (%)": None, "ML threshold (%)": None,
+                          "ML version": None, "_order": None})
     st.session_state['commodity_ideas'] = ideas
     st.session_state['commodity_scan_ts'] = london_now().strftime('%d %b %H:%M:%S')
     st.session_state['commodity_last_buys'] = recorded
@@ -4659,7 +4797,8 @@ closed_all = load_closed_trades_df()
 
 with tab_commodity:
     sec_title('🪙', 'Gold, silver, oil & gas', 'five UK-listed sterling-quoted ETCs')
-    st.caption('Rule-based paper research, NOT probabilities from the share AI. Prices below are pence per ETC unit, not gold/oil spot or USD futures. Quotes may be delayed.')
+    st.caption('Independent commodity ML may filter the existing five trend rules once a model beats its historical baseline. '
+               'It is NOT the share AI and does NOT estimate actual trade wins. Prices are pence per ETC unit; data may be delayed.')
     _buy_end = entry_window_end().strftime('%H:%M')
     if market_is_open and not is_entry_window_open():
         st.info(f'UK market is open for monitoring, but new paper buying finished at {_buy_end} London time. Existing paper trades continue to be checked until the market closes.')
@@ -4717,12 +4856,38 @@ with tab_commodity:
                     st.html(commodity_signal_card_html(it))
     else:
         st.warning('Commodity prices have not been checked successfully yet. Retry using the refresh control.')
-    st.caption('WAIT levels are provisional and may change each refresh. OPEN trade entry and target are locked to the journal; an active stop can only be adjusted by the existing risk rule. Targets use 2.4× 14-day ATR and initial stops use 1.5× ATR. No guarantee of execution or future profit.')
+    st.caption('WAIT levels are provisional and may change each refresh. OPEN entry/target are locked to the journal. '
+               'ML predicts a specific future five-session gain event, NOT target/stop execution. '
+               'Targets use 2.4× 14-day ATR and stops 1.5× ATR. All transactions are simulated.')
 
 # ==============================================================================
 # 13b. COMMODITY PERFORMANCE (separate from the share-trained AI)
 # ==============================================================================
 with tab_commodity:
+    sec_title('🧠', 'Commodity ML learning', 'historical evidence, guarded upgrades, separate from the share AI')
+    _ml_state = st.session_state.get('commodity_ml_state') or {}
+    _ml_champion = _ml_state.get('champion')
+    st.write('**' + ('ML champion v' + str(_ml_champion.get('version')) if _ml_champion
+                    else 'No promoted commodity ML model yet') + '**')
+    st.caption(str(st.session_state.get('commodity_ml_message', 'Awaiting historical training')))
+    if _ml_state.get('champion_paused'):
+        st.warning('The ML champion failed its latest independent baseline check. New ML-authorised buys are paused; '
+                   'no unsafe upgrade has been made.')
+    if _ml_champion:
+        st.caption('Last verified: ' + str(_ml_state.get('champion_last_confirmed_day') or _ml_champion.get('promoted_day','unknown')))
+    _ml_report = _ml_state.get('report') or {}
+    if _ml_report.get('test_count'):
+        score = _ml_report.get('challenger') or {}
+        baseline = _ml_report.get('baseline') or {}
+        st.caption(f"Latest independent historical test: {_ml_report['test_count']} labelled examples "
+                   f"across {_ml_report.get('test_days','?')} dates from {_ml_report.get('test_from','?')}; "
+                   f"candidate Brier {score.get('brier',0):.3f} vs constant baseline {baseline.get('brier',0):.3f}. "
+                   'Lower is better. Historical results do not guarantee live accuracy.')
+    if STORAGE_MODE == 'cloud' and not _ml_champion:
+        st.caption('For automatic upgrades to survive Streamlit Cloud restarts, configure the private Supabase model bucket and server-side model key. See COMMODITY_ML_SETUP.md.')
+    st.caption('ML predicts whether an ETC closes >1.5% higher after five sessions, BEFORE costs; '
+               'it does not predict an actual stop/target WIN. Trend, market hours, transaction costs '
+               'and portfolio risks still govern every paper order.')
     sec_title('📒', 'Every commodity paper trade', 'original purchases, current holdings and closed results')
     if not etc_df.empty:
         journal = commodity_journal_view(etc_df)
@@ -4740,7 +4905,9 @@ with tab_commodity:
                            file_name='alpha_lse_commodity_trades.csv', mime='text/csv',
                            key='export_commodity_journal')
         st.markdown('**What its commodity history has taught it**')
-        st.caption('A separate, conservative rule reduces a product’s paper position size by half only after at least 20 closed trades and consistently weak recent results. It never increases position risk. This is not validated AI predictive learning.')
+        st.caption('Historical ETC market bars train the separate ML model; completed paper trade outcomes '
+                   'independently reduce risk after weak runs. The stock AI and commodity learning remain separate. '
+                   'ML only filters candidates and cannot bypass safeguards.')
         feedback_table=[]
         for ticker in COMMODITY_ETPS:
             subset=etc_df[etc_df['ticker']==ticker]
@@ -4929,7 +5096,14 @@ with brief_box:
          ("good" if perf_eq.get("net_gbp", 0) > 0 else ("bad" if perf_eq.get("net_gbp", 0) < 0 else "")) if perf_eq["n"] else "", ("pos" if perf_eq.get("net_gbp", 0) > 0 else ("neg" if perf_eq.get("net_gbp", 0) < 0 else "")) if perf_eq["n"] else ""),
     ])
     _comm_home = summarise_commodity_history(etc_df)
+    _home_ml_state = st.session_state.get('commodity_ml_state') or {}
+    _home_ml = _home_ml_state.get('champion')
+    _home_ml_text = ('ML champion v' + str(_home_ml.get('version')) if _home_ml else 'Rule-only fallback; model not promoted')
+    if _home_ml_state.get('champion_paused'):
+        _home_ml_text += ' (ML entries paused: failed validation)'
     st.markdown('**🪙 Commodities at a glance**')
+    st.caption('Commodity learning: ' + _home_ml_text + ' · ' +
+               str(st.session_state.get('commodity_ml_message','Historical model status pending')))
     score_cards([
         ('Open commodities', str(_comm_home['open']), 'currently monitored ETC positions', '', ''),
         ('Commodity P/L — open', gbp(_comm_home['unrealised_gbp'], sign=True), 'estimated, unrealised', 'good' if _comm_home['unrealised_gbp'] > 0 else ('bad' if _comm_home['unrealised_gbp'] < 0 else ''), ''),
@@ -5125,7 +5299,8 @@ with tab_learn:
         + (f"\n- **Confidence tuning:** based on {cal['decided']} trades that clearly won or lost." if cal else "")
         + f"\n- **Evidence learner:** {'in use' if ev_model.get('ready') else 'collecting evidence'} (see above)."
         + (f"\n- **Latest AI validation:** {state['validation_n']} later paper trades from {state['validation_start_date']}, excluding {state['purge_days']} days around the training boundary." if state.get('validation_n') else "\n- **Latest AI validation:** waiting for enough independent closed paper trades.")
-        + "\n- **Commodities:** the separate trend-rule strategy is not mixed into stock AI training.")
+        + "\n- **Commodities:** the separate historical ETC ML is tested and promoted only when it beats a baseline/champion. "
+          "It remains separate from the share AI; all trades are simulated.")
 
     with st.expander("How the AI picks a share"):
         st.markdown(

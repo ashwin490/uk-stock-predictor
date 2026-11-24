@@ -1,3 +1,5 @@
+**24 Nov commodity ML release:** See `COMMODITY_ML_SETUP.md` before deploying on Streamlit Cloud. The historical model needs a private Supabase Storage bucket and server-side model key to persist upgrades across restarts. No models are fabricated or included without actual training data.
+
 > **LATEST: 23 NOVEMBER commodities upgrade** — You must also copy `commodity_signals.py` and `option_retirement.py` (not only `app.py`). The US options tab is retired; commodity price/target/stop predictions replace it. See [COMMODITIES_AND_OPTIONS.md](COMMODITIES_AND_OPTIONS.md).
 
 > **IMPORTANT: 23 NOVEMBER 2026 RELEASE** — The complete replacement includes `app.py`, `feature_engine.py`, `intraday_exit.py`, `commodity_etps.py` and `requirements.txt`. **Copy the complete project, including the two additional commodity modules.** Back up your trade history, model and secrets first. Existing `rns_scraper.py` and model files remain untouched. No new learning picks. US call-option engine now removed. See [NOV23_UPDATE.md](NOV23_UPDATE.md).

@@ -1,3 +1,11 @@
+## New: Commodity ML learning (24 November 2026)
+
+A separate five-ETC historical ML learner is included in `commodity_ml.py`. It scores a **five-session, >1.5% gross ETC move**, not trade-win probability. No real money or broker APIs. It compares challengers with historical baselines, promotes only improving models, and stores the version in a private Supabase Storage bucket after readback verification. Until promoted, the existing conservative rule-based paper simulator is used. Historical trades and the share AI remain separate.
+
+**For Streamlit Cloud, you must complete the one-time private model bucket/Secrets setup:** see [COMMODITY_ML_SETUP.md](COMMODITY_ML_SETUP.md). Without it, durable self-learning cannot operate on Community Cloud. An always-on training service is not included; sessions must be active.
+
+---
+
 > **LATEST UPGRADE — 23 NOVEMBER 2026:** See [NOV23_UPDATE.md](NOV23_UPDATE.md). This project now includes `feature_engine.py` (the numerical-warning fix), `intraday_exit.py` (conservative one-minute paper exit detection), and `commodity_etps.py` (verified sterling-traded UK commodity ETCs). Historical learning-pick trades are kept visible, but no new experimental learning picks are purchased. **This earlier release had an options page; it has now been replaced by the commodities page.** Live Streamlit/Supabase and actual model accuracy are **not independently verified**.
 
 > **LATEST: Commodity auto paper-trading and options retirement** — See [COMMODITIES_AND_OPTIONS.md](COMMODITIES_AND_OPTIONS.md). Five UK-listed commodity ETCs now show indicative buy, sell and stop prices. Old US options are retired; archive and delete their history from Settings. No US options trades are generated. The strategy is unvalidated and paper-only.

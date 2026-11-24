@@ -67,7 +67,8 @@ def commodity_journal_view(df: pd.DataFrame) -> pd.DataFrame:
     """User-friendly full history including old and new trades; never overwrite rows."""
     columns = ['Bought on', 'Commodity', 'Symbol', 'Quantity', 'Buy (p)',
                'Invested (£)', 'Sell target (p)', 'Stop-loss (p)',
-               'Latest / exit (p)', 'Sold on', 'Paper P/L (£)', 'Paper P/L (%)', 'Result']
+               'Latest / exit (p)', 'Sold on', 'Paper P/L (£)', 'Paper P/L (%)',
+               'Strategy', 'ML model version', 'ML 5d event estimate (%)', 'Result']
     if df is None or df.empty:
         return pd.DataFrame(columns=columns)
     rows = []
@@ -89,12 +90,21 @@ def commodity_journal_view(df: pd.DataFrame) -> pd.DataFrame:
         label = rec.get('commodity_name') or ticker.replace('.L', '')
         bought = meta.get('entry_timestamp_london') or rec.get('timestamp') or rec.get('date_str') or 'Unknown'
         sold = rec.get('exit_timestamp') if kind != 'OPEN' else ''
+        strategy_code = str(meta.get('strategy_id') or meta.get('model_source') or '')
+        strategy = ('ML + trend rules' if strategy_code == 'COMMODITY_ETC_ML_V1'
+                    else 'Trend rules' if strategy_code == 'COMMODITY_ETC_TREND_V1'
+                    else 'Manual ETC' if 'MANUAL_ETC' in strategy_code
+                    else 'Legacy (unknown)' if not strategy_code else strategy_code)
+        ml_version = meta.get('commodity_ml_version')
+        ml_estimate = _number(meta.get('commodity_ml_probability'),float('nan'))
         rows.append({'Bought on': str(bought), 'Commodity': str(label), 'Symbol': ticker,
                      'Quantity': int(_number(rec.get('shares'))), 'Buy (p)': _number(rec.get('entry_price')),
                      'Invested (£)': round(spent,2), 'Sell target (p)': _number(rec.get('target_price')),
                      'Stop-loss (p)': _number(rec.get('stop_loss')), 'Latest / exit (p)': price,
                      'Sold on': str(sold or ''), 'Paper P/L (£)': round(spent * pct/100.0,2),
-                     'Paper P/L (%)': round(pct,2),
+                     'Paper P/L (%)': round(pct,2), 'Strategy': strategy,
+                     'ML model version': ml_version if ml_version is not None else '—',
+                     'ML 5d event estimate (%)': round(100*ml_estimate,1) if math.isfinite(ml_estimate) else None,
                      'Result': {'WON':'Won — target','LOST':'Lost — stop',
                                 'SAVED':'Protected exit','EXPIRED':'Expired',
                                 'OPEN':'Open','OTHER':'Review needed'}[kind]})
@@ -210,6 +220,16 @@ def commodity_signal_card_html(item: dict) -> str:
     quote = item.get('Current (p)', item.get('Buy (p)'))
     quote_date = str(item.get('Quote date') or 'date unavailable')
     quote_note = f'Latest available market quote · bar dated {quote_date} · may be delayed'
+    ml_status = str(item.get('ML status') or 'Historical ML model not yet validated')
+    forecast = _number(item.get('ML forecast (%)'), float('nan'))
+    threshold = _number(item.get('ML threshold (%)'), float('nan'))
+    if math.isfinite(forecast) and math.isfinite(threshold):
+        ml_details = (f'<div class="cm-learning"><b>Commodity ML:</b> '
+                      f'{e(f"{forecast:.1f}%")} estimated chance of a 5-session ETC gain '
+                      f'over 1.5% <b>before costs</b> · entry filter {e(f"{threshold:.1f}%")} · '
+                      f'{e(ml_status)}. Not a target-hit / trade-win probability.</div>')
+    else:
+        ml_details = f'<div class="cm-learning"><b>Commodity ML:</b> {e(ml_status)}</div>'
     trade_details = ''
     if mode == 'OPEN':
         trade_details = (f'<div class="cm-why"><b>Recorded paper trade:</b> '
@@ -228,6 +248,7 @@ def commodity_signal_card_html(item: dict) -> str:
       <div><small>{e(target_label)}</small><b>{e(fmt_price(item.get('Sell target (p)')))}</b></div>
       <div><small>{e(stop_label)}</small><b>{e(fmt_price(item.get('Stop-loss (p)')))}</b></div></div>
       <div class="cm-learning">{e(quote_note)}</div>
+      {ml_details}
       <div class="cm-details"><span>Trend: <b>{e(item.get('Trend checks','—'))}</b></span><span>Quantity: <b>{int(_number(item.get('Units'))):,}</b></span><span>Paper spend: <b>£{_number(item.get('Paper amount (£)')):,.2f}</b></span></div>
       {trade_details}
       <div class="cm-why"><b>Why:</b> {e(explanation)}</div>

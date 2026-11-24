@@ -1,3 +1,14 @@
+## 2026-11-24 — Separate commodity historical ML and guarded automatic model upgrades
+
+- New `commodity_ml.py`: five GBp-listed ETC historical training, causal daily features, matured five-session labels, embargoed chronological testing, interpretable log-loss/Brier gate and versioned JSON champions.
+- Separate from the original share AI and from the commodity trend checks; no real broker orders. A promoted model filters (never overrides) all existing trend, cost, market-hours, quote-freshness and risk checks.
+- Private Supabase Storage model JSON persistence with readback verification; failed remote saves never activate a new champion. Local mode uses atomic JSON files; no untrusted pickle downloads.
+- Existing completed ETC trade outcomes keep their conservative risk feedback; new ML trades record the historical model version and specific 5-day event estimate in the paper journal.
+- Model validation can pause new ML entries when independent later observations deteriorate. Card details explain WAIT vs open recorded trades.
+- Added setup guide and offline leakage, storage and promotion tests. **No real provider data was available to pretrain a model in the build environment.** Cloud training runs on genuine verified ETC history only after one-time private bucket/Secrets setup.
+
+---
+
 # Final reliability pass — 20 November 2026
 
 - All fixes from the prior audit release are included.
