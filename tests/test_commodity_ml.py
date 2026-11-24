@@ -12,7 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from commodity_ml import (PRODUCTS, MODEL_SCHEMA, FEATURE_NAMES, CommodityMLStore,
                           clean_completed_bars, make_dataset, _features, _fit_model,
                           predict_proba, latest_forecast, _split_by_date,
-                          train_or_update, validate_model)
+                          train_or_update, validate_model,
+                          backfill_research_preview)
 
 
 def bars(n=700, seed=1):
@@ -197,3 +198,62 @@ def test_source_integration_never_reuses_stock_ml_or_overrides_securities():
     assert 'CommodityMLQualified' in app
     assert 'CommodityRuleQualified' in app
     assert 'is_entry_window_open()' in app
+
+
+def test_rejected_candidate_has_research_predictions_but_no_champion():
+    today=date(2026,11,24)
+    state, report, _ = train_or_update(histories(), {}, today)
+    assert not report['promoted'], 'Synthetic regression fixture expects failed challenger'
+    assert state.get('champion') is None
+    assert state['research_model']['research_only'] is True
+    assert state['last_evaluation']['research_evidence']['by_product']
+    assert len(state['last_evaluation']['research_evidence']['recent_examples']) == 15
+    assert sum(p['tested'] for p in report['research_evidence']['by_product']) == report['test_count']
+    # Rejected research-only forecasts are explicitly separate from a trading champion.
+    assert 'champion' not in state
+
+
+def test_research_evidence_remains_when_waiting_for_new_independent_dates():
+    today=date(2026,11,24)
+    state, report, _ = train_or_update(histories(), {}, today)
+    old=state['last_evaluation']['research_evidence']
+    new_state, waiting, _ = train_or_update(histories(), state, date(2026,11,25))
+    assert 'Waiting for enough' in waiting['status']
+    assert new_state['last_evaluation']['research_evidence'] == old
+    assert new_state['research_model'] == state['research_model']
+
+
+def test_backfill_old_rejected_cloud_state_keeps_promotion_watermark_and_state():
+    today=date(2026,11,24)
+    generated, report, _ = train_or_update(histories(), {}, today)
+    old = {k:v for k,v in generated.items() if k not in ('research_model','last_evaluation')}
+    before = old.get('evaluated_through')
+    backfilled, changed = backfill_research_preview(histories(),old,today)
+    assert changed
+    assert backfilled['research_model']['research_only']
+    assert backfilled['last_evaluation']['research_evidence']['recent_examples']
+    assert backfilled.get('champion') == old.get('champion')
+    assert backfilled.get('evaluated_through') == before
+    assert backfilled['last_attempt_day'] == old['last_attempt_day']
+    again, changed_again = backfill_research_preview(histories(),backfilled,today)
+    assert not changed_again and again == backfilled
+
+
+def test_research_card_is_explicitly_unvalidated_and_not_trade_win():
+    from commodity_dashboard import commodity_signal_card_html
+    html=commodity_signal_card_html({'Commodity':'Gold','Ticker':'SGLN.L','Decision':'WAIT',
+                                    'ML research forecast (%)':47.8,
+                                    'ML research threshold (%)':57.0,
+                                    'ML research bar date':'2026-11-23','Current (p)':4500})
+    assert '47.8%' in html and '57.0%' in html and '2026-11-23' in html
+    assert 'EXPERIMENTAL ML' in html and 'Candidate failed historical validation' in html
+    assert 'cannot approve a paper buy' in html and 'Not a trade-win probability' in html
+
+
+def test_research_only_model_never_assigned_to_trade_filter():
+    app=(Path(__file__).resolve().parents[1]/'app.py').read_text()
+    assert "research_model = (st.session_state.get('commodity_ml_state') or {}).get('research_model')" in app
+    assert "if not champion and research_model:" in app
+    assert "ml_qualified = bool(champion and ml_enabled" in app
+    assert "store.save(_new_state)" in app
+    assert "backfill_research_preview" in app

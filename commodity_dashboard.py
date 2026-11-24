@@ -229,7 +229,19 @@ def commodity_signal_card_html(item: dict) -> str:
                       f'over 1.5% <b>before costs</b> · entry filter {e(f"{threshold:.1f}%")} · '
                       f'{e(ml_status)}. Not a target-hit / trade-win probability.</div>')
     else:
-        ml_details = f'<div class="cm-learning"><b>Commodity ML:</b> {e(ml_status)}</div>'
+        research_probability = _number(item.get('ML research forecast (%)'), float('nan'))
+        research_threshold = _number(item.get('ML research threshold (%)'), float('nan'))
+        research_date = str(item.get('ML research bar date') or 'date unavailable')
+        if math.isfinite(research_probability):
+            cutoff_text = (f' · experimental threshold {e(f"{research_threshold:.1f}%")}'
+                           if math.isfinite(research_threshold) else '')
+            ml_details = (f'<div class="cm-learning"><b>EXPERIMENTAL ML — NOT VALIDATED:</b> '
+                          f'{e(f"{research_probability:.1f}%")} estimated chance of an ETC gain over '
+                          f'1.5% across five sessions <b>before costs</b>{cutoff_text}, based on completed bars '
+                          f'through {e(research_date)}. <b>Candidate failed historical validation;</b> '
+                          f'this estimate cannot approve a paper buy. Not a trade-win probability.</div>')
+        else:
+            ml_details = f'<div class="cm-learning"><b>Commodity ML:</b> {e(ml_status)}</div>'
     trade_details = ''
     if mode == 'OPEN':
         trade_details = (f'<div class="cm-why"><b>Recorded paper trade:</b> '

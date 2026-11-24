@@ -20,7 +20,8 @@ from intraday_exit import first_intraday_exit
 from commodity_etps import COMMODITY_ETPS, FUTURES_REFERENCES, is_commodity_etc
 from commodity_signals import evaluate_commodity_signal, STRATEGY_NAME
 from commodity_ml import (CommodityMLStore, STRATEGY_NAME_ML,
-                          train_or_update, latest_forecast, validate_model)
+                          train_or_update, latest_forecast, validate_model,
+                          backfill_research_preview)
 from commodity_dashboard import (commodity_signal_card_html, commodity_journal_view,
                                  summarise_commodity_history, assess_commodity_history,
                                  decorate_commodity_card)
@@ -106,7 +107,7 @@ POSITION_SIZE_GBP = 500.0   # backward compatibility when reading old trades
 MIN_POSITION_SIZE_GBP = 1.0
 REQUIRE_DURABLE_CLOUD = (STORAGE_MODE == "cloud")  # cloud mode requires Supabase; local uses persistent DuckDB
 DATA_FRESHNESS_HOURS = 30               # non-trading-day data can be older; new entries still need today's bar
-APP_VERSION = "2026.11.24-commodity-ml-v1"
+APP_VERSION = "2026.11.24-commodity-ml-v1.1-research"
 
 def load_paper_settings() -> dict:
     """Persist virtual-account configuration independent of browser sessions."""
@@ -4503,6 +4504,23 @@ def _prepare_commodity_ml():
         store = _get_commodity_ml_store()
         state = store.load()
         st.session_state['commodity_ml_state'] = state
+        # First upgrade from v1: old cloud state has already been evaluated
+        # today, but held-out examples and its rejected research model were not
+        # stored. Backfill RESEARCH ONLY immediately without changing the
+        # champion/promotion/watermark; persist before showing any forecasts.
+        _prior_test = (state.get('last_evaluation') or state.get('report') or {})
+        if (not state.get('champion') and not state.get('research_model')
+                and _prior_test.get('test_count')):
+            _history = {}
+            for _ticker in COMMODITY_ETPS:
+                _bars = fetch_cached_history(_ticker, '5y')
+                if _bars is not None and not _bars.empty and _bars.attrs.get('price_currency') == 'GBp':
+                    _history[_ticker] = _bars
+            _new_state, _changed = backfill_research_preview(_history, state, today)
+            if _changed:
+                store.save(_new_state)
+                state = _new_state
+                st.session_state['commodity_ml_state'] = state
         if state.get('last_attempt_day') == today.isoformat():
             st.session_state['commodity_ml_message'] = str((state.get('report') or {}).get('status','Model checked'))
             return
@@ -4575,6 +4593,8 @@ def commodity_idea(ticker: str, *, refresh: bool = False) -> dict:
            "Potential net return (%)": None, "History note": feedback.note,
            "ML status": "No validated commodity model yet; trend rules remain the fallback",
            "ML forecast (%)": None, "ML threshold (%)": None,
+           "ML research forecast (%)": None, "ML research bar date": None,
+           "ML research threshold (%)": None,
            "ML version": None, "_order": None}
     h = _download_history_raw(ticker, '6mo') if refresh else fetch_cached_history(ticker, '6mo')
     if h is None or h.empty or not isinstance(h.index, pd.DatetimeIndex):
@@ -4637,6 +4657,21 @@ def commodity_idea(ticker: str, *, refresh: bool = False) -> dict:
         except (ValueError, TypeError, KeyError) as exc:
             out['ML status'] = 'ML data not verified; automatic ML-filtered entry paused'
             LOGGER.warning('ETC model forecast unavailable for %s: %s',ticker,type(exc).__name__)
+    # RESEARCH ONLY: display candidate forecast from past prices even when its
+    # holdout test lost to the baseline. Never set champion, ml_forecast or an
+    # order approval based on this unvalidated model.
+    research_model = (st.session_state.get('commodity_ml_state') or {}).get('research_model')
+    if not champion and research_model:
+        try:
+            validate_model(research_model)
+            preview = latest_forecast(research_model, ticker, completed, today)
+            out['ML research forecast (%)'] = round(preview['probability'] * 100, 1)
+            out['ML research threshold (%)'] = round(preview['threshold'] * 100, 1)
+            out['ML research bar date'] = preview['bar_date']
+            out['ML status'] = 'Experimental historical ML preview; candidate FAILED validation and cannot authorise buys'
+        except (ValueError, TypeError, KeyError) as exc:
+            out['ML status'] = 'Research ML preview unavailable: verified historical features missing'
+            LOGGER.info('Research preview unavailable for %s: %s', ticker, type(exc).__name__)
     if evaluation.action != 'BUY_CANDIDATE':
         out['Decision'] = 'WAIT — trend/risk rules'
         return out
@@ -4742,6 +4777,8 @@ def scan_commodity_ideas(*, auto_record: bool):
                           "History note":"No reliable signal available",
                           "ML status":"Price data unavailable; ML forecast not possible",
                           "ML forecast (%)": None, "ML threshold (%)": None,
+                          "ML research forecast (%)": None, "ML research threshold (%)": None,
+                          "ML research bar date": None,
                           "ML version": None, "_order": None})
     st.session_state['commodity_ideas'] = ideas
     st.session_state['commodity_scan_ts'] = london_now().strftime('%d %b %H:%M:%S')
@@ -4875,7 +4912,9 @@ with tab_commodity:
                    'no unsafe upgrade has been made.')
     if _ml_champion:
         st.caption('Last verified: ' + str(_ml_state.get('champion_last_confirmed_day') or _ml_champion.get('promoted_day','unknown')))
-    _ml_report = _ml_state.get('report') or {}
+    # Retain the last true held-out test when subsequent days are merely
+    # waiting for fresh labels. These are research predictions, not paper P/L.
+    _ml_report = _ml_state.get('last_evaluation') or _ml_state.get('report') or {}
     if _ml_report.get('test_count'):
         score = _ml_report.get('challenger') or {}
         baseline = _ml_report.get('baseline') or {}
@@ -4883,8 +4922,34 @@ with tab_commodity:
                    f"across {_ml_report.get('test_days','?')} dates from {_ml_report.get('test_from','?')}; "
                    f"candidate Brier {score.get('brier',0):.3f} vs constant baseline {baseline.get('brier',0):.3f}. "
                    'Lower is better. Historical results do not guarantee live accuracy.')
+    _research_evidence = _ml_report.get('research_evidence') or {}
+    if _research_evidence.get('by_product'):
+        st.markdown('**Historical ML test predictions — research only**')
+        st.caption('These probabilities were calculated on later historical dates that were excluded from model training. '
+                   'A predicted rise means the rejected candidate crossed its experimental cutoff; '
+                   'it does NOT mean it was a profitable paper trade.')
+        _historic = pd.DataFrame(_research_evidence['by_product']).rename(columns={
+            'ticker':'ETC', 'tested':'Tested days', 'predicted_rises':'Predicted rises',
+            'correct_rises':'Predicted rises that occurred', 'actual_rises':'Actual rises',
+            'brier':'Brier score'})
+        st.dataframe(_historic, width='stretch', hide_index=True)
+    if _research_evidence.get('recent_examples'):
+        with st.expander('See dated historical ML forecasts and what happened'):
+            _samples = pd.DataFrame(_research_evidence['recent_examples']).rename(columns={
+                'date':'Historical date', 'ticker':'ETC',
+                'predicted_chance_pct':'Predicted probability (%)',
+                'predicted_rise':'Above experimental cutoff',
+                'actual_five_session_pct':'Actual 5-session change (%)',
+                'event_happened':'Rise over 1.5% occurred'})
+            st.dataframe(_samples, width='stretch', hide_index=True)
+            st.caption('This is an illustrative held-out sample from the most recent historical test, '
+                       'not a complete trading backtest; costs and intraday stop/targets are excluded.')
     if STORAGE_MODE == 'cloud' and not _ml_champion:
-        st.caption('For automatic upgrades to survive Streamlit Cloud restarts, configure the private Supabase model bucket and server-side model key. See COMMODITY_ML_SETUP.md.')
+        if _ml_state.get('last_attempt_day'):
+            st.caption('Cloud model-state history exists. No validated champion has passed promotion yet; '
+                       'the rejected research forecasts cannot authorise ML-filtered purchases.')
+        else:
+            st.caption('Cloud model-state access has not been verified. Check the private Supabase bucket and server-side model key.')
     st.caption('ML predicts whether an ETC closes >1.5% higher after five sessions, BEFORE costs; '
                'it does not predict an actual stop/target WIN. Trend, market hours, transaction costs '
                'and portfolio risks still govern every paper order.')

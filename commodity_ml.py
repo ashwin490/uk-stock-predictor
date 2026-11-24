@@ -246,6 +246,43 @@ def _split_by_date(rows: pd.DataFrame, earliest_test_after: str | None):
     return train, test, test_start
 
 
+def _historical_research_evidence(test: pd.DataFrame, probabilities: np.ndarray, prior: float) -> dict:
+    """Compact truly held-out forecasts and outcomes; never a trading strategy P/L.
+
+    Each forecast was made by a candidate fit on earlier feature dates only.
+    Only a small recent sample is saved so cloud state stays within its limit.
+    """
+    threshold = min(0.80, max(0.57, float(prior) + 0.05))
+    observed = test[['ticker', 'feature_date', 'label', 'future_return']].copy()
+    observed['probability'] = np.asarray(probabilities, dtype=float)
+    observed['flagged'] = observed['probability'] >= threshold
+    per_product = []
+    for ticker in PRODUCTS:
+        subset = observed.loc[observed['ticker'] == ticker]
+        if subset.empty:
+            continue
+        picked = subset.loc[subset['flagged']]
+        per_product.append({
+            'ticker': ticker,
+            'tested': int(len(subset)),
+            'predicted_rises': int(len(picked)),
+            'correct_rises': int(picked['label'].sum()),
+            'actual_rises': int(subset['label'].sum()),
+            'brier': round(float(np.mean((subset['probability'].to_numpy() - subset['label'].to_numpy()) ** 2)), 4),
+        })
+    # Last three known outcomes from each ETC, chronological test data only.
+    last = observed.groupby('ticker', sort=False).tail(3).sort_values(['feature_date', 'ticker'])
+    examples = [{
+        'date': str(r.feature_date), 'ticker': str(r.ticker),
+        'predicted_chance_pct': round(float(r.probability) * 100, 1),
+        'predicted_rise': bool(r.flagged),
+        'actual_five_session_pct': round(float(r.future_return) * 100, 2),
+        'event_happened': bool(r.label),
+    } for r in last.itertuples(index=False)]
+    return {'threshold_pct': round(threshold * 100, 1),
+            'by_product': per_product, 'recent_examples': examples}
+
+
 def _is_better(candidate: dict, comparator: dict, *, first: bool) -> bool:
     # Reject modest differences likely to be noise; Brier and logloss must both
     # improve. With first model baseline is a constant trained prior.
@@ -294,7 +331,9 @@ def train_or_update(histories: Mapping[str, pd.DataFrame], old_state: dict | Non
     comparator_metrics = _metrics(test['label'], predict_proba(incumbent, test)) if incumbent else baseline
     pass_gate = (_is_better(candidate_metrics, baseline, first=True)
                  and _is_better(candidate_metrics, comparator_metrics, first=incumbent is None))
-    report.update({'trained_count':len(train), 'test_count':len(test),
+    research_evidence = _historical_research_evidence(test, pred, base_rate)
+    report.update({'research_evidence': research_evidence,
+                   'trained_count':len(train), 'test_count':len(test),
                    'test_days':test['feature_date'].nunique(), 'test_from':test_start,
                    'test_through':test['feature_date'].max(), 'base_rate':round(base_rate,4),
                    'baseline':baseline, 'challenger':candidate_metrics,
@@ -319,12 +358,20 @@ def train_or_update(histories: Mapping[str, pd.DataFrame], old_state: dict | Non
         # merely after the latest labelled feature date (five days earlier).
         state['evaluated_through'] = promoted['market_data_through']
         state['previous_champion'] = incumbent
+        # A validated champion supersedes the unvalidated research preview.
+        state.pop('research_model', None)
         state['champion'] = promoted
         state['champion_last_confirmed_day'] = today.isoformat()
         state['champion_paused'] = False
         state['version'] = version
         report['status'] = f'Version {version} promoted after independent historical evaluation'
     else:
+        # Show the user's historical-data research estimates immediately, even
+        # though this rejected model NEVER authorises a paper purchase.
+        # Fit only on fully matured history; today's unfinished bar is excluded.
+        state['research_model'] = _fit_model(dataset)
+        state['research_model']['research_only'] = True
+        state['research_model']['created_day'] = today.isoformat()
         report['status'] = 'Challenger rejected: did not beat baseline and current champion'
         if incumbent:
             # An incumbent must continue to earn trust on genuinely later data.
@@ -335,8 +382,56 @@ def train_or_update(histories: Mapping[str, pd.DataFrame], old_state: dict | Non
                 state['champion_last_confirmed_day'] = today.isoformat()
             else:
                 report['status'] += '; incumbent also failed baseline, new ML buys paused'
+    # Keep the last evaluated predictions visible even while awaiting 22 NEW
+    # test days; do not silently erase evidence on tomorrow's rerun.
+    state['last_evaluation'] = report
     state['report'] = report
     return state, report, True
+
+
+def backfill_research_preview(histories: Mapping[str, pd.DataFrame],
+                              old_state: dict, today: date) -> tuple[dict, bool]:
+    """Expose a pre-existing rejected test without re-running model promotion.
+
+    Older release states stored test metrics but not test-date predictions or a
+    rejected model. This migration ONLY adds research evidence; neither the
+    promotion gate, validation watermark, nor live trading status changes.
+    """
+    state = dict(old_state)
+    previous = state.get('last_evaluation') or state.get('report') or {}
+    if state.get('champion') or state.get('research_model') or not previous.get('test_count'):
+        return state, False
+    dataset, usable = make_dataset(histories, today)
+    if len(usable) < 3 or len(dataset) < MIN_TRAIN + MIN_TEST:
+        return state, False
+    pair = _split_by_date(dataset, None)
+    if pair is None:
+        return state, False
+    train, test, start = pair
+    candidate = _fit_model(train)
+    pred = predict_proba(candidate, test)
+    prior = float(train['label'].mean())
+    historical = _historical_research_evidence(test, pred, prior)
+    # Only attach predictions to old scores when the holdout dates match.
+    # Otherwise mark this explicitly as a new display-only evaluation.
+    same_test = (str(previous.get('test_from')) == str(start)
+                 and int(previous.get('test_count') or 0) == len(test))
+    report = dict(previous) if same_test else {
+        'status': 'Display-only historical research test; NOT model validation or promotion',
+        'test_from': start, 'test_count': len(test),
+        'test_days': int(test['feature_date'].nunique()),
+        'test_through': str(test['feature_date'].max()),
+        'baseline': _metrics(test['label'], np.full(len(test), prior)),
+        'challenger': _metrics(test['label'], pred),
+        'promoted': False,
+    }
+    report['research_evidence'] = historical
+    report['research_backfilled'] = True
+    state['last_evaluation'] = report
+    state['research_model'] = _fit_model(dataset)
+    state['research_model']['research_only'] = True
+    state['research_model']['created_day'] = today.isoformat()
+    return state, True
 
 
 class CommodityMLStore:
@@ -373,6 +468,8 @@ class CommodityMLStore:
             raise ValueError('Invalid commodity model state')
         if obj.get('champion'):
             validate_model(obj['champion'])
+        if obj.get('research_model'):
+            validate_model(obj['research_model'])
         return obj
 
     def save(self, state: dict) -> None:
@@ -380,6 +477,8 @@ class CommodityMLStore:
             raise ValueError('Invalid commodity model state')
         if state.get('champion'):
             validate_model(state['champion'])
+        if state.get('research_model'):
+            validate_model(state['research_model'])
         payload = json.dumps(state, sort_keys=True, separators=(',', ':'), allow_nan=False).encode('utf-8')
         if len(payload) > 250000:
             raise ValueError('Oversized commodity model state')
