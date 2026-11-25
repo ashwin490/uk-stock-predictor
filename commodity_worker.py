@@ -58,6 +58,39 @@ def is_after_close(now: datetime) -> bool:
     return now.astimezone(timezone.utc) >= close + timedelta(minutes=35)
 
 
+def latest_verified_closed_session(now: datetime) -> date | None:
+    """Most recent XLON session whose *official* close + feed buffer has passed.
+
+    A GitHub schedule can be delayed past midnight. The research date must be
+    derived from the exchange calendar, NOT from the runner's local date.
+    Vendor OHLCV dates are still verified separately before any forecast save.
+    """
+    import exchange_calendars as xcals
+    if now.tzinfo is None:
+        raise ValueError('Scheduler timestamp must be timezone-aware')
+    cal = xcals.get_calendar('XLON')
+    local_day = now.astimezone(LONDON).date()
+    sessions = cal.sessions_in_range(
+        pd.Timestamp(local_day - timedelta(days=14)), pd.Timestamp(local_day))
+    cutoff = now.astimezone(timezone.utc) - timedelta(minutes=35)
+    for session in reversed(sessions):
+        close = cal.session_close(session).to_pydatetime()
+        if close <= cutoff:
+            return session.date()
+    return None
+
+
+def completed_history_through(bars: pd.DataFrame, session: date) -> pd.DataFrame:
+    """Exclude every later bar, including an unfinished current-session bar.
+
+    Crucial to prevent a delayed scheduler from accidentally training on a
+    newer partial day's quotes when issuing an older as-of close forecast.
+    """
+    if not isinstance(bars.index, pd.DatetimeIndex):
+        raise ValueError('Historical price index is not dated')
+    return bars.loc[bars.index.normalize() <= pd.Timestamp(session)].copy()
+
+
 def normalize_lse_bars(bars: pd.DataFrame, currency: str, ticker: str):
     if currency in ('GBp', 'GBX'):
         factor = 1.0
@@ -380,23 +413,27 @@ def save_health(bucket, mode, success, today, *, detail=None):
 
 def daily_worker(client, bucket, now):
     local = now.astimezone(LONDON)
-    if not is_after_close(now):
-        LOG.info('Not an after-close XLON trading session; daily ML skipped')
-        return {'status':'not_after_close'}
+    research_day = latest_verified_closed_session(now)
+    if research_day is None:
+        LOG.info('No completed XLON session eligible for daily ML yet')
+        return {'status':'no_verified_completed_session'}
+    LOG.info('Commodity daily target session: %s (worker ran %s)',
+             research_day.isoformat(), now.astimezone(timezone.utc).isoformat())
     histories, failures = fetch_histories('5y')
     if len(histories) < 3:
         raise RuntimeError('Fewer than three verified ETC price histories')
     # Fail closed on a stale Yahoo daily bar. Never label an incomplete session.
-    required_date = local.date().isoformat()
-    fresh = {t:b for t,b in histories.items() if b.index[-1].date().isoformat() == required_date}
+    required_date = research_day.isoformat()
+    histories = {t: completed_history_through(b, research_day) for t, b in histories.items()}
+    fresh = {t:b for t,b in histories.items() if len(b) and b.index[-1].date() == research_day}
     if len(fresh) < 3:
-        raise RuntimeError('Fewer than three ETCs have a completed bar dated today')
+        raise RuntimeError('Fewer than three ETCs have a completed bar for target XLON session ' + required_date)
     histories = fresh
     store = CommodityMLStore('_unused.json', cloud_mode=True, bucket=bucket)
     old = store.load()
-    # After official close today's last completed bar is usable: pass tomorrow
-    # to the trainer, which excludes bars >=today argument.
-    effective_day = local.date() + timedelta(days=1)
+    # After the target session's official close, its completed bar is usable.
+    # Pass the following date so the trainer excludes all bars >= that date.
+    effective_day = research_day + timedelta(days=1)
     proposed, report, should_save = train_or_update(histories, old, effective_day)
     if should_save:
         store.save(proposed)  # Must persist before any model promotion is visible.
@@ -419,11 +456,15 @@ def daily_worker(client, bucket, now):
                                   'event':f['event']})
             except (ValueError, TypeError, KeyError):
                 LOG.warning('No ML forecast for %s', t)
-    added = append_forecasts(bucket, forecasts) if forecasts else 0
-    save_json(bucket, LATEST_KEY, {'schema':1, 'as_of':required_date,'forecasts':forecasts,
+    if not forecasts:
+        raise RuntimeError('No commodity forecasts generated for completed session ' + required_date)
+    added = append_forecasts(bucket, forecasts)
+    save_json(bucket, LATEST_KEY, {'schema':1, 'as_of':required_date,
+                                    'processed_utc':now.astimezone(timezone.utc).isoformat(),
+                                    'forecasts':forecasts,
                                     'status':str(report.get('status','Model unchanged'))})
-    matured, total = collect_outcomes(bucket, histories, local.date())
-    score = historical_scorecard(bucket, local.date())
+    matured, total = collect_outcomes(bucket, histories, research_day)
+    score = historical_scorecard(bucket, research_day)
     save_json(bucket, 'research/scorecard_v1.json', {'schema':1,'as_of':required_date, **score})
     # Forward-dated research scores are not a buy strategy backtest. If a
     # validated champion develops a strong record of poor probability estimates,
@@ -450,7 +491,9 @@ def daily_worker(client, bucket, now):
         save_json(bucket, f'backups/model_states/{required_date}.json', proposed, immutable=True)
     detail = {'data_tickers':len(histories),'missing_tickers':list(failures),
               'forecasts_saved':added,'outcomes_saved':matured, 'model_status':str(report.get('status',''))[:120]}
-    save_health(bucket, 'daily', True, local.date(), detail=detail)
+    detail['target_session'] = required_date
+    detail['worker_ran_utc'] = now.astimezone(timezone.utc).isoformat()
+    save_health(bucket, 'daily', True, research_day, detail=detail)
     LOG.info('Daily research completed: %s', detail)
     return detail
 

@@ -17,7 +17,8 @@ import math
 import pandas as pd
 
 from commodity_worker import (connection_from_env, read_json, save_json, calendar_session,
-                              is_after_close, future_label, alert)
+                              latest_verified_closed_session, completed_history_through,
+                              future_label, alert)
 from share_research import (training_rows, train_candidate, latest_predictions,
                             predict, reconcile_paper_equity_rows, HORIZON, GAIN, FEATURES)
 
@@ -244,21 +245,26 @@ def health(bucket,mode:str,ok:bool,today,details=None):
 
 
 def daily(bucket,now,*,fetcher=fetch_universe):
-    if not is_after_close(now):
-        return {'status':'not_after_verified_exchange_close'}
+    research_day = latest_verified_closed_session(now)
+    if research_day is None:
+        return {'status':'no_verified_completed_session'}
     from zoneinfo import ZoneInfo
-    local=now.astimezone(ZoneInfo('Europe/London'))
-    day=local.date().isoformat()
+    day=research_day.isoformat()
+    LOG.info('Share daily target session: %s (worker ran %s)',
+             day, now.astimezone(timezone.utc).isoformat())
     tickers=available_universe()
-    histories,failures=fetcher(tickers,'3y')
-    today_data={t:b for t,b in histories.items() if len(b) and b.index[-1].date().isoformat()==day}
+    raw_histories,failures=fetcher(tickers,'3y')
+    # Never train on a bar after the intended as-of date (possibly a newer,
+    # unfinished session when GitHub starts late).
+    histories={t:completed_history_through(b,research_day) for t,b in raw_histories.items()}
+    today_data={t:b for t,b in histories.items() if len(b) and b.index[-1].date()==research_day}
     if len(today_data)<max(12,min(30,len(tickers)//4)):
-        raise RuntimeError('Insufficient complete same-day UK share price feeds')
+        raise RuntimeError('Insufficient complete UK share price feeds for target XLON session '+day)
     # Training data must be complete and adjusted, never today's partial bars.
     import exchange_calendars as xcals
     cal=xcals.get_calendar('XLON')
     start=min(b.index[0].date() for b in histories.values())
-    sessions=cal.sessions_in_range(pd.Timestamp(start),pd.Timestamp(local.date()))
+    sessions=cal.sessions_in_range(pd.Timestamp(start),pd.Timestamp(research_day))
     prepared=[training_rows(t,b,sessions) for t,b in histories.items()]
     parts=[p for p in prepared if not p.empty]
     if not parts:
@@ -266,7 +272,7 @@ def daily(bucket,now,*,fetcher=fetch_universe):
     df=pd.concat(parts,ignore_index=True)
     state=read_json(bucket,STATE,{'schema':1,'champion':None,'research_model':None})
     last=state.get('last_training_date')
-    due=not last or (local.date()-pd.Timestamp(last).date()).days >= 30
+    due=not last or (research_day-pd.Timestamp(last).date()).days >= 30
     decision='retained previous model'
     if due:
         candidate,meta=train_candidate(df)
@@ -313,12 +319,16 @@ def daily(bucket,now,*,fetcher=fetch_universe):
     for p in new_predictions:
         p['validated']=bool(state.get('champion') and not state.get('champion_paused'))
         p['strategy']='share_price_event_v1'
+    if not new_predictions:
+        raise RuntimeError('No UK share forecasts generated for completed session ' + day)
     added=append_predictions(bucket,new_predictions)
-    save_json(bucket,FORECASTS,{'schema':1,'as_of':day,'forecasts':new_predictions,
+    save_json(bucket,FORECASTS,{'schema':1,'as_of':day,
+                                'processed_utc':now.astimezone(timezone.utc).isoformat(),
+                                'forecasts':new_predictions,
                                 'universe_count':len(tickers), 'verified_count':len(today_data),
                                 'decision':decision,'failed_feed_count':len(failures)})
-    matured,count=mature_outcomes(bucket,histories,local.date())
-    sc=scorecard(bucket,local.date(),
+    matured,count=mature_outcomes(bucket,histories,research_day)
+    sc=scorecard(bucket,research_day,
                  champion_version=(state.get('champion') or {}).get('version'))
     selected_shadow=(sc.get('shadow_by_version') or {}).get(
         (state.get('challenger') or {}).get('version'),{})
@@ -341,10 +351,11 @@ def daily(bucket,now,*,fetcher=fetch_universe):
             save_json(bucket,STATE,state)
             alert('UK-share forward forecast quality deteriorated; ML advisory paused')
     save_json(bucket,SCORE,{'schema':1,'as_of':day,**sc})
-    details={'coverage':len(today_data),'universe':len(tickers),
+    details={'target_session':day,'worker_ran_utc':now.astimezone(timezone.utc).isoformat(),
+             'coverage':len(today_data),'universe':len(tickers),
              'saved':added,'matured_added':matured,'total_resolved':count,
              'decision':decision}
-    health(bucket,'daily',True,local.date(),details)
+    health(bucket,'daily',True,research_day,details)
     return details
 
 
