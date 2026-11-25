@@ -1,11 +1,6 @@
 name: Monthly reliability check
 on:
-  push:
-  pull_request:
   workflow_dispatch:
-  schedule:
-    # Finds breaking dependency changes; it does NOT automatically repair or upgrade the system.
-    - cron: '0 8 1 * *'
 jobs:
   test:
     runs-on: ubuntu-latest

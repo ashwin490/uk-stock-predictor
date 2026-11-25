@@ -9,12 +9,8 @@ on:
         default: daily
         options: [check, daily, monitor, health, backup]
   schedule:
-    # GitHub schedules use UTC and can be late/dropped. Runtime checks London XLON calendar.
-    - cron: '17 8-16 * * 1-5'
-    - cron: '43 18 * * 1-5'
+    # Single end-of-day research run on UK weekdays, in UTC.
     - cron: '13 20 * * 1-5'
-    - cron: '29 11 * * 1-5'
-    - cron: '23 20 * * 0'
 concurrency:
   group: alpha-lse-commodity-worker
   cancel-in-progress: false
@@ -36,18 +32,17 @@ jobs:
           python-version: '3.11'
           cache: pip
       - run: python -m pip install -r requirements-worker.txt
-      - name: Market research scan (independent of the Streamlit browser)
-        if: github.event_name == 'schedule' && github.event.schedule == '17 8-16 * * 1-5'
-        run: python commodity_worker.py --mode monitor
       - name: Daily model research and five-session outcome audit
-        if: github.event_name == 'schedule' && (github.event.schedule == '43 18 * * 1-5' || github.event.schedule == '13 20 * * 1-5')
+        if: github.event_name == 'schedule'
         run: python commodity_worker.py --mode daily
-      - name: Scheduled worker heartbeat check
-        if: github.event_name == 'schedule' && github.event.schedule == '29 11 * * 1-5'
-        run: python commodity_worker.py --mode health
-      - name: Weekly backup of complete Supabase paper journal
-        if: github.event_name == 'schedule' && github.event.schedule == '23 20 * * 0'
-        run: python commodity_worker.py --mode backup
+      - name: Weekly journal backup within the same scheduled run
+        if: github.event_name == 'schedule'
+        run: |
+          if [ "$(date -u +%u)" = '5' ]; then
+            python commodity_worker.py --mode backup
+          else
+            echo 'Backup scheduled for Friday within this workflow run.'
+          fi
       - name: On-demand worker run
         if: github.event_name == 'workflow_dispatch'
         run: python commodity_worker.py --mode '${{ inputs.mode }}'

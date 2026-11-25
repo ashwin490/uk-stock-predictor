@@ -9,11 +9,8 @@ on:
         default: check
         options: [check, daily, audit, monitor]
   schedule:
-    # Scheduled times are UTC; share_worker checks actual XLON close.
-    - cron: '7 19 * * 1-5'
+    # Single end-of-day research run on UK weekdays, in UTC.
     - cron: '47 20 * * 1-5'
-    - cron: '23 12 * * 1-5'
-    - cron: '31 19 * * 0'
 concurrency:
   group: alpha-lse-share-research-writer
   cancel-in-progress: false
@@ -39,14 +36,16 @@ jobs:
       - name: Install worker dependencies
         run: python -m pip install -r requirements-worker.txt
       - name: UK share daily forecast and five-session verification
-        if: github.event_name == 'schedule' && (github.event.schedule == '7 19 * * 1-5' || github.event.schedule == '47 20 * * 1-5')
+        if: github.event_name == 'schedule'
         run: python share_worker.py --mode daily
-      - name: Health monitor
-        if: github.event_name == 'schedule' && github.event.schedule == '23 12 * * 1-5'
-        run: python share_worker.py --mode monitor
-      - name: Independent paper-journal accounting audit
-        if: github.event_name == 'schedule' && github.event.schedule == '31 19 * * 0'
-        run: python share_worker.py --mode audit
+      - name: Weekly accounting audit within the same scheduled run
+        if: github.event_name == 'schedule'
+        run: |
+          if [ "$(date -u +%u)" = '5' ]; then
+            python share_worker.py --mode audit
+          else
+            echo 'Accounting audit scheduled for Friday within this workflow run.'
+          fi
       - name: Manual action
         if: github.event_name == 'workflow_dispatch'
         run: python share_worker.py --mode '${{ inputs.mode }}'
