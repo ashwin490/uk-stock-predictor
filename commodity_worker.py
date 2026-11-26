@@ -148,6 +148,30 @@ def price_failure_reason(exc: Exception) -> str:
     return type(exc).__name__
 
 
+def rejected_bar_diagnostics(bars: pd.DataFrame) -> str:
+    """Report *which* vendor OHLCV checks failed, never repair values here.
+
+    Counts are diagnostic only; the strict normalizer still decides which
+    historical feeds are acceptable. Do not log prices or untrusted error bodies.
+    """
+    keys = ('Open', 'High', 'Low', 'Close', 'Volume')
+    if not isinstance(bars, pd.DataFrame) or not set(keys).issubset(bars.columns):
+        return 'OHLCV columns missing'
+    x = bars[list(keys)].apply(pd.to_numeric, errors='coerce')
+    finite = pd.Series(np.isfinite(x).all(axis=1), index=x.index)
+    positive = (x[['Open', 'High', 'Low', 'Close']] > 0).all(axis=1)
+    volume = x['Volume'] >= 0
+    high = x['High'] >= x[['Open', 'Close', 'Low']].max(axis=1)
+    low = x['Low'] <= x[['Open', 'Close', 'High']].min(axis=1)
+    bad = ~(finite & positive & volume & high & low)
+    return (f'invalid={int(bad.sum())}/{len(x)}; '
+            f'nonfinite={int((~finite).sum())}; '
+            f'nonpositive_price={int((~positive).sum())}; '
+            f'negative_volume={int((~volume).sum())}; '
+            f'high_below_price={int((~high).sum())}; '
+            f'low_above_price={int((~low).sum())}')
+
+
 def can_retry_short_history(exc: Exception) -> bool:
     # A shorter, independently validated history can bypass older corrupted bars.
     # DO NOT retry a non-sterling or unverifiable currency with a guessed unit.
@@ -157,6 +181,12 @@ def can_retry_short_history(exc: Exception) -> bool:
 
 
 def fetch_histories(period='5y'):
+    """Prefer independently verified raw OHLCV; try yfinance repair if all fail.
+
+    Yahoo's repair algorithm is NOT trusted as ground truth: repaired OHLCV
+    must pass the identical strict GBP/pence, price, volume and history checks.
+    Unknown currencies or provider errors are never guessed or bypassed.
+    """
     import yfinance as yf
     output, failures = {}, {}
     for ticker in PRODUCTS:
@@ -167,29 +197,48 @@ def fetch_histories(period='5y'):
             failures[ticker] = type(exc).__name__
             LOG.warning('ETC %s: Yahoo ticker setup failed (%s)', ticker, failures[ticker])
             continue
-        for i, candidate_period in enumerate(periods):
-            try:
-                bars = stock.history(period=candidate_period, auto_adjust=False,
-                                     repair=False, timeout=16)
-                meta = getattr(stock, 'history_metadata', None)
-                cur = meta.get('currency') if isinstance(meta, dict) else None
-                if not cur:
-                    cur = stock.fast_info.get('currency')
-                cleaned = normalize_lse_bars(bars, cur, ticker)
-                output[ticker] = cleaned
-                failures.pop(ticker, None)
-                if i:
-                    LOG.info('ETC %s: independently verified %s history after rejecting older bars',
-                             ticker, candidate_period)
-                break
-            except Exception as exc:
-                reason = price_failure_reason(exc)
-                failures[ticker] = reason
-                retry = i < len(periods)-1 and can_retry_short_history(exc)
-                LOG.warning('ETC %s (%s): rejected %s history%s', ticker,
-                            candidate_period, reason, '; retrying shorter window' if retry else '')
-                if not retry:
+        found = False
+        stop = False
+        for repaired in (False, True):
+            for i, candidate_period in enumerate(periods):
+                bars = None
+                try:
+                    bars = stock.history(period=candidate_period, auto_adjust=False,
+                                         repair=repaired, timeout=16)
+                    meta = getattr(stock, 'history_metadata', None)
+                    cur = meta.get('currency') if isinstance(meta, dict) else None
+                    if not cur:
+                        cur = stock.fast_info.get('currency')
+                    cleaned = normalize_lse_bars(bars, cur, ticker)
+                    output[ticker] = cleaned
+                    failures.pop(ticker, None)
+                    found = True
+                    if repaired:
+                        LOG.info('ETC %s: Yahoo-repaired %s OHLCV passed independent strict checks',
+                                 ticker, candidate_period)
+                    elif i:
+                        LOG.info('ETC %s: verified %s raw history after older bars failed checks',
+                                 ticker, candidate_period)
                     break
+                except Exception as exc:
+                    reason = price_failure_reason(exc)
+                    failures[ticker] = reason
+                    diagnostic = ''
+                    if isinstance(exc, ValueError) and 'too many rejected price bars' in str(exc):
+                        try:
+                            diagnostic = '; ' + rejected_bar_diagnostics(bars)
+                        except (TypeError, ValueError, KeyError):
+                            pass
+                    retryable = can_retry_short_history(exc)
+                    LOG.warning('ETC %s (%s, repair=%s): %s%s',
+                                ticker, candidate_period, repaired, reason, diagnostic)
+                    if not retryable:
+                        stop = True
+                        break
+            if found or stop:
+                break
+            if not repaired:
+                LOG.info('ETC %s: no raw history validated; testing Yahoo price repair with strict revalidation', ticker)
     return output, failures
 
 
