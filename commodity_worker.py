@@ -22,8 +22,8 @@ import numpy as np
 import pandas as pd
 
 from commodity_etps import COMMODITY_ETPS
-from commodity_ml import (CommodityMLStore, PRODUCTS, HORIZON, GAIN_THRESHOLD,
-                          clean_completed_bars, latest_forecast, train_or_update)
+from commodity_ml import (MODEL_SCHEMA, PRODUCTS, HORIZON, GAIN_THRESHOLD,
+                          clean_completed_bars, latest_forecast, train_or_update, validate_model)
 from commodity_signals import evaluate_commodity_signal
 
 LOG = logging.getLogger('alpha_lse.worker')
@@ -349,6 +349,45 @@ def save_json(bucket, key, value, *, immutable=False):
     raise RuntimeError('Cloud readback mismatch after retries: ' + key)
 
 
+
+def read_worker_model_state(bucket) -> dict:
+    """Load the durable model from an authenticated uncached storage read.
+
+    The generic model store uses SDK downloads, which may be CDN-stale directly
+    after an overwrite. A worker must not train against stale champion state.
+    """
+    state = read_json(bucket, STATE_KEY, default={}, fresh=True)
+    if not isinstance(state, dict):
+        raise ValueError('Cloud commodity model state is not a JSON object')
+    if not state:
+        return {}
+    if state.get('schema') != MODEL_SCHEMA:
+        raise ValueError('Incompatible cloud commodity model state schema')
+    if len(json_bytes(state)) > 250_000:
+        raise ValueError('Oversized commodity model state')
+    for role in ('champion', 'research_model'):
+        if state.get(role):
+            validate_model(state[role])
+    return state
+
+
+def save_worker_model_state(bucket, state: dict) -> None:
+    """Persist an ML state with validation and bounded uncached readback.
+
+    Unlike CommodityMLStore.save's immediate SDK download, save_json retries
+    non-cached, authenticated reads. A failed verification remains a hard error:
+    the caller must NEVER use an unconfirmed new champion for paper decisions.
+    """
+    if not isinstance(state, dict) or state.get('schema') != MODEL_SCHEMA:
+        raise ValueError('Invalid commodity ML state')
+    if len(json_bytes(state)) > 250_000:
+        raise ValueError('Oversized commodity model state')
+    for role in ('champion', 'research_model'):
+        if state.get(role):
+            validate_model(state[role])
+    save_json(bucket, STATE_KEY, state)
+
+
 def connection_from_env():
     from supabase import create_client
     url = os.environ.get('SUPABASE_URL', '').strip()
@@ -529,14 +568,13 @@ def daily_worker(client, bucket, now):
     if len(fresh) < 3:
         raise RuntimeError('Fewer than three ETCs have a completed bar for target XLON session ' + required_date + '; latest accepted bars: ' + str({t: b.index[-1].date().isoformat() if len(b) else 'none' for t,b in histories.items()}))
     histories = fresh
-    store = CommodityMLStore('_unused.json', cloud_mode=True, bucket=bucket)
-    old = store.load()
+    old = read_worker_model_state(bucket)
     # After the target session's official close, its completed bar is usable.
     # Pass the following date so the trainer excludes all bars >= that date.
     effective_day = research_day + timedelta(days=1)
     proposed, report, should_save = train_or_update(histories, old, effective_day)
     if should_save:
-        store.save(proposed)  # Must persist before any model promotion is visible.
+        save_worker_model_state(bucket, proposed)  # Persist before any model promotion is visible.
     else:
         proposed = old
     model = proposed.get('champion') or proposed.get('research_model')
@@ -575,7 +613,7 @@ def daily_worker(client, bucket, now):
         if not proposed.get('champion_paused'):
             proposed['champion_paused'] = True
             proposed['forward_score_pause_day'] = required_date
-            store.save(proposed)
+            save_worker_model_state(bucket, proposed)
             alert('Validated commodity model paused: forward Brier score deteriorated')
     # Archive ALL actual independent evaluation decisions (including rejected
     # challengers) so a ten-year research history isn't silently overwritten.
