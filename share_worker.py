@@ -100,20 +100,30 @@ def available_universe(app_file: str | Path | None = None) -> list[str]:
 
 def fetch_one(ticker: str, period='3y'):
     import yfinance as yf
-    from commodity_worker import normalize_lse_bars
+    from commodity_worker import normalize_lse_bars, can_retry_short_history
     stock=yf.Ticker(ticker)
-    bars=stock.history(period=period,auto_adjust=True,repair=False,timeout=18)
-    metadata=getattr(stock,'history_metadata',{}) or {}
-    currency=metadata.get('currency') if isinstance(metadata,dict) else None
-    if not currency:
-        currency=stock.fast_info.get('currency')
-    cleaned=normalize_lse_bars(bars,currency,ticker)
-    # Corporate actions: adjusted history cannot be equated with an old fill.
-    # Use only for forward percentage changes, never repricing old paper trades.
-    return cleaned
+    periods=(period, '2y', '1y') if period=='3y' else (period,)
+    for i, candidate_period in enumerate(periods):
+        try:
+            bars=stock.history(period=candidate_period,auto_adjust=True,repair=False,timeout=18)
+            metadata=getattr(stock,'history_metadata',{}) or {}
+            currency=metadata.get('currency') if isinstance(metadata,dict) else None
+            if not currency:
+                currency=stock.fast_info.get('currency')
+            cleaned=normalize_lse_bars(bars,currency,ticker)
+            # The adjusted series is ONLY for forward price changes and is
+            # never allowed to change past paper-trade fill prices.
+            if i:
+                LOG.info('Share %s: recovered verified %s price history',ticker,candidate_period)
+            return cleaned
+        except Exception as exc:
+            if i<len(periods)-1 and can_retry_short_history(exc):
+                continue
+            raise
 
 
 def fetch_universe(tickers: list[str],period='3y'):
+    from commodity_worker import price_failure_reason
     data={}; bad={}
     with ThreadPoolExecutor(max_workers=10) as exe:
         futures={exe.submit(fetch_one,t,period):t for t in tickers}
@@ -122,7 +132,7 @@ def fetch_universe(tickers: list[str],period='3y'):
             try:
                 data[t]=f.result()
             except Exception as err:
-                bad[t]=type(err).__name__
+                bad[t]=price_failure_reason(err)
     return data,bad
 
 
@@ -254,12 +264,18 @@ def daily(bucket,now,*,fetcher=fetch_universe):
              day, now.astimezone(timezone.utc).isoformat())
     tickers=available_universe()
     raw_histories,failures=fetcher(tickers,'3y')
+    if failures:
+        from collections import Counter
+        LOG.warning('UK share feed validation: %s of %s rejected; causes=%s',
+                    len(failures),len(tickers),dict(Counter(failures.values())))
+    LOG.info('UK share feed validation: %s accepted of %s requested',
+             len(raw_histories),len(tickers))
     # Never train on a bar after the intended as-of date (possibly a newer,
     # unfinished session when GitHub starts late).
     histories={t:completed_history_through(b,research_day) for t,b in raw_histories.items()}
     today_data={t:b for t,b in histories.items() if len(b) and b.index[-1].date()==research_day}
     if len(today_data)<max(12,min(30,len(tickers)//4)):
-        raise RuntimeError('Insufficient complete UK share price feeds for target XLON session '+day)
+        raise RuntimeError('Insufficient complete UK share price feeds for target XLON session '+day+'; verified='+str(len(today_data))+' of '+str(len(tickers))+'; rejected='+str(len(failures)))
     # Training data must be complete and adjusted, never today's partial bars.
     import exchange_calendars as xcals
     cal=xcals.get_calendar('XLON')

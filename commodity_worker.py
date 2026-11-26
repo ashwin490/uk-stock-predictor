@@ -114,7 +114,7 @@ def normalize_lse_bars(bars: pd.DataFrame, currency: str, ticker: str):
           & (arr['High'] >= arr[['Open','Close','Low']].max(axis=1))
           & (arr['Low'] <= arr[['Open','Close','High']].min(axis=1)))
     if len(x) and float(ok.mean()) < .97:
-        raise ValueError(f'{ticker}: too many rejected price bars')
+        raise ValueError(f'{ticker}: too many rejected price bars ({int((~ok).sum())} of {len(x)} rows)')
     x = x.loc[ok].copy()
     if len(x) < 120:
         raise ValueError(f'{ticker}: insufficient good daily bars')
@@ -123,22 +123,73 @@ def normalize_lse_bars(bars: pd.DataFrame, currency: str, ticker: str):
     return x
 
 
+# Only these locally generated validation errors are safe to show in logs.
+# Never print raw Yahoo error bodies, credentials, or HTTP request URLs.
+SAFE_PRICE_FAILURES = (
+    'quote currency not verified as sterling',
+    'missing verified OHLCV',
+    'price dates lack timezone',
+    'too many rejected price bars',
+    'insufficient good daily bars',
+)
+
+
+def price_failure_reason(exc: Exception) -> str:
+    if isinstance(exc, ValueError):
+        message = str(exc)
+        for reason in SAFE_PRICE_FAILURES:
+            if reason in message:
+                # The diagnostic is constructed by our own normaliser.
+                if reason == 'too many rejected price bars':
+                    import re
+                    match = re.search(r'\((\d+) of (\d+) rows\)', message)
+                    return f'{reason} ({match.group(1)}/{match.group(2)})' if match else reason
+                return reason
+    return type(exc).__name__
+
+
+def can_retry_short_history(exc: Exception) -> bool:
+    # A shorter, independently validated history can bypass older corrupted bars.
+    # DO NOT retry a non-sterling or unverifiable currency with a guessed unit.
+    return isinstance(exc, ValueError) and any(term in str(exc) for term in (
+        'too many rejected price bars', 'insufficient good daily bars',
+        'missing verified OHLCV', 'price dates lack timezone'))
+
+
 def fetch_histories(period='5y'):
     import yfinance as yf
-    output = {}
-    failures = {}
+    output, failures = {}, {}
     for ticker in PRODUCTS:
+        periods = (period, '3y', '2y', '1y') if period == '5y' else (period,)
         try:
             stock = yf.Ticker(ticker)
-            bars = stock.history(period=period, auto_adjust=False, repair=False, timeout=16)
-            meta = getattr(stock, 'history_metadata', None)
-            cur = meta.get('currency') if isinstance(meta, dict) else None
-            if not cur:
-                cur = stock.fast_info.get('currency')
-            output[ticker] = normalize_lse_bars(bars, cur, ticker)
-        except Exception as e:
-            failures[ticker] = type(e).__name__
-            LOG.warning('Data invalid for %s (%s)', ticker, type(e).__name__)
+        except Exception as exc:
+            failures[ticker] = type(exc).__name__
+            LOG.warning('ETC %s: Yahoo ticker setup failed (%s)', ticker, failures[ticker])
+            continue
+        for i, candidate_period in enumerate(periods):
+            try:
+                bars = stock.history(period=candidate_period, auto_adjust=False,
+                                     repair=False, timeout=16)
+                meta = getattr(stock, 'history_metadata', None)
+                cur = meta.get('currency') if isinstance(meta, dict) else None
+                if not cur:
+                    cur = stock.fast_info.get('currency')
+                cleaned = normalize_lse_bars(bars, cur, ticker)
+                output[ticker] = cleaned
+                failures.pop(ticker, None)
+                if i:
+                    LOG.info('ETC %s: independently verified %s history after rejecting older bars',
+                             ticker, candidate_period)
+                break
+            except Exception as exc:
+                reason = price_failure_reason(exc)
+                failures[ticker] = reason
+                retry = i < len(periods)-1 and can_retry_short_history(exc)
+                LOG.warning('ETC %s (%s): rejected %s history%s', ticker,
+                            candidate_period, reason, '; retrying shorter window' if retry else '')
+                if not retry:
+                    break
     return output, failures
 
 
@@ -421,13 +472,13 @@ def daily_worker(client, bucket, now):
              research_day.isoformat(), now.astimezone(timezone.utc).isoformat())
     histories, failures = fetch_histories('5y')
     if len(histories) < 3:
-        raise RuntimeError('Fewer than three verified ETC price histories')
+        raise RuntimeError('Fewer than three verified ETC price histories; accepted=%s, rejected=%s' % (sorted(histories), failures))
     # Fail closed on a stale Yahoo daily bar. Never label an incomplete session.
     required_date = research_day.isoformat()
     histories = {t: completed_history_through(b, research_day) for t, b in histories.items()}
     fresh = {t:b for t,b in histories.items() if len(b) and b.index[-1].date() == research_day}
     if len(fresh) < 3:
-        raise RuntimeError('Fewer than three ETCs have a completed bar for target XLON session ' + required_date)
+        raise RuntimeError('Fewer than three ETCs have a completed bar for target XLON session ' + required_date + '; latest accepted bars: ' + str({t: b.index[-1].date().isoformat() if len(b) else 'none' for t,b in histories.items()}))
     histories = fresh
     store = CommodityMLStore('_unused.json', cloud_mode=True, bucket=bucket)
     old = store.load()
@@ -616,7 +667,16 @@ def main(argv=None):
         return 0
     except Exception as exc:
         safe = args.mode + ' failed: ' + type(exc).__name__
-        LOG.error('Worker failed in %s (%s); inspect provider status and server configuration', args.mode, type(exc).__name__)
+        # Safe detail only for errors constructed locally from validated ticker/date
+        # information. Never log arbitrary upstream exception bodies or tokens.
+        message = str(exc)
+        if message.startswith(('Fewer than three verified ETC price histories',
+                               'Fewer than three ETCs have a completed bar',
+                               'No commodity forecasts generated for completed session')):
+            LOG.error('Worker failed in %s: %s', args.mode, message[:550])
+        else:
+            LOG.error('Worker failed in %s (%s); inspect provider status and server configuration',
+                      args.mode, type(exc).__name__)
         alert(safe)
         return 1
 
