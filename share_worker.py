@@ -260,6 +260,7 @@ def daily(bucket,now,*,fetcher=fetch_universe):
         return {'status':'no_verified_completed_session'}
     from zoneinfo import ZoneInfo
     day=research_day.isoformat()
+    expected_day=day
     LOG.info('Share daily target session: %s (worker ran %s)',
              day, now.astimezone(timezone.utc).isoformat())
     tickers=available_universe()
@@ -270,12 +271,50 @@ def daily(bucket,now,*,fetcher=fetch_universe):
                     len(failures),len(tickers),dict(Counter(failures.values())))
     LOG.info('UK share feed validation: %s accepted of %s requested',
              len(raw_histories),len(tickers))
-    # Never train on a bar after the intended as-of date (possibly a newer,
-    # unfinished session when GitHub starts late).
-    histories={t:completed_history_through(b,research_day) for t,b in raw_histories.items()}
-    today_data={t:b for t,b in histories.items() if len(b) and b.index[-1].date()==research_day}
-    if len(today_data)<max(12,min(30,len(tickers)//4)):
-        raise RuntimeError('Insufficient complete UK share price feeds for target XLON session '+day+'; verified='+str(len(today_data))+' of '+str(len(tickers))+'; rejected='+str(len(failures)))
+    # A daily feed can publish its last completed XLON candle a session late.
+    # Never fabricate the target date: only accept the immediately previous
+    # *official exchange session* if a quorum of valid vendor histories agrees.
+    # This is a bounded catch-up, not a relaxation of OHLCV/currency checks.
+    from collections import Counter
+    import exchange_calendars as xcals
+    cal = xcals.get_calendar('XLON')
+    prev_session = cal.previous_session(pd.Timestamp(research_day)).date()
+    last_dates = Counter(str(b.index[-1].date()) for b in raw_histories.values() if len(b))
+    LOG.info('UK share feed latest verified bar dates: %s', dict(last_dates.most_common(6)))
+    min_coverage = max(12, min(30, len(tickers)//4))
+    target_histories = {t: completed_history_through(b, research_day)
+                        for t, b in raw_histories.items()}
+    target_data = {t: b for t, b in target_histories.items()
+                   if len(b) and b.index[-1].date() == research_day}
+    delayed = False
+    if len(target_data) < min_coverage:
+        previous_histories = {t: completed_history_through(b, prev_session)
+                              for t, b in raw_histories.items()}
+        previous_data = {t: b for t, b in previous_histories.items()
+                         if len(b) and b.index[-1].date() == prev_session}
+        if len(previous_data) < min_coverage:
+            raise RuntimeError(
+                'Insufficient complete UK share prices: expected XLON session '
+                + day + '; expected_coverage=' + str(len(target_data))
+                + '; previous_session=' + prev_session.isoformat()
+                + '; previous_coverage=' + str(len(previous_data))
+                + '; required=' + str(min_coverage)
+                + '; accepted_histories=' + str(len(raw_histories))
+                + '; rejected=' + str(len(failures))
+                + '; vendor_latest_dates=' + str(dict(last_dates.most_common(4))))
+        LOG.warning('UK share vendor has insufficient %s close bars (%s/%s); '
+                    'researching latest verified earlier XLON session %s (%s/%s). '
+                    'No forecasts are attributed to the missing date.',
+                    day, len(target_data), len(tickers), prev_session,
+                    len(previous_data), len(tickers))
+        research_day = prev_session
+        day = research_day.isoformat()
+        histories = previous_histories
+        today_data = previous_data
+        delayed = True
+    else:
+        histories = target_histories
+        today_data = target_data
     # Training data must be complete and adjusted, never today's partial bars.
     import exchange_calendars as xcals
     cal=xcals.get_calendar('XLON')
@@ -339,6 +378,8 @@ def daily(bucket,now,*,fetcher=fetch_universe):
         raise RuntimeError('No UK share forecasts generated for completed session ' + day)
     added=append_predictions(bucket,new_predictions)
     save_json(bucket,FORECASTS,{'schema':1,'as_of':day,
+                                'expected_session':expected_day,
+                                'feed_lagged_one_session':delayed,
                                 'processed_utc':now.astimezone(timezone.utc).isoformat(),
                                 'forecasts':new_predictions,
                                 'universe_count':len(tickers), 'verified_count':len(today_data),
@@ -367,7 +408,9 @@ def daily(bucket,now,*,fetcher=fetch_universe):
             save_json(bucket,STATE,state)
             alert('UK-share forward forecast quality deteriorated; ML advisory paused')
     save_json(bucket,SCORE,{'schema':1,'as_of':day,**sc})
-    details={'target_session':day,'worker_ran_utc':now.astimezone(timezone.utc).isoformat(),
+    details={'target_session':day,'expected_session':expected_day,
+             'feed_lagged_one_session':delayed,
+             'worker_ran_utc':now.astimezone(timezone.utc).isoformat(),
              'coverage':len(today_data),'universe':len(tickers),
              'saved':added,'matured_added':matured,'total_resolved':count,
              'decision':decision}
